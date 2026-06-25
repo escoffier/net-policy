@@ -1,0 +1,5 @@
+*.o
+net-rule
+include/
+.cache
+build*
