@@ -9,38 +9,38 @@
 
 namespace policy {
 
-enum class FLOW_DIR { DIR_INGRESS = 0, DIR_EGRESS = 1, FLOW_DIR_MAX };
+enum class FlowDir { kIngress = 0, kEgress = 1, kMax };
 
-enum class NET_POLICY_RULE {
-  NET_DENY = 0,
-  NET_ALLOW = 1,
-  NET_ALLOW_RSP = 2,
-  NET_ALLOW_REQ = 3,
-  NET_DEFAULT = 4,
-  NET_POLICY_MAX
+enum class NetPolicyRule {
+  kDeny = 0,
+  kAllow = 1,
+  kAllowRsp = 2,
+  kAllowReq = 3,
+  kDefault = 4,
+  kMax
 };
 
 struct RulePort {
-  uint16_t endPort; //端口段上限
-  uint16_t port;    //端口段下限
-  uint8_t proto;    //协议
+  uint16_t end_port; //端口段上限
+  uint16_t port;     //端口段下限
+  uint8_t proto;     //协议
 };
 
 struct RuleDetail {
-  char proto;                   //协议
-  int priority;                 //权重
-  int addrType;                 // ipv4 OR ipv6
-  FLOW_DIR direction;           //流量策略方向
-  NET_POLICY_RULE action;       //策略
-  std::vector<RulePort> vPorts; //
-  std::string policyKey;        //策略主键
-  std::string srcIp;            //源地址
-  std::string dstIp;            //目的地址
+  char proto;                    //协议
+  int priority;                  //权重
+  int addrType;                  // ipv4 OR ipv6
+  FlowDir direction;             //流量策略方向
+  NetPolicyRule action;          //策略
+  std::vector<RulePort> vPorts;  //
+  std::string policyKey;         //策略主键
+  std::string srcIp;             //源地址
+  std::string dstIp;             //目的地址
 };
 
 struct HttpRuleInfo {
   uint8_t direction;
-  NET_POLICY_RULE action;
+  NetPolicyRule action;
   std::string host;
   std::string method;
   std::string path;
@@ -59,18 +59,18 @@ struct FiveTuple {
 
 class PolicyEngine {
 public:
-  int addNewPolicy(RuleDetail& policy, RulePort& stPort);
+  int AddNewPolicy(RuleDetail& policy, RulePort& stPort);
 
-  int addNewHttpPolicy(FLOW_DIR dir, std::string& key, HttpRuleInfo& httpRule);
+  int AddNewHttpPolicy(FlowDir dir, std::string& key, HttpRuleInfo& http_rule);
 
-  std::string createPolicyRuleKey(RuleDetail& info);
+  std::string CreatePolicyRuleKey(RuleDetail& info);
 
-  int createPolicyRuleKey(FiveTuple& tuple, FLOW_DIR dir, std::vector<std::string>& value);
+  int CreatePolicyRuleKey(FiveTuple& tuple, FlowDir dir, std::vector<std::string>& value);
 
-  NET_POLICY_RULE matchNetPolicyRule(FiveTuple& tuple, FLOW_DIR dir, std::string& sRuleKey);
+  NetPolicyRule MatchNetPolicyRule(FiveTuple& tuple, FlowDir dir, std::string& rule_key);
 
-  NET_POLICY_RULE matchHttpPolicyRule(const std::vector<HttpRuleInfo>& httpRules,
-                                      http::Header state);
+  NetPolicyRule MatchHttpPolicyRule(const std::vector<HttpRuleInfo>& http_rules,
+                                    http::Header state);
 
   bool handle();
 
@@ -79,7 +79,7 @@ private:
   std::unordered_map<std::string, RuleDetail> NetOutputPolicyRule;
   std::unordered_map<std::string, std::vector<HttpRuleInfo>> NetInputHttpPolicy;
   std::unordered_map<std::string, std::vector<HttpRuleInfo>> NetOutputHttpPolicy;
-  std::unordered_map<std::string, std::unordered_map<std::string, FLOW_DIR>*> NetPolicyKey;
+  std::unordered_map<std::string, std::unordered_map<std::string, FlowDir>*> NetPolicyKey;
   std::set<int> MaskCidr;
   std::set<int> Priority;
 };

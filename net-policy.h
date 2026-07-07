@@ -34,7 +34,7 @@ inline constexpr uint16_t         kNetPolicyPort  = 9999;
 inline constexpr uint16_t         kPostNetPort    = 8888;
 inline constexpr int              kNfMatchRule    = 6;
 
-/* Responses from hook functions. 
+/* Responses from hook functions.
 #define NF_DROP 0
 #define NF_ACCEPT 1
 #define NF_STOLEN 2
@@ -46,49 +46,55 @@ inline constexpr int              kNfMatchRule    = 6;
 
 typedef struct nf_conntrack NF_CONNTRACK;
 /*epoll call function*/
-using RcvCbFunc = int32_t(*)(int32_t zRcvEvFd, int32_t fd, void* ptr);
+using RcvCbFunc = int32_t(*)(int32_t epoll_fd, int32_t fd, void* ptr);
 /*清除iptables配置*/
 extern void ClearIptabelsRule();
 extern int SetNs(int pid, char *basePath);
 /*connection manager*/
-extern net::ConnectionManager connectionManager;
+extern net::ConnectionManager g_connection_manager;
 
-enum class NET_DATA_TYPE : int
+enum class NetDataType : int
 {
-    POD_PID      = 1,  // pod up
-    POD_DIE      = 2,  // delete pod
-    ADD_RULE     = 3,  // add rule
-    DEL_RULE     = 4,  // delete rule
-    RSP_ACK      = 5,  // response
-    POST_NET     = 6,  // deny post
-    ADD_WAF_RULE = 7,  // add waf rule
-    DEL_WAF_RULE = 8,  // delete waf rule
-    HEAP_DUMP    = 9,
-    CONF_DUMP    = 10,
-    CONN_DUMP    = 11,
-    RESET        = 12,
-    NODE_CFG     = 13,
-    LOG_LEVEL    = 14,
-    NET_INFO_MAX
+    kPodPid      = 1,  // pod up
+    kPodDie      = 2,  // delete pod
+    kAddRule     = 3,  // add rule
+    kDelRule     = 4,  // delete rule
+    kRspAck      = 5,  // response
+    kPostNet     = 6,  // deny post
+    kAddWafRule  = 7,  // add waf rule
+    kDelWafRule  = 8,  // delete waf rule
+    kHeapDump    = 9,
+    kConfDump    = 10,
+    kConnDump    = 11,
+    kReset       = 12,
+    kNodeCfg     = 13,
+    kLogLevel    = 14,
+    kMax
 };
+// legacy alias
+using NET_DATA_TYPE = NetDataType;
 
-enum class NET_POLICY_RULE : uint32_t
+enum class NetPolicyRule : uint32_t
 {
-    NET_DENY      = 0,
-    NET_ALLOW     = 1,
-    NET_MARK      = 2,
-    NET_ALLOW_RSP = 3,
-    NET_ALLOW_REQ = 4,
-    NET_DEFAULT   = 5,
-    NET_POLICY_MAX
+    kDeny      = 0,
+    kAllow     = 1,
+    kMark      = 2,
+    kAllowRsp  = 3,
+    kAllowReq  = 4,
+    kDefault   = 5,
+    kMax
 };
+// legacy alias
+using NET_POLICY_RULE = NetPolicyRule;
 
-enum class FLOW_DIR : int
+enum class FlowDir : int
 {
-    DIR_INGRESS = 0,
-    DIR_EGRESS  = 1,
-    FLOW_DIR_MAX
+    kIngress = 0,
+    kEgress  = 1,
+    kMax
 };
+// legacy alias
+using FLOW_DIR = FlowDir;
 
 /*TCP/UDP伪首部*/
 struct PseudoHeader
@@ -103,14 +109,14 @@ using PSEUDO_HEADER = PseudoHeader; // legacy alias
 
 struct TcpFourTupleV4
 {
-    uint32_t uzSrcAddr;
-    uint32_t uzDstAddr;
-    uint16_t usSrcPort;
-    uint16_t usDstPort;
+    uint32_t src_addr;
+    uint32_t dst_addr;
+    uint16_t src_port;
+    uint16_t dst_port;
 
     bool operator<(const TcpFourTupleV4& other) const noexcept {
-        return std::tie(uzSrcAddr, uzDstAddr, usSrcPort, usDstPort) <
-               std::tie(other.uzSrcAddr, other.uzDstAddr, other.usSrcPort, other.usDstPort);
+        return std::tie(src_addr, dst_addr, src_port, dst_port) <
+               std::tie(other.src_addr, other.dst_addr, other.src_port, other.dst_port);
     }
 };
 using TCP_FOUR_TUPLE_V4 = TcpFourTupleV4; // legacy alias
@@ -118,14 +124,14 @@ using TCP_FOUR_TUPLE_V4 = TcpFourTupleV4; // legacy alias
 class FiveTuple
 {
 public:
-    uint8_t  proto;
-    uint16_t totLen;
-    uint16_t srcPort;
-    uint16_t dstPort;
-    uint32_t uzSrcAddr;
-    uint32_t uzDstAddr;
-    std::string srcAddr;
-    std::string dstAddr;
+    uint8_t  proto_;
+    uint16_t tot_len_;
+    uint16_t src_port_;
+    uint16_t dst_port_;
+    uint32_t src_addr_u32_;
+    uint32_t dst_addr_u32_;
+    std::string src_addr_;
+    std::string dst_addr_;
 public:
     FiveTuple();
     ~FiveTuple();
@@ -139,20 +145,20 @@ struct RcvEpollCb; // forward declaration — full definition follows NFQ_RES_IN
 class NFQ_RES_INFO
 {
 public:
-    int pid;
-    int inputFd;
-    int outputFd;
-    int pollFd;
-    struct nfq_q_handle* inputQue  = nullptr;
-    struct nfq_q_handle* outputQue = nullptr;
-    RcvEpollCb*          inputCb   = nullptr;
-    RcvEpollCb*          outputcb  = nullptr;
+    int pid_;
+    int input_fd_;
+    int output_fd_;
+    int poll_fd_;
+    struct nfq_q_handle* input_que_  = nullptr;
+    struct nfq_q_handle* output_que_ = nullptr;
+    RcvEpollCb*          input_cb_   = nullptr;
+    RcvEpollCb*          output_cb_  = nullptr;
     // nf conntrack
-    NF_CONNTRACK*        nfct      = nullptr;
-    NF_CONNTRACK*        nfctCb    = nullptr;
-    struct nfct_handle*  nfctHd    = nullptr;
-    struct nfct_handle*  nfctCbHd  = nullptr;
-    uint64_t podId;
+    NF_CONNTRACK*        nfct_       = nullptr;
+    NF_CONNTRACK*        nfct_cb_    = nullptr;
+    struct nfct_handle*  nfct_hd_    = nullptr;
+    struct nfct_handle*  nfct_cb_hd_ = nullptr;
+    uint64_t pod_id_;
 
 public:
     NFQ_RES_INFO();
@@ -166,8 +172,8 @@ public:
 struct RcvEpollCb
 {
     int32_t fd;
-    RcvCbFunc epollinfunc; // epoll EPOLLIN
-    NFQ_RES_INFO *nfqres;
+    RcvCbFunc epoll_in_func; // epoll EPOLLIN
+    NFQ_RES_INFO *nfq_res;
 };
 using RCV_EPOLL_CB = RcvEpollCb; // legacy alias
 
@@ -175,16 +181,16 @@ struct NetCtrlInfo
 {
     int  pid;           // 进程PID
     int  level;         // 日志级别
-    uint64_t podId;
-    std::string policyKey;
+    uint64_t pod_id;
+    std::string policy_key;
     std::string uuid;
-    NET_DATA_TYPE msgType; // 数据类型
+    NetDataType msg_type; // 数据类型
 };
 using NET_CTRL_INFO = NetCtrlInfo; // legacy alias
 
 struct RulePort
 {
-    uint16_t endPort; // 端口段上限
+    uint16_t end_port; // 端口段上限
     uint16_t port;    // 端口段下限
     uint8_t  proto;   // 协议
 };
@@ -193,7 +199,7 @@ using RULE_PORT = RulePort; // legacy alias
 struct HTTP_RULE_INFO
 {
     uint8_t direction;
-    NET_POLICY_RULE action;
+    NetPolicyRule action;
     std::string host;
     std::string method;
     std::string path;
@@ -203,7 +209,7 @@ struct HTTP_RULE_INFO
 class NfQueData
 {
 public:
-    std::unordered_map<uint64_t, std::unique_ptr<NFQ_RES_INFO>> ResData;
+    std::unordered_map<uint64_t, std::unique_ptr<NFQ_RES_INFO>> res_data_;
 
 public:
     NfQueData();
@@ -222,16 +228,16 @@ public:
 class RuleDetail
 {
 public:
-    uint8_t proto;//协议
-    int  priority;//权重
-    int  addrType;//ipv4 OR ipv6
-    FLOW_DIR direction; //流量策略方向
-    NET_POLICY_RULE action;//策略
-    std::string ActionDsc;//策略描述
-    std::string policyKey;//策略主键
-    std::string srcIp;//源地址
-    std::string dstIp;//目的地址
-    std::vector<RULE_PORT> vPorts;//端口信息
+    uint8_t proto_;//协议
+    int  priority_;//权重
+    int  addr_type_;//ipv4 OR ipv6
+    FlowDir direction_; //流量策略方向
+    NetPolicyRule action_;//策略
+    std::string action_dsc_;//策略描述
+    std::string policy_key_;//策略主键
+    std::string src_ip_;//源地址
+    std::string dst_ip_;//目的地址
+    std::vector<RULE_PORT> ports_;//端口信息
 
 public:
     RuleDetail();
@@ -247,7 +253,7 @@ public:
     /*生成用于匹配的策略*/
     std::string CreateRuleKey(int &mask);
     /*匹配策略详情*/
-    bool MatchRuleDetail(FiveTuple &tuple, FLOW_DIR dir);
+    bool MatchRuleDetail(FiveTuple &tuple, FlowDir dir);
     /*打印策略详情*/
     void PrintRuleDetail(std::string desc);
 };
@@ -256,8 +262,8 @@ public:
 class RuleGroup
 {
 public:
-    std::unordered_map<std::string, std::shared_ptr<RuleDetail>> Rules;//key-策略名称
-                                                                                                    
+    std::unordered_map<std::string, std::shared_ptr<RuleDetail>> rules_;//key-策略名称
+
 public:
     RuleGroup();
     ~RuleGroup();
@@ -266,7 +272,7 @@ public:
     /*删除匹配策略*/
     void DeleteRule(std::string policyName);
     /*匹配策略*/
-    bool MatchRule(FiveTuple &tuple, RuleDetail &detail, FLOW_DIR dir);
+    bool MatchRule(FiveTuple &tuple, RuleDetail &detail, FlowDir dir);
     /*获取规则数*/
     size_t GetRulesSize();
 };
@@ -275,8 +281,8 @@ public:
 class RuleChain
 {
 public:
-    FLOW_DIR dir;
-    std::unordered_map<std::string, std::shared_ptr<RuleGroup>> Chain;//key-匹配规则
+    FlowDir dir_;
+    std::unordered_map<std::string, std::shared_ptr<RuleGroup>> chain_;//key-匹配规则
 
 public:
     RuleChain();
@@ -286,7 +292,7 @@ public:
     /*清空规则*/
     void RuleChainClear();
     /*set dir*/
-    void SetRuleDir(FLOW_DIR);
+    void SetRuleDir(FlowDir);
     /*匹配规则*/
     bool MatchRuleGroup(std::string &key, FiveTuple &tuple, RuleDetail &detail);
     /*生成匹配规则,并保持到链上*/
@@ -300,7 +306,7 @@ class PolicyTree : public RuleChain
 {
 public:
     /*policy tree*/
-    std::unordered_map<std::string, std::unordered_map<std::string, FLOW_DIR>*> Tree;
+    std::unordered_map<std::string, std::unordered_map<std::string, FlowDir>*> tree_;
 
 public:
     PolicyTree();
@@ -319,15 +325,15 @@ public:
 class PolicyRule : public NfQueData
 {
 public:
-    int efd;
+    int efd_;
     /*Input上的策略规则*/
     /*Output上的策略规则*/
-    PolicyTree InputTree;
-    PolicyTree OutputTree;
+    PolicyTree input_tree_;
+    PolicyTree output_tree_;
     /*子网掩码*/
-    std::set<int> MaskCidr;
+    std::set<int> mask_cidr_;
     /*优先级*/
-    std::set<int> Priority;
+    std::set<int> priority_;
 
 public:
     PolicyRule();
@@ -335,15 +341,15 @@ public:
     /*清除优先级和子网掩码*/
     int ClearCfg();
     /*删除指定策略*/
-    int DeletePolicy(FLOW_DIR dir, std::string name);
+    int DeletePolicy(FlowDir dir, std::string name);
     /*添加优先级和子网掩码*/
     void AddMaskAndPriority(int priority, int mask);
     /*将规则添加到链上*/
     int AddPolicyToTree(RuleDetail &policy, RULE_PORT &stPort);
     /*通过五元组生成规则*/
-    void CreateRuleKeyByTuple(FiveTuple &tuple, FLOW_DIR dir, std::vector<std::string> &value);
+    void CreateRuleKeyByTuple(FiveTuple &tuple, FlowDir dir, std::vector<std::string> &value);
     /*获取策略map*/
-    PolicyTree *GetPolicyTree(FLOW_DIR dir);
+    PolicyTree *GetPolicyTree(FlowDir dir);
     /*获取所有规则配置*/
     cJSON *GetAllConfig(std::string name);
     /*打印日志*/
