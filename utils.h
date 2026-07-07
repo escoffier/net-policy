@@ -1,14 +1,16 @@
 #include <netinet/in.h>
 #include <string>
 #include <string_view>
+#include <type_traits>
 namespace utility {
 
 constexpr std::string_view Deny  = "Deny";
 constexpr std::string_view Allow = "Allow";
 constexpr std::string_view Alert = "Alert";
 
-inline std::string_view actionString(int action) {
-  switch (action) {
+template <typename T>
+inline std::string_view actionString(T action) {
+  switch (static_cast<int>(action)) {
   case 0:
     return Deny;
   case 1:
@@ -20,8 +22,9 @@ inline std::string_view actionString(int action) {
   };
 };
 
-inline std::string_view directionString(int direction) {
-  switch (direction) {
+template <typename T>
+inline std::string_view directionString(T direction) {
+  switch (static_cast<int>(direction)) {
   case 0:
     return "ingress";
   case 1:

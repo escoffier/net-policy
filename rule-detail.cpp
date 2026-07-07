@@ -327,7 +327,7 @@ bool RuleGroup::MatchRule(FiveTuple &tuple, RuleDetail &detail, FlowDir dir)
     /*遍历规则列表*/
     for(auto it = this->rules_.begin(); it != this->rules_.end(); it++)
     {
-        detail = it->second;
+        detail.AssignFrom(it->second);
         auto ret = detail.MatchRuleDetail(tuple, dir);
         if(ret) return true;
     }

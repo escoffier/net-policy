@@ -2039,12 +2039,12 @@ err:
 }
 
 void CustomPrefix(std::ostream& s, const google::LogMessageInfo& l, void*) {
-  s << std::setw(4) << 1900 + l.time.year() << '-' << setw(2) << 1 + l.time.month() << '-'
-    << setw(2) << l.time.day() << 'T' << setw(2) << l.time.hour() << ':' << setw(2) << l.time.min()
-    << ':' << setw(2) << l.time.sec() << "." << setw(6) << l.time.usec()
+  s << std::setw(4) << 1900 + l.time.year() << '-' << std::setw(2) << 1 + l.time.month() << '-'
+    << std::setw(2) << l.time.day() << 'T' << std::setw(2) << l.time.hour() << ':' << std::setw(2) << l.time.min()
+    << ':' << std::setw(2) << l.time.sec() << "." << std::setw(6) << l.time.usec()
     << ' '
-    //    << setfill(' ') << setw(5)
-    << l.thread_id << setfill('0') << " {" << l.severity << "} " << l.filename << ':'
+    //    << std::setfill(' ') << std::setw(5)
+    << l.thread_id << std::setfill('0') << " {" << l.severity << "} " << l.filename << ':'
     << l.line_number;
 }
 
