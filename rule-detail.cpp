@@ -33,7 +33,7 @@
 using std::string;
 using std::make_pair;
 
-void ipv4CidrToIp(std::string cidr, std::string &ip, int &mask)
+void Ipv4CidrToIp(std::string cidr, std::string &ip, int &mask)
 {
     struct in_addr addr;
     uint32_t uzIpaddr, uzMask;
@@ -58,7 +58,7 @@ void ipv4CidrToIp(std::string cidr, std::string &ip, int &mask)
     ip = inet_ntop(AF_INET, &addr, buf, sizeof(buf));
 }
 
-std::string ipv4CidrToIp(std::string ip, int mask)
+std::string Ipv4CidrToIp(std::string ip, int mask)
 {
     struct in_addr addr;
     uint32_t uzIpaddr, uzMask;
@@ -77,45 +77,45 @@ FiveTuple::~FiveTuple() {}
 
 void FiveTuple::InitTuple()
 {
-    this->proto     = 0;
-    this->totLen    = 0;
-    this->srcPort   = 0;
-    this->dstPort   = 0;
-    this->uzSrcAddr = 0;
-    this->uzDstAddr = 0;
-    this->srcAddr   = "";
-    this->dstAddr   = "";
+    this->proto_        = 0;
+    this->tot_len_      = 0;
+    this->src_port_     = 0;
+    this->dst_port_     = 0;
+    this->src_addr_u32_ = 0;
+    this->dst_addr_u32_ = 0;
+    this->src_addr_     = "";
+    this->dst_addr_     = "";
 }
 
 void FiveTuple::PrintData(std::string key, int level)
 {
-    if(level < gzLogLevel) return;
-    if(this->srcPort == 53 || this->dstPort == 53) return;
-    if(this->srcAddr == "127.0.0.1" || this->dstAddr == "127.0.0.1") return;
-    LOG_D("key : %s, five tuple -> proto : %d, %s:%d --> %s:%d", key.c_str(), this->proto, this->srcAddr.c_str(), this->srcPort, this->dstAddr.c_str(), this->dstPort);
+    if(level < g_log_level) return;
+    if(this->src_port_ == 53 || this->dst_port_ == 53) return;
+    if(this->src_addr_ == "127.0.0.1" || this->dst_addr_ == "127.0.0.1") return;
+    LOG_D("key : %s, five tuple -> proto : %d, %s:%d --> %s:%d", key.c_str(), this->proto_, this->src_addr_.c_str(), this->src_port_, this->dst_addr_.c_str(), this->dst_port_);
 }
 
 void FiveTuple::ReverseTuple(FiveTuple &tuple)
 {
     // 备份当前对象的成员变量
-    auto tempProto     = this->proto;
-    auto tempTotLen    = this->totLen;
-    auto tempSrcPort   = this->srcPort;
-    auto tempDstPort   = this->dstPort;
-    auto tempUzSrcAddr = this->uzSrcAddr;
-    auto tempUzDstAddr = this->uzDstAddr;
-    auto tempSrcAddr   = this->srcAddr;
-    auto tempDstAddr   = this->dstAddr;
+    auto temp_proto      = this->proto_;
+    auto temp_tot_len    = this->tot_len_;
+    auto temp_src_port   = this->src_port_;
+    auto temp_dst_port   = this->dst_port_;
+    auto temp_src_u32    = this->src_addr_u32_;
+    auto temp_dst_u32    = this->dst_addr_u32_;
+    auto temp_src_addr   = this->src_addr_;
+    auto temp_dst_addr   = this->dst_addr_;
 
     // 将当前对象的值赋给传入的 tuple
-    tuple.proto     = tempProto;
-    tuple.totLen    = tempTotLen;
-    tuple.srcPort   = tempDstPort;    // 交换 srcPort 和 dstPort
-    tuple.dstPort   = tempSrcPort;
-    tuple.uzSrcAddr = tempUzDstAddr;  // 交换地址
-    tuple.uzDstAddr = tempUzSrcAddr;
-    tuple.srcAddr   = tempDstAddr; 
-    tuple.dstAddr   = tempSrcAddr; 
+    tuple.proto_        = temp_proto;
+    tuple.tot_len_      = temp_tot_len;
+    tuple.src_port_     = temp_dst_port;    // 交换 src_port_ 和 dst_port_
+    tuple.dst_port_     = temp_src_port;
+    tuple.src_addr_u32_ = temp_dst_u32;     // 交换地址
+    tuple.dst_addr_u32_ = temp_src_u32;
+    tuple.src_addr_     = temp_dst_addr;
+    tuple.dst_addr_     = temp_src_addr;
 }
 
 NFQ_RES_INFO::NFQ_RES_INFO() {}
@@ -123,20 +123,20 @@ NFQ_RES_INFO::~NFQ_RES_INFO() {}
 
 void NFQ_RES_INFO::Init()
 {
-    this->pid       = 0;
-    this->inputFd   = 0;
-    this->outputFd  = 0;
-    this->podId     = 0;
-    this->pollFd    = 0;
-    this->inputQue  = nullptr;
-    this->outputQue = nullptr;
-    this->inputCb   = nullptr;
-    this->outputcb  = nullptr;
+    this->pid_       = 0;
+    this->input_fd_  = 0;
+    this->output_fd_ = 0;
+    this->pod_id_    = 0;
+    this->poll_fd_   = 0;
+    this->input_que_ = nullptr;
+    this->output_que_= nullptr;
+    this->input_cb_  = nullptr;
+    this->output_cb_ = nullptr;
     //nf conntrack
-    this->nfct      = nullptr;
-    this->nfctCb    = nullptr;
-    this->nfctHd    = nullptr;
-    this->nfctCbHd  = nullptr;
+    this->nfct_      = nullptr;
+    this->nfct_cb_   = nullptr;
+    this->nfct_hd_   = nullptr;
+    this->nfct_cb_hd_= nullptr;
 }
 
 /*释放资源*/
@@ -146,66 +146,66 @@ void NFQ_RES_INFO::FreeResource(int efd)
     struct nfq_q_handle *qh = NULL;
 
     /*close input fd*/
-    if(this->inputFd > 0)
+    if(this->input_fd_ > 0)
     {
-        ev.data.fd = this->inputFd;
-        epoll_ctl(efd, EPOLL_CTL_DEL, this->inputFd, &ev);
-        close(this->inputFd);
+        ev.data.fd = this->input_fd_;
+        epoll_ctl(efd, EPOLL_CTL_DEL, this->input_fd_, &ev);
+        close(this->input_fd_);
     }
     /*close output fd*/
-    if(this->outputFd > 0)
+    if(this->output_fd_ > 0)
     {
-        ev.data.fd = this->outputFd;
-        epoll_ctl(efd, EPOLL_CTL_DEL, this->outputFd, &ev);
-        close(this->outputFd);
+        ev.data.fd = this->output_fd_;
+        epoll_ctl(efd, EPOLL_CTL_DEL, this->output_fd_, &ev);
+        close(this->output_fd_);
     }
     /*destroy input queue*/
-    if(this->inputQue)
+    if(this->input_que_)
     {
-        qh = this->inputQue;
+        qh = this->input_que_;
         nfq_close(qh->h);
         nfq_destroy_queue(qh);
     }
     /*destroy output queue*/
-    if(this->outputQue)
+    if(this->output_que_)
     {
-        qh = this->outputQue;
+        qh = this->output_que_;
         nfq_close(qh->h);
         nfq_destroy_queue(qh);
     }
-    if(this->inputCb)  delete this->inputCb;
-    if(this->outputcb) delete this->outputcb;
-    if(this->nfct)     nfct_destroy(this->nfct);
-    if(this->nfctCb)   nfct_destroy(this->nfctCb);
-    if(this->nfctHd)   nfct_close(this->nfctHd);
-    if(this->nfctCbHd) nfct_close(this->nfctCbHd);
+    if(this->input_cb_)  delete this->input_cb_;
+    if(this->output_cb_) delete this->output_cb_;
+    if(this->nfct_)      nfct_destroy(this->nfct_);
+    if(this->nfct_cb_)   nfct_destroy(this->nfct_cb_);
+    if(this->nfct_hd_)   nfct_close(this->nfct_hd_);
+    if(this->nfct_cb_hd_) nfct_close(this->nfct_cb_hd_);
     /*print debug log*/
-    LOG_I("free nfqueue resource, pid : %d", this->pid);
+    LOG_I("free nfqueue resource, pid : %d", this->pid_);
 }
 
 RuleDetail::RuleDetail() {}
 RuleDetail::~RuleDetail() {}
 
 /*添加端口*/
-void RuleDetail::AddPortsCfg(RULE_PORT &port) { this->vPorts.push_back(port); }
+void RuleDetail::AddPortsCfg(RULE_PORT &port) { this->ports_.push_back(port); }
 /*清除端口配置*/
-void RuleDetail::ClearPortsCfg() { this->vPorts.clear(); }
+void RuleDetail::ClearPortsCfg() { this->ports_.clear(); }
 /*生成用于匹配的策略*/
 std::string RuleDetail::CreateRuleKey(int &mask)
 {
     string key, ip;
     char buff[128] = {0};
-    switch (this->direction)
+    switch (this->direction_)
     {
-        case FLOW_DIR::DIR_INGRESS:
-            ipv4CidrToIp(this->srcIp, ip, mask);
+        case FlowDir::kIngress:
+            Ipv4CidrToIp(this->src_ip_, ip, mask);
             /*create key*/
-            sprintf(buff, "%d-%d-%s-%s", this->priority, this->proto, ip.c_str(), this->dstIp.c_str());
+            sprintf(buff, "%d-%d-%s-%s", this->priority_, this->proto_, ip.c_str(), this->dst_ip_.c_str());
             break;
         default:
-            ipv4CidrToIp(this->dstIp, ip, mask);
+            Ipv4CidrToIp(this->dst_ip_, ip, mask);
             /*create key*/
-            sprintf(buff, "%d-%d-%s-%s", this->priority, this->proto, this->srcIp.c_str(), ip.c_str());
+            sprintf(buff, "%d-%d-%s-%s", this->priority_, this->proto_, this->src_ip_.c_str(), ip.c_str());
             break;
     }
     key = buff;
@@ -214,29 +214,29 @@ std::string RuleDetail::CreateRuleKey(int &mask)
 }
 
 /*匹配策略详情*/
-bool RuleDetail::MatchRuleDetail(FiveTuple &tuple, FLOW_DIR dir)
+bool RuleDetail::MatchRuleDetail(FiveTuple &tuple, FlowDir dir)
 {
     int p = 0;
     bool bIsMatch = false;
-    uint8_t protocol = tuple.proto;
+    uint8_t protocol = tuple.proto_;
     /*处理ICMP协议*/
-    if(protocol == IPPROTO_ICMP) protocol = this->proto;
+    if(protocol == IPPROTO_ICMP) protocol = this->proto_;
     /*匹配协议*/
-    if(!((this->proto == 0) || (protocol == this->proto))) return false;
+    if(!((this->proto_ == 0) || (protocol == this->proto_))) return false;
     /*匹配ICMP协议*/
-    if((this->vPorts.size() == 0) || (tuple.proto == IPPROTO_ICMP)) bIsMatch = true;
+    if((this->ports_.size() == 0) || (tuple.proto_ == IPPROTO_ICMP)) bIsMatch = true;
     /*匹配端口*/
-    for(p = 0; p < (int)this->vPorts.size(); p++)
+    for(p = 0; p < (int)this->ports_.size(); p++)
     {
-        if(this->vPorts.at(p).endPort == 0)
+        if(this->ports_.at(p).end_port == 0)
         {
             bIsMatch = true;
             break;
         }
         /*check port rang*/
-        if(tuple.dstPort > this->vPorts.at(p).endPort) continue;
+        if(tuple.dst_port_ > this->ports_.at(p).end_port) continue;
         /*check min port*/
-        if(tuple.dstPort < this->vPorts.at(p).port) continue;
+        if(tuple.dst_port_ < this->ports_.at(p).port) continue;
         /*set match true*/
         bIsMatch = true;
         break;
@@ -244,11 +244,11 @@ bool RuleDetail::MatchRuleDetail(FiveTuple &tuple, FLOW_DIR dir)
     /*判断是否匹配成功*/
     if(!bIsMatch) return false;
     /*过滤DNS*/
-    if((tuple.srcPort == 53) || (tuple.dstPort == 53)) return true;
+    if((tuple.src_port_ == 53) || (tuple.dst_port_ == 53)) return true;
     /*print debug log*/
     LOG_D("flow dir %s, match name : %s, dir : %d, action : %d, priority : %d, proto : %d, ip : %s <--> %s port : %d ~ %d",
-        (dir == FLOW_DIR::DIR_INGRESS) ? "ingress" : "egress", this->policyKey.c_str(), static_cast<int>(this->direction), static_cast<int>(this->action), this->priority,
-        this->proto, this->srcIp.c_str(), this->dstIp.c_str(), this->vPorts.at(p).port, this->vPorts.at(p).endPort);
+        (dir == FlowDir::kIngress) ? "ingress" : "egress", this->policy_key_.c_str(), static_cast<int>(this->direction_), static_cast<int>(this->action_), this->priority_,
+        this->proto_, this->src_ip_.c_str(), this->dst_ip_.c_str(), this->ports_.at(p).port, this->ports_.at(p).end_port);
     /*return*/
     return true;
 }
@@ -259,20 +259,20 @@ void RuleDetail::PrintRuleDetail(std::string desc)
     char buf[128];
     std::string ports = "";
     /*log level*/
-    if(gzLogLevel < 2) return;
+    if(g_log_level < 2) return;
     /*format port*/
-    for(int i = 0; i < (int)this->vPorts.size(); i++)
+    for(int i = 0; i < (int)this->ports_.size(); i++)
     {
         memset(buf, 0, sizeof(buf));
-        sprintf(buf, "%d ~ %d", this->vPorts.at(i).port, this->vPorts.at(i).endPort);
+        sprintf(buf, "%d ~ %d", this->ports_.at(i).port, this->ports_.at(i).end_port);
         ports += buf;
-        if((i + 1) < (int)this->vPorts.size()) ports += ",";
+        if((i + 1) < (int)this->ports_.size()) ports += ",";
     }
-    LOG_V("%s detail -> proto : %d, priority : %d, dir : %d, action : %d, name : %s, addr : %s -> %s, ports : %s", 
-        desc.c_str(), this->proto, this->priority, static_cast<int>(this->direction), static_cast<int>(this->action), this->policyKey.c_str(), this->srcIp.c_str(), this->dstIp.c_str(), ports.c_str());
+    LOG_V("%s detail -> proto : %d, priority : %d, dir : %d, action : %d, name : %s, addr : %s -> %s, ports : %s",
+        desc.c_str(), this->proto_, this->priority_, static_cast<int>(this->direction_), static_cast<int>(this->action_), this->policy_key_.c_str(), this->src_ip_.c_str(), this->dst_ip_.c_str(), ports.c_str());
 }
 
-RuleGroup::RuleGroup() { this->Rules.clear(); }
+RuleGroup::RuleGroup() { this->rules_.clear(); }
 RuleGroup::~RuleGroup() {}
 
 /*增加策略详情信息*/
@@ -281,17 +281,17 @@ bool RuleGroup::AddRuleDetail(RuleDetail rule, RULE_PORT &stPort)
     /*clear ports*/
     rule.ClearPortsCfg();
     /*查询策略是否已经存在*/
-    auto it = this->Rules.find(rule.policyKey);
-    if(it == this->Rules.end())
+    auto it = this->rules_.find(rule.policy_key_);
+    if(it == this->rules_.end())
     {
         /*print debug log*/
-        LOG_D("create policy name : %s, action : %d, mutil port : %d ~ %d.", rule.policyKey.c_str(), rule.action, stPort.port, stPort.endPort);
+        LOG_D("create policy name : %s, action : %d, mutil port : %d ~ %d.", rule.policy_key_.c_str(), rule.action_, stPort.port, stPort.end_port);
         /*save policy port*/
         rule.AddPortsCfg(stPort);
         /*make shared*/
         auto detail = std::make_shared<RuleDetail>(rule);
         /*新增数据*/
-        this->Rules[rule.policyKey] = detail;
+        this->rules_[rule.policy_key_] = detail;
         /*return*/
         return true;
     }
@@ -300,7 +300,7 @@ bool RuleGroup::AddRuleDetail(RuleDetail rule, RULE_PORT &stPort)
     /*add port config*/
     detail->AddPortsCfg(stPort);
     /*print debug log*/
-    LOG_D("add policy name : %s, dir : %d, action : %d, mutil port : %d ~ %d, port num : %d", rule.policyKey.c_str(), rule.direction, rule.action, stPort.port, stPort.endPort, (int)detail->vPorts.size());
+    LOG_D("add policy name : %s, dir : %d, action : %d, mutil port : %d ~ %d, port num : %d", rule.policy_key_.c_str(), rule.direction_, rule.action_, stPort.port, stPort.end_port, (int)detail->ports_.size());
     /*print debug log*/
     detail->PrintRuleDetail("add");
     /*return*/
@@ -310,22 +310,22 @@ bool RuleGroup::AddRuleDetail(RuleDetail rule, RULE_PORT &stPort)
 /*删除匹配策略*/
 void RuleGroup::DeleteRule(std::string policyName)
 {
-    auto it = this->Rules.find(policyName);
-    if(it == this->Rules.end()) return;
+    auto it = this->rules_.find(policyName);
+    if(it == this->rules_.end()) return;
     /*删除策略*/
     auto detail = it->second;
     /*打印需要删除的策略详情*/
     detail->PrintRuleDetail("delete");
     /*删除该策略*/
-    this->Rules.erase(it);
+    this->rules_.erase(it);
 }
 
 /*匹配策略*/
-bool RuleGroup::MatchRule(FiveTuple &tuple, RuleDetail &detail, FLOW_DIR dir)
+bool RuleGroup::MatchRule(FiveTuple &tuple, RuleDetail &detail, FlowDir dir)
 {
-    if(this->Rules.size() == 0) return false;
+    if(this->rules_.size() == 0) return false;
     /*遍历规则列表*/
-    for(auto it = this->Rules.begin(); it != this->Rules.end(); it++)
+    for(auto it = this->rules_.begin(); it != this->rules_.end(); it++)
     {
         detail = it->second;
         auto ret = detail.MatchRuleDetail(tuple, dir);
@@ -337,49 +337,49 @@ bool RuleGroup::MatchRule(FiveTuple &tuple, RuleDetail &detail, FLOW_DIR dir)
 }
 
 /*获取规则数*/
-size_t RuleGroup::GetRulesSize() { return this->Rules.size(); }
+size_t RuleGroup::GetRulesSize() { return this->rules_.size(); }
 
 
-RuleChain::RuleChain() { this->Chain.clear(); }
+RuleChain::RuleChain() { this->chain_.clear(); }
 RuleChain::~RuleChain() {}
 
 /*获取规则表数据量*/
-size_t RuleChain::RuleSize() { return this->Chain.size(); }
+size_t RuleChain::RuleSize() { return this->chain_.size(); }
 
 /*set dir*/
-void RuleChain::SetRuleDir(FLOW_DIR direction) { this->dir = direction;}
+void RuleChain::SetRuleDir(FlowDir direction) { this->dir_ = direction;}
 
 /*清空规则*/
-void RuleChain::RuleChainClear() { this->Chain.clear(); }
+void RuleChain::RuleChainClear() { this->chain_.clear(); }
 
 /*匹配规则*/
 bool RuleChain::MatchRuleGroup(std::string &key, FiveTuple &tuple, RuleDetail &detail)
 {
     /*match rule*/
-    auto it = this->Chain.find(key);
-    if(it == this->Chain.end()) return false;
+    auto it = this->chain_.find(key);
+    if(it == this->chain_.end()) return false;
     /*print debug log*/
     tuple.PrintData(key);
     /*match rule*/
-    return it->second->MatchRule(tuple, detail, this->dir);
+    return it->second->MatchRule(tuple, detail, this->dir_);
 }
 
 /*生成匹配规则,并保持到链上*/
 int RuleChain::AddRuleToChain(std::string key, RuleDetail &policy, RULE_PORT &stPort)
 {
     /*check key*/
-    auto it = this->Chain.find(key);
-    if(it == this->Chain.end())
+    auto it = this->chain_.find(key);
+    if(it == this->chain_.end())
     {
         auto rg = std::make_shared<RuleGroup>();
         if(rg == nullptr) RETURN_ERROR(2, "new memory failed by rule group.");
         /*print debug log*/
-        LOG_D("create group to chain, policy name : %s, rule key : %s", policy.policyKey.c_str(), key.c_str());
+        LOG_D("create group to chain, policy name : %s, rule key : %s", policy.policy_key_.c_str(), key.c_str());
         /*add rule*/
         auto ok = rg->AddRuleDetail(policy, stPort);
         if(!ok) RETURN_ERROR(5, "add policy detail failed.");
         /*add rule group*/
-        this->Chain[key] = rg;
+        this->chain_[key] = rg;
     }
     else
     {
@@ -389,7 +389,7 @@ int RuleChain::AddRuleToChain(std::string key, RuleDetail &policy, RULE_PORT &st
         auto ok = rg->AddRuleDetail(policy, stPort);
         if(!ok) RETURN_ERROR(5, "update policy detail failed.");
         /*print debug log*/
-        LOG_D("add group to chain, policy name : %s, rule key : %s, group size : %d", policy.policyKey.c_str(), key.c_str(), (int)rg->GetRulesSize());
+        LOG_D("add group to chain, policy name : %s, rule key : %s, group size : %d", policy.policy_key_.c_str(), key.c_str(), (int)rg->GetRulesSize());
     }
     /*return*/
     return 0;
@@ -398,8 +398,8 @@ int RuleChain::AddRuleToChain(std::string key, RuleDetail &policy, RULE_PORT &st
 /*从链上删除规则*/
 void RuleChain::DeleteRuleFromChain(std::string pname, std::string ruleKey)
 {
-    auto it = this->Chain.find(ruleKey);
-    if(it == this->Chain.end()) return;
+    auto it = this->chain_.find(ruleKey);
+    if(it == this->chain_.end()) return;
     /*获取规则组*/
     auto group = it->second;
     if (group == nullptr) return;
@@ -409,9 +409,9 @@ void RuleChain::DeleteRuleFromChain(std::string pname, std::string ruleKey)
     if(group->GetRulesSize() == 0)
     {
         /*打印调试日志*/
-        LOG_D("delete group, policy name : %s, rule key : %s, dir : %d", pname.c_str(), ruleKey.c_str(), static_cast<int>(this->dir));
+        LOG_D("delete group, policy name : %s, rule key : %s, dir : %d", pname.c_str(), ruleKey.c_str(), static_cast<int>(this->dir_));
         /*从新将规则添加到链上*/
-        this->Chain.erase(it);
+        this->chain_.erase(it);
     }
 }
 
@@ -421,19 +421,19 @@ PolicyTree::~PolicyTree() {}
 
 
 /*get size*/
-int PolicyTree::GetTreeSize() { return (int)this->Tree.size(); }
+int PolicyTree::GetTreeSize() { return (int)this->tree_.size(); }
 
 /*clear*/
 int PolicyTree::Clear()
 {
-    for(auto it = this->Tree.begin(); it != this->Tree.end(); it++)
+    for(auto it = this->tree_.begin(); it != this->tree_.end(); it++)
     {
         auto value = it->second;
         if(value == nullptr) continue;
         delete value;
     }
 
-    this->Tree.clear();
+    this->tree_.clear();
     this->RuleChainClear();
     return 0;
 }
@@ -442,22 +442,22 @@ int PolicyTree::Clear()
 int PolicyTree::DeletePolicyFromTree(std::string &name)
 {
     /*find*/
-    auto pit = this->Tree.find(name);
-    if(pit == this->Tree.end()) RETURN_INFO(0, "can not find this key : [%s], dir : %d", name.c_str(), static_cast<int>(this->dir));
+    auto pit = this->tree_.find(name);
+    if(pit == this->tree_.end()) RETURN_INFO(0, "can not find this key : [%s], dir : %d", name.c_str(), static_cast<int>(this->dir_));
     /*remove policy*/
-    this->Tree.erase(pit);
+    this->tree_.erase(pit);
     /*get value*/
     auto rules = pit->second;
-    if(rules == nullptr) RETURN_WARN(0, "policy information is null, name : %s, dir : %d", name.c_str(), static_cast<int>(this->dir));
+    if(rules == nullptr) RETURN_WARN(0, "policy information is null, name : %s, dir : %d", name.c_str(), static_cast<int>(this->dir_));
     /*print debug log*/
-    LOG_D("policy name : %s, rule numbers : %lu, dir : %d.", name.c_str(), rules->size(), static_cast<int>(this->dir));
+    LOG_D("policy name : %s, rule numbers : %lu, dir : %d.", name.c_str(), rules->size(), static_cast<int>(this->dir_));
     /*delete rule*/
     for(auto it = rules->begin(); it != rules->end(); it++)
     {
         auto key = it->first;
         auto value = it->second;
         /*print debug log*/
-        LOG_D("delete policy, flow dir : %s, key : %s.", (value == FLOW_DIR::DIR_INGRESS) ? "ingress" : "egress", key.c_str());
+        LOG_D("delete policy, flow dir : %s, key : %s.", (value == FlowDir::kIngress) ? "ingress" : "egress", key.c_str());
         /*删除策略下的规则*/
         this->DeleteRuleFromChain(name, key);
     }
@@ -465,9 +465,9 @@ int PolicyTree::DeletePolicyFromTree(std::string &name)
     rules->clear();
     delete rules;
     /*clear all*/
-    if(this->Tree.size() == 0) return this->Clear();
+    if(this->tree_.size() == 0) return this->Clear();
     /*print debug log*/
-    LOG_D("delete net policy name : %s, dir : %d", name.c_str(), static_cast<int>(this->dir));
+    LOG_D("delete net policy name : %s, dir : %d", name.c_str(), static_cast<int>(this->dir_));
     /*return*/
     return 0;
 }
@@ -475,18 +475,18 @@ int PolicyTree::DeletePolicyFromTree(std::string &name)
 /*将规则添加到链上*/
 int PolicyTree::AddPolicyToChain(RuleDetail &policy, RULE_PORT &stPort, int &zMask)
 {
-    std::unordered_map<std::string, FLOW_DIR>* ruleMap;
+    std::unordered_map<std::string, FlowDir>* ruleMap;
     /*query policy*/
-    auto it = this->Tree.find(policy.policyKey);
-    if(it == this->Tree.end())
+    auto it = this->tree_.find(policy.policy_key_);
+    if(it == this->tree_.end())
     {
-        ruleMap = new std::unordered_map<std::string, FLOW_DIR>;
+        ruleMap = new std::unordered_map<std::string, FlowDir>;
         if(ruleMap == nullptr) RETURN_ERROR(2, "new memory failed when add policy.");
         /*insert data*/
-        auto ret = this->Tree.insert(std::make_pair(policy.policyKey, ruleMap));
+        auto ret = this->tree_.insert(std::make_pair(policy.policy_key_, ruleMap));
         if(!ret.second) RETURN_ERROR(3, "insert policy name to map failed when add policy.");
         /*print debug log*/
-        LOG_D("create new policy : [%s]", policy.policyKey.c_str());
+        LOG_D("create new policy : [%s]", policy.policy_key_.c_str());
     }
     else
     {
@@ -500,7 +500,7 @@ int PolicyTree::AddPolicyToChain(RuleDetail &policy, RULE_PORT &stPort, int &zMa
     auto ret = this->AddRuleToChain(key, policy, stPort);
     if(ret != 0) return ret;
     /*insert key*/
-    ruleMap->insert(std::make_pair(key, policy.direction));
+    ruleMap->insert(std::make_pair(key, policy.direction_));
     /*return*/
     return 0;
 }
@@ -511,20 +511,20 @@ PolicyRule::~PolicyRule() {}
 /*清除优先级和子网掩码*/
 int PolicyRule::ClearCfg()
 {
-    this->MaskCidr.clear();
-    this->Priority.clear();
-    this->MaskCidr.insert(32);
+    this->mask_cidr_.clear();
+    this->priority_.clear();
+    this->mask_cidr_.insert(32);
     /*init map*/
-    this->InputTree.Clear();
-    this->OutputTree.Clear();
+    this->input_tree_.Clear();
+    this->output_tree_.Clear();
     /*set rule direction*/
-    this->InputTree.SetRuleDir(FLOW_DIR::DIR_INGRESS);
-    this->OutputTree.SetRuleDir(FLOW_DIR::DIR_EGRESS);
+    this->input_tree_.SetRuleDir(FlowDir::kIngress);
+    this->output_tree_.SetRuleDir(FlowDir::kEgress);
     return 0;
 }
 
 /*通过五元组生成规则*/
-void PolicyRule::CreateRuleKeyByTuple(FiveTuple &tuple, FLOW_DIR dir, std::vector<std::string> &value)
+void PolicyRule::CreateRuleKeyByTuple(FiveTuple &tuple, FlowDir dir, std::vector<std::string> &value)
 {
     char buff[128] = {0};
     char data[128] = {0};
@@ -532,24 +532,24 @@ void PolicyRule::CreateRuleKeyByTuple(FiveTuple &tuple, FLOW_DIR dir, std::vecto
     /*init*/
     value.clear();
     /*create key*/
-    for(auto it = this->Priority.begin(); it != this->Priority.end(); ++it)
+    for(auto it = this->priority_.begin(); it != this->priority_.end(); ++it)
     {
-        for(auto iter = this->MaskCidr.begin(); iter != this->MaskCidr.end(); ++iter)
+        for(auto iter = this->mask_cidr_.begin(); iter != this->mask_cidr_.end(); ++iter)
         {
             /*clear data*/
             dstaddr.clear();
             srcaddr.clear();
             switch (dir)
             {
-                case FLOW_DIR::DIR_INGRESS:
+                case FlowDir::kIngress:
                     srcaddr.push_back("0.0.0.0");
-                    srcaddr.push_back(ipv4CidrToIp(tuple.srcAddr, *iter));
-                    dstaddr.push_back(tuple.dstAddr);
+                    srcaddr.push_back(Ipv4CidrToIp(tuple.src_addr_, *iter));
+                    dstaddr.push_back(tuple.dst_addr_);
                     break;
                 default:
-                    srcaddr.push_back(tuple.srcAddr);
+                    srcaddr.push_back(tuple.src_addr_);
                     dstaddr.push_back("0.0.0.0");
-                    dstaddr.push_back(ipv4CidrToIp(tuple.dstAddr, *iter));
+                    dstaddr.push_back(Ipv4CidrToIp(tuple.dst_addr_, *iter));
                     break;
             }
             //list priority
@@ -558,7 +558,7 @@ void PolicyRule::CreateRuleKeyByTuple(FiveTuple &tuple, FLOW_DIR dir, std::vecto
                 for(size_t j = 0; j < dstaddr.size(); j++)
                 {
                     memset(buff, 0, sizeof(buff));
-                    sprintf(buff, "%d-%d-%s-%s", *it, tuple.proto, srcaddr.at(i).c_str(), dstaddr.at(j).c_str());
+                    sprintf(buff, "%d-%d-%s-%s", *it, tuple.proto_, srcaddr.at(i).c_str(), dstaddr.at(j).c_str());
                     /*save key*/
                     value.push_back(buff);
                     /*print debug log*/
@@ -575,28 +575,28 @@ void PolicyRule::CreateRuleKeyByTuple(FiveTuple &tuple, FLOW_DIR dir, std::vecto
         }
     }
     /*print debug log*/
-    LOG_T("create rule key num : %lu, priority size : %lu, mark size : %lu.", value.size(), this->Priority.size(), this->MaskCidr.size());
+    LOG_T("create rule key num : %lu, priority size : %lu, mark size : %lu.", value.size(), this->priority_.size(), this->mask_cidr_.size());
 }
 
 /*获取策略map*/
-PolicyTree *PolicyRule::GetPolicyTree(FLOW_DIR dir)
+PolicyTree *PolicyRule::GetPolicyTree(FlowDir dir)
 {
-    return (dir == FLOW_DIR::DIR_INGRESS) ? &this->InputTree : &this->OutputTree;
+    return (dir == FlowDir::kIngress) ? &this->input_tree_ : &this->output_tree_;
 }
 
 /*打印日志*/
 void PolicyRule::PrintPolicyLog()
 {
-    LOG_D("NetInput : %d, NetOutput : %d, input tree : %d, output tree : %d", (int)this->InputTree.RuleSize(), (int)this->OutputTree.RuleSize(), this->InputTree.GetTreeSize(), this->OutputTree.GetTreeSize());
+    LOG_D("NetInput : %d, NetOutput : %d, input tree : %d, output tree : %d", (int)this->input_tree_.RuleSize(), (int)this->output_tree_.RuleSize(), this->input_tree_.GetTreeSize(), this->output_tree_.GetTreeSize());
 }
 
 /*添加优先级和子网掩码*/
 void PolicyRule::AddMaskAndPriority(int priority, int mask)
 {
     /*save priority*/
-    this->Priority.insert(priority);
+    this->priority_.insert(priority);
     /*save cidr*/
-    if((mask > 0) && (mask <= 32)) this->MaskCidr.insert(mask);
+    if((mask > 0) && (mask <= 32)) this->mask_cidr_.insert(mask);
 }
 
 /*将规则添加到链上*/
@@ -604,18 +604,18 @@ int PolicyRule::AddPolicyToTree(RuleDetail &policy, RULE_PORT &stPort)
 {
     int zMask = 0;
     /*get policy tree*/
-    auto tree = this->GetPolicyTree(policy.direction);
+    auto tree = this->GetPolicyTree(policy.direction_);
     /*return*/
     auto ret = tree->AddPolicyToChain(policy, stPort, zMask);
     if(ret != 0) RETURN_ERROR(ret, "add policy to chain failed.");
     /*save priority*/
-    this->AddMaskAndPriority(policy.priority, zMask);
+    this->AddMaskAndPriority(policy.priority_, zMask);
     /*return*/
     return 0;
 }
 
 /*删除指定策略*/
-int PolicyRule::DeletePolicy(FLOW_DIR dir, std::string name)
+int PolicyRule::DeletePolicy(FlowDir dir, std::string name)
 {
    auto tree = this->GetPolicyTree(dir);
     /*return*/
@@ -634,70 +634,70 @@ cJSON *PolicyRule::GetAllConfig(std::string name)
     inrule = cJSON_CreateArray();
     outrule = cJSON_CreateArray();
     containers = cJSON_CreateArray();
-    auto stat = connectionManager.stat();
+    auto stat = g_connection_manager.stat();
     if(!config || !outrule || !inrule || !tcp || !containers) GOTO_ERROR(err, "create json object failed.");
 
-    for(auto it = this->InputTree.Chain.begin(); it != this->InputTree.Chain.end(); it++)
+    for(auto it = this->input_tree_.chain_.begin(); it != this->input_tree_.chain_.end(); it++)
     {
         auto rule = it->second;
         if(rule == nullptr) continue;
 
-        for(auto rd = rule->Rules.begin(); rd != rule->Rules.end(); rd++)
+        for(auto rd = rule->rules_.begin(); rd != rule->rules_.end(); rd++)
         {
-            if(!name.empty() && name != rd->second->policyKey) continue;
+            if(!name.empty() && name != rd->second->policy_key_) continue;
 
             r = cJSON_CreateObject();
             if(!r) GOTO_ERROR(err, "create json object failed.");
 
-            cJSON_AddStringToObject(r, "policy_name", rd->second->policyKey.c_str());
-            cJSON_AddNumberToObject(r, "priority", rd->second->priority);
-            cJSON_AddStringToObject(r, "direction", utility::directionString(rd->second->direction).data());
-            cJSON_AddStringToObject(r, "action", utility::actionString(rd->second->action).data());
-            cJSON_AddStringToObject(r, "protocol", utility::protocolString(rd->second->proto).data());
-            cJSON_AddNumberToObject(r, "protocol_int", rd->second->proto);
-            cJSON_AddStringToObject(r, "from_address", rd->second->srcIp.c_str());
-            cJSON_AddStringToObject(r, "to_address", rd->second->dstIp.c_str());
+            cJSON_AddStringToObject(r, "policy_name", rd->second->policy_key_.c_str());
+            cJSON_AddNumberToObject(r, "priority", rd->second->priority_);
+            cJSON_AddStringToObject(r, "direction", utility::directionString(rd->second->direction_).data());
+            cJSON_AddStringToObject(r, "action", utility::actionString(rd->second->action_).data());
+            cJSON_AddStringToObject(r, "protocol", utility::protocolString(rd->second->proto_).data());
+            cJSON_AddNumberToObject(r, "protocol_int", rd->second->proto_);
+            cJSON_AddStringToObject(r, "from_address", rd->second->src_ip_.c_str());
+            cJSON_AddStringToObject(r, "to_address", rd->second->dst_ip_.c_str());
             cJSON_AddItemToArray(inrule, r);
         }
     }
     cJSON_AddItemToObject(config, "inbound_rules", inrule);
 
-    for (auto it = this->OutputTree.Chain.begin(); it != this->OutputTree.Chain.end(); it++)
+    for (auto it = this->output_tree_.chain_.begin(); it != this->output_tree_.chain_.end(); it++)
     {
         auto rule = it->second;
         if(rule == nullptr) continue;
 
-        for(auto rd = rule->Rules.begin(); rd != rule->Rules.end(); rd++)
+        for(auto rd = rule->rules_.begin(); rd != rule->rules_.end(); rd++)
         {
-            if(!name.empty() && name != rd->second->policyKey) continue;
-            
+            if(!name.empty() && name != rd->second->policy_key_) continue;
+
             r = cJSON_CreateObject();
             if(!r) GOTO_ERROR(err, "create json object failed.");
 
-            cJSON_AddStringToObject(r, "policy_name", rd->second->policyKey.c_str());
-            cJSON_AddNumberToObject(r, "priority", rd->second->priority);
-            cJSON_AddStringToObject(r, "direction", utility::directionString(rd->second->direction).data());
-            cJSON_AddStringToObject(r, "action", utility::actionString(rd->second->action).data());
-            cJSON_AddStringToObject(r, "protocol", utility::protocolString(rd->second->proto).data());
-            cJSON_AddNumberToObject(r, "protocol_int", rd->second->proto);
-            cJSON_AddStringToObject(r, "from_address", rd->second->srcIp.c_str());
-            cJSON_AddStringToObject(r, "to_address", rd->second->dstIp.c_str());
+            cJSON_AddStringToObject(r, "policy_name", rd->second->policy_key_.c_str());
+            cJSON_AddNumberToObject(r, "priority", rd->second->priority_);
+            cJSON_AddStringToObject(r, "direction", utility::directionString(rd->second->direction_).data());
+            cJSON_AddStringToObject(r, "action", utility::actionString(rd->second->action_).data());
+            cJSON_AddStringToObject(r, "protocol", utility::protocolString(rd->second->proto_).data());
+            cJSON_AddNumberToObject(r, "protocol_int", rd->second->proto_);
+            cJSON_AddStringToObject(r, "from_address", rd->second->src_ip_.c_str());
+            cJSON_AddStringToObject(r, "to_address", rd->second->dst_ip_.c_str());
             cJSON_AddItemToArray(outrule, r);
         }
     }
     cJSON_AddItemToObject(config, "outbound_rules", outrule);
-    
+
     if(!name.empty()) return config;
 
-    for (auto it = this->ResData.begin(); it != this->ResData.end(); it++)
+    for (auto it = this->res_data_.begin(); it != this->res_data_.end(); it++)
     {
-        res = it->second;
+        res = it->second.get();
         if(res == nullptr) continue;
 
         item = cJSON_CreateObject();
         if(!item) GOTO_ERROR(err, "create json object failed.");
-        cJSON_AddNumberToObject(item, "pid", res->pid);
-        cJSON_AddNumberToObject(item, "pod_id", res->podId);
+        cJSON_AddNumberToObject(item, "pid", res->pid_);
+        cJSON_AddNumberToObject(item, "pod_id", res->pod_id_);
         cJSON_AddItemToArray(containers,  item);
     }
     cJSON_AddItemToObject(config, "containers",containers);
@@ -717,13 +717,13 @@ err:
 }
 
 
-NfQueData::NfQueData() { this->ResData.clear(); }
+NfQueData::NfQueData() { this->res_data_.clear(); }
 NfQueData::~NfQueData() {}
 
 /*create nfqueue resource*/
 int NfQueData::NewNfQueRes(uint64_t pid, std::unique_ptr<NFQ_RES_INFO> res)
 {
-    auto ret = this->ResData.insert(make_pair(pid, std::move(res)));
+    auto ret = this->res_data_.insert(make_pair(pid, std::move(res)));
     if(!ret.second) RETURN_ERROR(-2, "save nfq resource data failed.");
     /*return*/
     return 0;
@@ -732,13 +732,13 @@ int NfQueData::NewNfQueRes(uint64_t pid, std::unique_ptr<NFQ_RES_INFO> res)
 /*delete nfqueue resource*/
 int NfQueData::DeleteNfQueRes(int efd, uint64_t pid)
 {
-    auto it = this->ResData.find(pid);
-    if(it == this->ResData.end()) return 0;
+    auto it = this->res_data_.find(pid);
+    if(it == this->res_data_.end()) return 0;
     /*free resource before erasing*/
     if(it->second != nullptr)
         it->second->FreeResource(efd);
     /*erase key — unique_ptr destructor handles delete*/
-    this->ResData.erase(it);
+    this->res_data_.erase(it);
     /*return*/
     return 0;
 }
@@ -746,8 +746,8 @@ int NfQueData::DeleteNfQueRes(int efd, uint64_t pid)
 /*get nfqueue resource*/
 NFQ_RES_INFO *NfQueData::GetNfqRes(uint64_t pid)
 {
-    auto it = this->ResData.find(pid);
-    if(it == this->ResData.end()) return nullptr;
+    auto it = this->res_data_.find(pid);
+    if(it == this->res_data_.end()) return nullptr;
     /*return*/
     return it->second.get();
 }
@@ -756,19 +756,19 @@ NFQ_RES_INFO *NfQueData::GetNfqRes(uint64_t pid)
 void NfQueData::ClearNfQueResource(int efd)
 {
     int ret;
-    for (auto& [pid, res] : this->ResData)
+    for (auto& [pid, res] : this->res_data_)
     {
         if(res == nullptr) continue;
         /*set network namespace*/
-        ret = SetNs(res->pid, const_cast<char*>(kBasePath.data()));
+        ret = SetNs(res->pid_, const_cast<char*>(kBasePath.data()));
         if (ret != 0) continue;
         /*print debug log*/
-        LOG_D("destroy nfqueue, pid : %d.", res->pid);
+        LOG_D("destroy nfqueue, pid : %d.", res->pid_);
         /*clear iptables rule*/
         ClearIptabelsRule();
         /*free nfque resource — unique_ptr handles delete*/
         res->FreeResource(efd);
     }
     /*clear map*/
-    this->ResData.clear();
+    this->res_data_.clear();
 }

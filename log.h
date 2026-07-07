@@ -1,6 +1,6 @@
 #pragma once
 
-extern int gzLogLevel;
+extern int g_log_level;
 
 #define POLICY_LOG_LEVEL  "POLICY_LOG_LEVEL"
 #define POLICY_WAF_ENABLE "POLICY_WAF_ENABLE"
@@ -20,15 +20,15 @@ extern std::string TimeToString();
 }
 
 #define LOG_D(fmt, ...) {\
-    if(gzLogLevel > 0) fprintf(stderr, "[DEBUG] [%s] [line:%d] [%s] [policy] " fmt "\n", TimeToString().c_str(), __LINE__, __FUNCTION__, ##__VA_ARGS__);\
+    if(g_log_level > 0) fprintf(stderr, "[DEBUG] [%s] [line:%d] [%s] [policy] " fmt "\n", TimeToString().c_str(), __LINE__, __FUNCTION__, ##__VA_ARGS__);\
 }
 
 #define LOG_V(fmt, ...) {\
-    if(gzLogLevel > 1) fprintf(stderr, "[VERBOSE] [%s] [line:%d] [%s] [policy] " fmt "\n", TimeToString().c_str(), __LINE__, __FUNCTION__, ##__VA_ARGS__);\
+    if(g_log_level > 1) fprintf(stderr, "[VERBOSE] [%s] [line:%d] [%s] [policy] " fmt "\n", TimeToString().c_str(), __LINE__, __FUNCTION__, ##__VA_ARGS__);\
 }
 
 #define LOG_T(fmt, ...) {\
-    if(gzLogLevel > 2) fprintf(stderr, "[TRACE] [%s] [line:%d] [%s] [policy] " fmt "\n", TimeToString().c_str(), __LINE__, __FUNCTION__, ##__VA_ARGS__);\
+    if(g_log_level > 2) fprintf(stderr, "[TRACE] [%s] [line:%d] [%s] [policy] " fmt "\n", TimeToString().c_str(), __LINE__, __FUNCTION__, ##__VA_ARGS__);\
 }
 
 #define RETURN_ERROR(ret, fmt, ...) {\
