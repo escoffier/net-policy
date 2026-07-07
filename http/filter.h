@@ -23,12 +23,12 @@ enum class FilterStatus {
 
 struct TCPSegment {
   // ip address using network order
-  uint32_t from;
-  uint32_t to;
+  uint32_t from_;
+  uint32_t to_;
 
   // tcp segment including tcp header
-  char* base;
-  size_t size;
+  char* base_;
+  size_t size_;
 
   friend std::ostream& operator<<(std::ostream& os, TCPSegment& tcp);
 };

@@ -36,68 +36,68 @@ typedef enum {
 } MATCH_REQ_POS;
 
 struct AttackedLog {
-    std::string AttackIp;//攻击IP
-    std::string AttackedApp;//受攻击应用
-    std::string AttackLoad;//攻击载荷
-    std::string AttackedUrl;//受攻击地址
-    std::string ReqPkg;//请求报文
-    std::string RspPkg;//响应报文
-    std::string type;
-    std::string action;//判决
-    std::string RuleName;
-    std::string ReqMethod;
-    std::string RspContentType;
-    std::int64_t AttackTime;//攻击时间
-    std::int64_t RuleId;//匹配到的规则ID
+    std::string attack_ip_;//攻击IP
+    std::string attacked_app_;//受攻击应用
+    std::string attack_load_;//攻击载荷
+    std::string attacked_url_;//受攻击地址
+    std::string req_pkg_;//请求报文
+    std::string rsp_pkg_;//响应报文
+    std::string type_;
+    std::string action_;//判决
+    std::string rule_name_;
+    std::string req_method_;
+    std::string rsp_content_type_;
+    std::int64_t attack_time_;//攻击时间
+    std::int64_t rule_id_;//匹配到的规则ID
 };
 
 struct Rule {
-    std::int64_t id;
-    std::int64_t level;
-    std::string type;
-    std::string name;
-    std::string description;
-    std::string expr;
-    std::string mode;
-    std::vector<std::string> keys;
-    std::vector<std::string> matchFunc;
+    std::int64_t id_;
+    std::int64_t level_;
+    std::string type_;
+    std::string name_;
+    std::string description_;
+    std::string expr_;
+    std::string mode_;
+    std::vector<std::string> keys_;
+    std::vector<std::string> match_func_;
 };
 
 struct BWList {
-    uint64_t id;
-    uint8_t action;
-    std::string name;
-    std::string expr;
-    std::string mode;
-    std::string desc;
-    std::string oprexpr;/*运算表达式*/
-    std::vector<uint8_t> rtype;
-    std::vector<std::string> rdata;
+    uint64_t id_;
+    uint8_t action_;
+    std::string name_;
+    std::string expr_;
+    std::string mode_;
+    std::string desc_;
+    std::string oprexpr_;/*运算表达式*/
+    std::vector<uint8_t> rtype_;
+    std::vector<std::string> rdata_;
 };
 
 class Rules{
 
 private:
-    uint8_t defAction;
+    uint8_t def_action_;
     // app id
-    std::string app_name;
-    std::string app_uri;
-    std::vector<Rule> HeaderRules; // rules数组
-    std::vector<Rule> BodyRules; // rules数组
-    std::unordered_map<std::string, uint8_t> ignore;//需要排除的类型
-    std::vector<std::string> detectHeader;//检测包头配置
-    std::vector<std::string> domain;//检测包头配置
-    std::vector<BWList> WhiteList;//白名单
-    std::vector<BWList> BlackList;//黑名单
-    std::vector<BWList> ForceWhiteList;//强白名单
+    std::string app_name_;
+    std::string app_uri_;
+    std::vector<Rule> header_rules_; // rules数组
+    std::vector<Rule> body_rules_; // rules数组
+    std::unordered_map<std::string, uint8_t> ignore_;//需要排除的类型
+    std::vector<std::string> detect_header_;//检测包头配置
+    std::vector<std::string> domain_;//检测包头配置
+    std::vector<BWList> white_list_;//白名单
+    std::vector<BWList> black_list_;//黑名单
+    std::vector<BWList> force_white_list_;//强白名单
 
 public:
-    uint64_t app_id;
-    std::string cluster_key;// cluster key
-    std::string pod_namespace;// namespace
-    std::string res_kind;// kind
-    std::string res_name;// resource name
-    std::string app_mode;// app mode
+    uint64_t app_id_;
+    std::string cluster_key_;// cluster key
+    std::string pod_namespace_;// namespace
+    std::string res_kind_;// kind
+    std::string res_name_;// resource name
+    std::string app_mode_;// app mode
 
 public:
     // 构造函数
@@ -121,21 +121,21 @@ public:
     /*add default action*/
     void AddDefAction(std::string);
     /*add app name*/
-    void AddAppName(std::string name) { app_name = name; }
+    void AddAppName(std::string name) { app_name_ = name; }
     /*add app name*/
-    void AddAppUri(std::string uri) { app_uri = uri; }
+    void AddAppUri(std::string uri) { app_uri_ = uri; }
     /*get app name*/
-    std::string GetAppName() { return app_name; }
+    std::string GetAppName() { return app_name_; }
     /*match mode function*/
     int MatchModeFunc(std::string str);
     /*get header rule*/
-    std::vector<Rule> GetHeaderRule() { return HeaderRules; }
+    std::vector<Rule> GetHeaderRule() { return header_rules_; }
     /*get body rule*/
-    std::vector<Rule> GetBodyRule() { return BodyRules; }
+    std::vector<Rule> GetBodyRule() { return body_rules_; }
     /*get detect headers*/
-    std::vector<std::string> GetDetectHeaders() { return detectHeader; }
+    std::vector<std::string> GetDetectHeaders() { return detect_header_; }
     /*get default action*/
-    uint8_t GetDefAction() { return defAction; }
+    uint8_t GetDefAction() { return def_action_; }
     /*pcre2 match*/
     bool Pcre2Regex(std::uint64_t id, std::string &expr, std::string &src, std::string &dst);
     /*match ignore type*/
@@ -151,42 +151,42 @@ public:
 template <typename T>
 class CacheQueue {
 public:
-    CacheQueue() : maxSize(200) {}
+    CacheQueue() : max_size_(200) {}
 
     int push(const T& item) {
-        std::unique_lock<std::mutex> lock(mutex);
+        std::unique_lock<std::mutex> lock(mutex_);
 
-        if((int)queue.size() >= maxSize) return 1;
+        if((int)queue_.size() >= max_size_) return 1;
         /*push back*/
-        queue.push_back(item);
+        queue_.push_back(item);
         /*return*/
         return 0;
     }
 
     T pop() {
-        std::unique_lock<std::mutex> lock(mutex);
-        
-        if(queue.empty()) return T();
+        std::unique_lock<std::mutex> lock(mutex_);
+
+        if(queue_.empty()) return T();
         /*get front data*/
-        T item = queue.front();
+        T item = queue_.front();
         /*pop data*/
-        queue.pop_front();
+        queue_.pop_front();
         /*return*/
         return item;
     }
 
     bool isEmpty() const {
-        return queue.empty();
+        return queue_.empty();
     }
 
     size_t Size() const {
-        return queue.size();
+        return queue_.size();
     }
 
 private:
-    std::deque<T> queue;
-    std::mutex mutex;
-    int maxSize;
+    std::deque<T> queue_;
+    std::mutex mutex_;
+    int max_size_;
 };
 
 extern std::string urlDecode(const std::string& url);

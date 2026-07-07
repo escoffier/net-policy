@@ -206,18 +206,18 @@ uint16_t TcpCsum(char* packet) {
   memset(buffer, 0, sizeof(buffer));
   /*pesudo header*/
   pseudo = (PSEUDO_HEADER*)buffer;
-  pseudo->daddr = iphdr->daddr;
-  pseudo->saddr = iphdr->saddr;
-  pseudo->placeholder = 0;
-  pseudo->protocol = iphdr->protocol;
-  pseudo->length = htons(ntohs(iphdr->tot_len) - (iphdr->ihl << 2));
+  pseudo->daddr_ = iphdr->daddr;
+  pseudo->saddr_ = iphdr->saddr;
+  pseudo->placeholder_ = 0;
+  pseudo->protocol_ = iphdr->protocol;
+  pseudo->length_ = htons(ntohs(iphdr->tot_len) - (iphdr->ihl << 2));
   /*tcp header*/
   ttcphdr = (struct tcphdr*)(buffer + sizeof(PSEUDO_HEADER));
-  memcpy(ttcphdr, tcpphdr, ntohs(pseudo->length));
+  memcpy(ttcphdr, tcpphdr, ntohs(pseudo->length_));
   ttcphdr->check = 0;
   /*checksum*/
   return csum((uint16_t*)buffer,
-              ntohs(pseudo->length) +
+              ntohs(pseudo->length_) +
                   sizeof(PSEUDO_HEADER)); // sizeof(PSEUDO_HEADER) + sizeof(UDP_HEADER));
 }
 
@@ -227,7 +227,7 @@ void PrintPolicyData(RuleDetail& r, RULE_PORT& stPort) {
             "[policy] name : %s, dir : %d, action : %d, priority : %d, proto : %d, ip : %s <--> %s "
             "port : %d ~ %d\n",
             r.policy_key_.c_str(), r.direction_, r.action_, r.priority_, r.proto_, r.src_ip_.c_str(),
-            r.dst_ip_.c_str(), stPort.port, stPort.end_port);
+            r.dst_ip_.c_str(), stPort.port_, stPort.end_port_);
   }
 }
 
@@ -235,9 +235,9 @@ std::string PrintPortsData(std::vector<RULE_PORT>& ports) {
   std::string value = "";
   if (g_log_level > 0) {
     for (int p = 0; p < (int)ports.size(); p++) {
-      value += std::to_string(ports.at(p).port);
+      value += std::to_string(ports.at(p).port_);
       value += " ~ ";
-      value += std::to_string(ports.at(p).end_port);
+      value += std::to_string(ports.at(p).end_port_);
       if (p != ((int)ports.size() - 1))
         value += ", ";
     }
@@ -363,10 +363,10 @@ err:
 static NET_POLICY_RULE MatchHttpPolicyRule(const std::vector<HTTP_RULE_INFO>& http_rules,
                                            http::Header state) {
   for (const auto& rule : http_rules) {
-    if (!rule.host.empty()   && (rule.host   != state.host_))   continue;
-    if (!rule.method.empty() && (rule.method != state.method_)) continue;
-    if (!rule.path.empty()   && (rule.path   != state.path_))   continue;
-    return rule.action;
+    if (!rule.host_.empty()   && (rule.host_   != state.host_))   continue;
+    if (!rule.method_.empty() && (rule.method_ != state.method_)) continue;
+    if (!rule.path_.empty()   && (rule.path_   != state.path_))   continue;
+    return rule.action_;
   }
   return NetPolicyRule::kDefault;
 }
@@ -653,10 +653,10 @@ static int input_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct 
     }
   }
   /*tcp four tuple*/
-  ct_key.dst_port = tuple.dst_port_;
-  ct_key.src_port = tuple.src_port_;
-  ct_key.dst_addr = tuple.dst_addr_u32_;
-  ct_key.src_addr = tuple.src_addr_u32_;
+  ct_key.dst_port_ = tuple.dst_port_;
+  ct_key.src_port_ = tuple.src_port_;
+  ct_key.dst_addr_ = tuple.dst_addr_u32_;
+  ct_key.src_addr_ = tuple.src_addr_u32_;
   /*tcp protocol*/
   switch (tuple.proto_) {
   case IPPROTO_TCP:
@@ -839,10 +839,10 @@ static int output_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct
     }
   }
   /*tcp four tuple*/
-  ct_key.dst_port = tuple.dst_port_;
-  ct_key.src_port = tuple.src_port_;
-  ct_key.dst_addr = tuple.dst_addr_u32_;
-  ct_key.src_addr = tuple.src_addr_u32_;
+  ct_key.dst_port_ = tuple.dst_port_;
+  ct_key.src_port_ = tuple.src_port_;
+  ct_key.dst_addr_ = tuple.dst_addr_u32_;
+  ct_key.src_addr_ = tuple.src_addr_u32_;
   /*tcp protocol*/
   switch (tuple.proto_) {
   case IPPROTO_TCP:
@@ -1055,7 +1055,7 @@ int NfqueueRcvData(int32_t epoll_fd, int32_t fd, void* ptr) {
   RCV_EPOLL_CB* nfqEvent = (RCV_EPOLL_CB*)ptr;
   if (!ptr)
     RETURN_ERROR(0, "the argument pointer is nil.");
-  nfq_res = nfqEvent->nfq_res;
+  nfq_res = nfqEvent->nfq_res_;
   /*read data*/
   ret = read(fd, buf, sizeof(buf));
   if (ret <= 0) {
@@ -1087,14 +1087,14 @@ int AddEpollEvent(int zEvfd, NFQ_RES_INFO* nfq_res) {
   if (!nfqInput || !nfqOutput)
     GOTO_ERROR(err, "new nfqueue resource info memory failed, %s.", strerror(errno));
   /*copy data*/
-  nfqInput->nfq_res = nfq_res;
-  nfqOutput->nfq_res = nfq_res;
+  nfqInput->nfq_res_ = nfq_res;
+  nfqOutput->nfq_res_ = nfq_res;
   /*set nonblock*/
   fcntl(nfq_res->input_fd_, F_SETFL, fcntl(nfq_res->input_fd_, F_GETFL) | O_NONBLOCK);
   fcntl(nfq_res->output_fd_, F_SETFL, fcntl(nfq_res->output_fd_, F_GETFL) | O_NONBLOCK);
   /*input queue event*/
-  nfqInput->fd = nfq_res->input_fd_;
-  nfqInput->epoll_in_func = NfqueueRcvData;
+  nfqInput->fd_ = nfq_res->input_fd_;
+  nfqInput->epoll_in_func_ = NfqueueRcvData;
   // register epoll event
   ev.data.ptr = nfqInput;
   ev.events = EPOLLIN;
@@ -1103,8 +1103,8 @@ int AddEpollEvent(int zEvfd, NFQ_RES_INFO* nfq_res) {
     GOTO_ERROR(err, "add nfqueue handle to epoll failed, pid : %d, %s.", nfq_res->input_fd_,
                strerror(errno));
   /*output queue event*/
-  nfqOutput->fd = nfq_res->output_fd_;
-  nfqOutput->epoll_in_func = NfqueueRcvData;
+  nfqOutput->fd_ = nfq_res->output_fd_;
+  nfqOutput->epoll_in_func_ = NfqueueRcvData;
   // register epoll event
   ev.data.ptr = nfqOutput;
   ev.events = EPOLLIN;
@@ -1130,36 +1130,36 @@ err:
 int InitNfqueue(int epoll_fd, NET_CTRL_INFO& ctrl) {
   int ret;
   // check resource — duplicated resource is not an error
-  if (g_micro_rule.GetNfqRes(ctrl.pod_id) != nullptr)
-    RETURN_WARN(0, "duplicated pod resource, pid : %d.", ctrl.pid);
+  if (g_micro_rule.GetNfqRes(ctrl.pod_id_) != nullptr)
+    RETURN_WARN(0, "duplicated pod resource, pid : %d.", ctrl.pid_);
   // new memory
   auto nfq_res = std::make_unique<NFQ_RES_INFO>();
   /*memory init*/
   nfq_res->Init();
   /*save pid*/
-  nfq_res->pid_     = ctrl.pid;
-  nfq_res->pod_id_  = ctrl.pod_id;
+  nfq_res->pid_     = ctrl.pid_;
+  nfq_res->pod_id_  = ctrl.pod_id_;
   nfq_res->poll_fd_ = epoll_fd;
   /*init input queue*/
   ret = OpenNfque(FlowDir::kIngress, nfq_res.get());
   if (ret != 0)
-    GOTO_ERROR(err, "init input queue resource failed, pid : %d.", ctrl.pid);
+    GOTO_ERROR(err, "init input queue resource failed, pid : %d.", ctrl.pid_);
   /*init output queue*/
   ret = OpenNfque(FlowDir::kEgress, nfq_res.get());
   if (ret != 0)
-    GOTO_ERROR(err, "init output queue resource failed, pid : %d.", ctrl.pid);
+    GOTO_ERROR(err, "init output queue resource failed, pid : %d.", ctrl.pid_);
   /*init conntrack*/
   ret = OpenConntrack(nfq_res.get());
   if (ret != 0)
-    GOTO_ERROR(err, "init conntrack resource failed, pid : %d.", ctrl.pid);
+    GOTO_ERROR(err, "init conntrack resource failed, pid : %d.", ctrl.pid_);
   /*add epoll event*/
   ret = AddEpollEvent(epoll_fd, nfq_res.get());
   if (ret != 0)
-    GOTO_ERROR(err, "add %d epoll event failed.", ctrl.pid);
+    GOTO_ERROR(err, "add %d epoll event failed.", ctrl.pid_);
   /*insert nfqueue — transfer ownership*/
-  ret = g_micro_rule.NewNfQueRes(ctrl.pod_id, std::move(nfq_res));
+  ret = g_micro_rule.NewNfQueRes(ctrl.pod_id_, std::move(nfq_res));
   if (ret != 0)
-    GOTO_ERROR(err, "insert nfqueue resource failed, pid : %d.", ctrl.pid);
+    GOTO_ERROR(err, "insert nfqueue resource failed, pid : %d.", ctrl.pid_);
   /*return*/
   return 0;
 
@@ -1444,7 +1444,7 @@ int ParseNetPolicy(char* buf) {
   /*clear vector ports*/
   rule.ports_.clear();
   rule.policy_key_ = item->valuestring;
-  ctrl.policy_key = rule.policy_key_;
+  ctrl.policy_key_ = rule.policy_key_;
   // clear old policy
   DeletePolicy(rule.policy_key_);
   // create new policy
@@ -1482,8 +1482,8 @@ int ParseNetPolicy(char* buf) {
     // list http rule
     httparr = cJSON_GetObjectItem(array, "http");
     if (httparr) {
-      http.action = rule.action_;
-      http.direction = static_cast<uint8_t>(rule.direction_);
+      http.action_ = rule.action_;
+      http.direction_ = static_cast<uint8_t>(rule.direction_);
       for (int k = 0; k < cJSON_GetArraySize(httparr); k++) {
         item = cJSON_GetArrayItem(httparr, k);
         if (!item)
@@ -1491,15 +1491,15 @@ int ParseNetPolicy(char* buf) {
         param = cJSON_GetObjectItem(item, "host");
         if (!param)
           BREAK_ERROR("get http host failed.");
-        http.host = cJSON_GetStringValue(param);
+        http.host_ = cJSON_GetStringValue(param);
         param = cJSON_GetObjectItem(item, "method");
         if (!param)
           BREAK_ERROR("get http method failed.");
-        http.method = cJSON_GetStringValue(param);
+        http.method_ = cJSON_GetStringValue(param);
         param = cJSON_GetObjectItem(item, "path");
         if (!param)
           BREAK_ERROR("get http path failed.");
-        http.path = cJSON_GetStringValue(param);
+        http.path_ = cJSON_GetStringValue(param);
         /*save http rule*/
         AddNewHttpPolicy(rule.direction_, rule.policy_key_, http);
       }
@@ -1545,15 +1545,15 @@ int ParseNetPolicy(char* buf) {
         //
         item = cJSON_GetObjectItem(param, "endPort");
         if (item)
-          rulePort.end_port = item->valueint;
+          rulePort.end_port_ = item->valueint;
         //
         item = cJSON_GetObjectItem(param, "port");
         if (item)
-          rulePort.port = item->valueint;
+          rulePort.port_ = item->valueint;
         //
-        rulePort.proto = rule.proto_;
+        rulePort.proto_ = rule.proto_;
         //
-        rulePort.end_port = (rulePort.end_port == 0) ? rulePort.port : rulePort.end_port;
+        rulePort.end_port_ = (rulePort.end_port_ == 0) ? rulePort.port_ : rulePort.end_port_;
         // push
         rulePorts.push_back(rulePort);
       }
@@ -1640,40 +1640,40 @@ int ParseRcvJson(char* buf, NET_CTRL_INFO* ctrl) {
   item = cJSON_GetObjectItem(root, "msg_type");
   if (!item)
     GOTO_ERROR(err, "get message type item failed!");
-  ctrl->msg_type = static_cast<NET_DATA_TYPE>(item->valueint);
+  ctrl->msg_type_ = static_cast<NET_DATA_TYPE>(item->valueint);
   // get pid
   item = cJSON_GetObjectItem(root, "pid");
   if (item)
-    ctrl->pid = item->valueint;
+    ctrl->pid_ = item->valueint;
   // get pod id
   item = cJSON_GetObjectItem(root, "pod_id");
   if (item)
-    ctrl->pod_id = (uint64_t)item->valuedouble;
+    ctrl->pod_id_ = (uint64_t)item->valuedouble;
   // get resource key
   item = cJSON_GetObjectItem(root, "policy_name");
   if (item)
-    ctrl->policy_key = item->valuestring;
+    ctrl->policy_key_ = item->valuestring;
   // get uuid
   item = cJSON_GetObjectItem(root, "uuid");
   if (item)
-    ctrl->uuid = item->valuestring;
+    ctrl->uuid_ = item->valuestring;
   // get log level
   item = cJSON_GetObjectItem(root, "level");
   if (item)
-    ctrl->level = item->valueint;
+    ctrl->level_ = item->valueint;
   // free resource
   cJSON_Delete(root);
   // check data
-  switch (ctrl->msg_type) {
+  switch (ctrl->msg_type_) {
   case NetDataType::kPodPid:
   case NetDataType::kPodDie:
-    if (ctrl->pid == 0 || ctrl->pod_id == 0)
-      RETURN_ERROR(-1, "need pod pid, message type : %d.", static_cast<int>(ctrl->msg_type));
+    if (ctrl->pid_ == 0 || ctrl->pod_id_ == 0)
+      RETURN_ERROR(-1, "need pod pid, message type : %d.", static_cast<int>(ctrl->msg_type_));
     break;
   case NetDataType::kAddRule:
   case NetDataType::kDelRule:
-    if (ctrl->policy_key.length() == 0)
-      RETURN_ERROR(-1, "need policy name, message type : %d.", static_cast<int>(ctrl->msg_type));
+    if (ctrl->policy_key_.length() == 0)
+      RETURN_ERROR(-1, "need policy name, message type : %d.", static_cast<int>(ctrl->msg_type_));
     break;
   default:
     break;
@@ -1792,24 +1792,24 @@ int ParseRcvData(int32_t epoll_fd, int32_t fd, void* ptr) {
   if (ret < 0)
     GOTO_ERROR(rsp, "[net] parse receive json failed!");
   /*condition*/
-  switch (ctrl.msg_type) {
+  switch (ctrl.msg_type_) {
   case NetDataType::kPodPid:
     // set ns
-    ret = SetNs(ctrl.pid, const_cast<char*>(kBasePath.data()));
+    ret = SetNs(ctrl.pid_, const_cast<char*>(kBasePath.data()));
     if (ret < 0)
-      GOTO_ERROR(rsp, "setns to %d failed.", ctrl.pid);
+      GOTO_ERROR(rsp, "setns to %d failed.", ctrl.pid_);
     // init nfqueue
     ret = InitNfqueue(epoll_fd, ctrl);
     /*print error info*/
     if (ret != 0)
-      GOTO_ERROR(rsp, "init %d nfqueue failed, ret : %d.", ctrl.pid, ret);
+      GOTO_ERROR(rsp, "init %d nfqueue failed, ret : %d.", ctrl.pid_, ret);
     // write iptables rule
     WriteIptableRule(1, 1);
     /*goto*/
     goto rsp;
 
   case NetDataType::kPodDie:
-    ret = g_micro_rule.DeleteNfQueRes(epoll_fd, ctrl.pod_id);
+    ret = g_micro_rule.DeleteNfQueRes(epoll_fd, ctrl.pod_id_);
     goto rsp;
 
   case NetDataType::kAddRule:
@@ -1819,7 +1819,7 @@ int ParseRcvData(int32_t epoll_fd, int32_t fd, void* ptr) {
     goto rsp;
 
   case NetDataType::kDelRule:
-    ret = DeletePolicy(ctrl.policy_key);
+    ret = DeletePolicy(ctrl.policy_key_);
     goto rsp;
 
   case NetDataType::kAddWafRule:
@@ -1839,7 +1839,7 @@ int ParseRcvData(int32_t epoll_fd, int32_t fd, void* ptr) {
     goto rsp;
 
   case NetDataType::kConfDump:
-    respBody = g_micro_rule.GetAllConfig(ctrl.policy_key);
+    respBody = g_micro_rule.GetAllConfig(ctrl.policy_key_);
     goto rsp;
 
   case NetDataType::kConnDump:
@@ -1856,12 +1856,12 @@ int ParseRcvData(int32_t epoll_fd, int32_t fd, void* ptr) {
     goto rsp;
 
   case NetDataType::kLogLevel:
-    g_log_level = ctrl.level;
+    g_log_level = ctrl.level_;
     LOG_I("set log level : %d", g_log_level);
     goto rsp;
 
   default:
-    LOG_E("data type is error, datatype : %d.", static_cast<int>(ctrl.msg_type));
+    LOG_E("data type is error, datatype : %d.", static_cast<int>(ctrl.msg_type_));
     break;
   }
 
@@ -1881,11 +1881,11 @@ rsp:
 
   cJSON_AddNumberToObject(response, "status", ret);
   cJSON_AddNumberToObject(response, "msg_type", static_cast<int>(NetDataType::kRspAck));
-  cJSON_AddStringToObject(response, "uuid", ctrl.uuid.c_str());
+  cJSON_AddStringToObject(response, "uuid", ctrl.uuid_.c_str());
   if (respBody != nullptr)
     cJSON_AddItemToObject(response, "body", respBody);
   /*format reponse data*/
-  if (ctrl.msg_type == NetDataType::kConfDump) {
+  if (ctrl.msg_type_ == NetDataType::kConfDump) {
     result = cJSON_Print(response);
     /*data len*/
     length = (int)strlen(result);
@@ -1909,7 +1909,7 @@ rsp:
   do {
     ret = write(fd, result + offset, length);
     /*print debug log*/
-    if (ctrl.msg_type == NetDataType::kConfDump)
+    if (ctrl.msg_type_ == NetDataType::kConfDump)
       LOG_D("send rsp msg, time : %s, ret: %d, data len %d, offset : %d.", TimeToString().c_str(),
             ret, length, offset);
     if (ret < 0)
@@ -1954,8 +1954,8 @@ int ProcAcceptEvent(int32_t epoll_fd, int32_t fd, void* ptr) {
   // noblock
   fcntl(zClientFd, F_SETFL, fcntl(zClientFd, F_GETFL) | O_NONBLOCK);
   /*callback*/
-  DaeEvent.fd = g_client_fd;
-  DaeEvent.epoll_in_func = ParseRcvData;
+  DaeEvent.fd_ = g_client_fd;
+  DaeEvent.epoll_in_func_ = ParseRcvData;
   // epoll event
   ev.data.ptr = &DaeEvent;
   ev.events = EPOLLIN;
@@ -2022,8 +2022,8 @@ int CreatePostServer(int efd, RCV_EPOLL_CB* pstPostEv) {
   if (ret != 0)
     GOTO_ERROR(err, "listen the client connect request! err : %s", strerror(errno));
   //
-  pstPostEv->fd = fd;
-  pstPostEv->epoll_in_func = ProcAcceptPostLinkEvent;
+  pstPostEv->fd_ = fd;
+  pstPostEv->epoll_in_func_ = ProcAcceptPostLinkEvent;
   // register epoll event
   ev.data.ptr = pstPostEv;
   ev.events = EPOLLIN;
@@ -2147,8 +2147,8 @@ int main(int argc, char* argv[]) {
   //
   g_micro_rule.efd_ = epfd;
   //
-  unixEvent.fd = zListenFd;
-  unixEvent.epoll_in_func = ProcAcceptEvent;
+  unixEvent.fd_ = zListenFd;
+  unixEvent.epoll_in_func_ = ProcAcceptEvent;
   // register epoll event
   ev.data.ptr = &unixEvent;
   ev.events = EPOLLIN;
@@ -2164,12 +2164,12 @@ int main(int argc, char* argv[]) {
       if (!pstCbEv)
         continue;
       /*link fd*/
-      zLinkFd = pstCbEv->fd;
+      zLinkFd = pstCbEv->fd_;
       if (events[i].events & EPOLLIN) {
-        if (!pstCbEv->epoll_in_func)
+        if (!pstCbEv->epoll_in_func_)
           continue;
         /*epll in callback*/
-        pstCbEv->epoll_in_func(epfd, zLinkFd, (void*)pstCbEv);
+        pstCbEv->epoll_in_func_(epfd, zLinkFd, (void*)pstCbEv);
       }
     }
   }

@@ -52,32 +52,32 @@ static uint16_t TcpCsum(char *packet, size_t length, uint32_t from, uint32_t to)
   memset(buffer, 0, sizeof(buffer));
   /*pesudo header*/
   pseudo = (PSEUDO_HEADER *)buffer;
-  pseudo->daddr = to;
-  pseudo->saddr = from;
-  pseudo->placeholder = 0;
-  pseudo->protocol = IPPROTO_TCP;
-  pseudo->length = htons(length);
+  pseudo->daddr_ = to;
+  pseudo->saddr_ = from;
+  pseudo->placeholder_ = 0;
+  pseudo->protocol_ = IPPROTO_TCP;
+  pseudo->length_ = htons(length);
   /*tcp header*/
   ttcphdr = (struct tcphdr *)(buffer + sizeof(PSEUDO_HEADER));
-  memcpy(ttcphdr, tcpphdr, ntohs(pseudo->length));
+  memcpy(ttcphdr, tcpphdr, ntohs(pseudo->length_));
   ttcphdr->check = 0;
   /*checksum*/
-  return csum((uint16_t *)buffer, ntohs(pseudo->length) + sizeof(PSEUDO_HEADER)); // sizeof(PSEUDO_HEADER) + sizeof(UDP_HEADER));
+  return csum((uint16_t *)buffer, ntohs(pseudo->length_) + sizeof(PSEUDO_HEADER)); // sizeof(PSEUDO_HEADER) + sizeof(UDP_HEADER));
 }
 
 FilterStatus PluginContext::ModifyNetPackets()
 {
   auto data = getTcpSegment();
-  struct tcphdr *tcphdr = (struct tcphdr *)data.base;
+  struct tcphdr *tcphdr = (struct tcphdr *)data.base_;
   int offset = tcphdr->doff << 2;
-  int dataLen = data.size - offset;
+  int dataLen = data.size_ - offset;
   dataLen = (dataLen > 30) ? 30 : dataLen;
   for(int i = offset; i < (dataLen + offset); i++)
   {
-    data.base[i] = 0;
+    data.base_[i] = 0;
   }
   //tcp checksum
-  tcphdr->check = TcpCsum((char *)data.base, data.size, data.from, data.to);
+  tcphdr->check = TcpCsum((char *)data.base_, data.size_, data.from_, data.to_);
   //return
   return FilterStatus::StopIteration;
 }
@@ -85,12 +85,12 @@ FilterStatus PluginContext::ModifyNetPackets()
 FilterStatus PluginContext::onNewConnection(const net::ConnectionInfo &streamInfo)
 {
   //print debug log
-  LOG_T("new connection, dst ip : %s, waf rule size : %ld", streamInfo.to.c_str(), RootContext.GetWafRuleSize());
+  LOG_T("new connection, dst ip : %s, waf rule size : %ld", streamInfo.to_.c_str(), RootContext.GetWafRuleSize());
   //get waf rule
-  auto ret = RootContext.GetWafRule(streamInfo.to, ruleArr);
+  auto ret = RootContext.GetWafRule(streamInfo.to_, ruleArr);
   if(!ret) return FilterStatus::StopIteration;
   /*source address*/
-  forwardIp_ = streamInfo.from;
+  forwardIp_ = streamInfo.from_;
   //print debug log
   LOG_T("new connection, get waf rule success, id : %lu, default action : %d", getConnectionID(), ruleArr.GetDefAction());
   //return
@@ -102,36 +102,36 @@ FilterStatus PluginContext::onClose()
   char *str = NULL;
   cJSON *root = NULL, *array = nullptr, *obj = nullptr;
   /*link close*/
-  LOG_T("http connection close, app length : %d, id : %lu", (int)atlog.AttackedApp.length(), getConnectionID());
+  LOG_T("http connection close, app length : %d, id : %lu", (int)atlog.attacked_app_.length(), getConnectionID());
   /*check attack app length*/
-  if(atlog.AttackedApp.length() == 0) return FilterStatus::Continue;
+  if(atlog.attacked_app_.length() == 0) return FilterStatus::Continue;
   /*create json object*/
   root = cJSON_CreateObject();
   if(!root) RETURN_ERROR(FilterStatus::Continue, "create json object failed.");
   /*pod info*/
   cJSON_AddStringToObject(root, "type", "waf");
-  cJSON_AddNumberToObject(root, "service_id", ruleArr.app_id);
-  cJSON_AddStringToObject(root, "res_name", ruleArr.res_name.c_str());
+  cJSON_AddNumberToObject(root, "service_id", ruleArr.app_id_);
+  cJSON_AddStringToObject(root, "res_name", ruleArr.res_name_.c_str());
   cJSON_AddStringToObject(root, "app_name", ruleArr.GetAppName().c_str());
-  cJSON_AddStringToObject(root, "res_kind", ruleArr.res_kind.c_str());
-  cJSON_AddStringToObject(root, "namespace", ruleArr.pod_namespace.c_str());
-  cJSON_AddStringToObject(root, "cluster_key", ruleArr.cluster_key.c_str());
+  cJSON_AddStringToObject(root, "res_kind", ruleArr.res_kind_.c_str());
+  cJSON_AddStringToObject(root, "namespace", ruleArr.pod_namespace_.c_str());
+  cJSON_AddStringToObject(root, "cluster_key", ruleArr.cluster_key_.c_str());
   //json array
   array = cJSON_CreateArray();
   obj   = cJSON_CreateObject();
   if(!array || !obj) RETURN_ERROR(FilterStatus::Continue, "create json array object failed.");
-  cJSON_AddStringToObject(obj, "action",      atlog.action.c_str());
-  cJSON_AddStringToObject(obj, "attack_ip", atlog.AttackIp.c_str());
-  cJSON_AddStringToObject(obj, "attacked_app", atlog.AttackedApp.c_str());
-  cJSON_AddStringToObject(obj, "attack_load", atlog.AttackLoad.c_str());
-  cJSON_AddNumberToObject(obj, "attack_time", atlog.AttackTime);
-  cJSON_AddNumberToObject(obj, "rule_id",     atlog.RuleId);
-  cJSON_AddStringToObject(obj, "rule_name",   atlog.RuleName.c_str());
-  cJSON_AddStringToObject(obj, "req_pkg",     atlog.ReqPkg.c_str());
-  cJSON_AddStringToObject(obj, "rsp_pkg",     atlog.RspPkg.c_str());
-  cJSON_AddStringToObject(obj, "attack_type", atlog.type.c_str());
-  cJSON_AddStringToObject(obj, "attacked_url", atlog.AttackedUrl.c_str());
-  cJSON_AddStringToObject(obj, "rsp_content_type", atlog.RspContentType.c_str());
+  cJSON_AddStringToObject(obj, "action",      atlog.action_.c_str());
+  cJSON_AddStringToObject(obj, "attack_ip", atlog.attack_ip_.c_str());
+  cJSON_AddStringToObject(obj, "attacked_app", atlog.attacked_app_.c_str());
+  cJSON_AddStringToObject(obj, "attack_load", atlog.attack_load_.c_str());
+  cJSON_AddNumberToObject(obj, "attack_time", atlog.attack_time_);
+  cJSON_AddNumberToObject(obj, "rule_id",     atlog.rule_id_);
+  cJSON_AddStringToObject(obj, "rule_name",   atlog.rule_name_.c_str());
+  cJSON_AddStringToObject(obj, "req_pkg",     atlog.req_pkg_.c_str());
+  cJSON_AddStringToObject(obj, "rsp_pkg",     atlog.rsp_pkg_.c_str());
+  cJSON_AddStringToObject(obj, "attack_type", atlog.type_.c_str());
+  cJSON_AddStringToObject(obj, "attacked_url", atlog.attacked_url_.c_str());
+  cJSON_AddStringToObject(obj, "rsp_content_type", atlog.rsp_content_type_.c_str());
   //add json array
   cJSON_AddItemToArray(array, obj);
   cJSON_AddItemToObject(root, "attacked_log", array);
@@ -224,7 +224,7 @@ FilterStatus PluginContext::onRequestHeaders(RequestHeaderMap &headers, bool end
   /*get request header pairs*/
   auto headerPairs = headers.getHttpHeaderPairs();
   /*save requst header infor*/
-  atlog.AttackedUrl = SaveHeadersInfo(atlog, headerPairs);
+  atlog.attacked_url_ = SaveHeadersInfo(atlog, headerPairs);
   /*match domain*/
   auto domain = headers.getHttpHeader(":authority");
   if(domain.empty()) domain = headers.getHttpHeader(":host");
@@ -251,18 +251,18 @@ FilterStatus PluginContext::onRequestHeaders(RequestHeaderMap &headers, bool end
   if(ret)
   {
     //print debug log
-    LOG_D("[success] match force white list, action : %d", param.action);
+    LOG_D("[success] match force white list, action : %d", param.action_);
     /*save attack info*/
-    atlog.AttackIp   = forwardIp_;
-    atlog.AttackTime = nowtime;
-    atlog.RuleId     = param.id;
-    atlog.AttackLoad = param.mode;
-    atlog.RuleName   = param.desc;
-    atlog.type = "force-white";
-    atlog.AttackedApp = ruleArr.GetAppName();
-    atlog.action = (param.action == ATCTION_DROP) ? "drop" : "pass";
+    atlog.attack_ip_   = forwardIp_;
+    atlog.attack_time_ = nowtime;
+    atlog.rule_id_     = param.id_;
+    atlog.attack_load_ = param.mode_;
+    atlog.rule_name_   = param.desc_;
+    atlog.type_ = "force-white";
+    atlog.attacked_app_ = ruleArr.GetAppName();
+    atlog.action_ = (param.action_ == ATCTION_DROP) ? "drop" : "pass";
     /*check action and content-length*/
-    if((param.action == ATCTION_DROP) && (clen.length() == 0)) return ModifyNetPackets();
+    if((param.action_ == ATCTION_DROP) && (clen.length() == 0)) return ModifyNetPackets();
     /*return*/
     return FilterStatus::Continue;
   }
@@ -273,18 +273,18 @@ FilterStatus PluginContext::onRequestHeaders(RequestHeaderMap &headers, bool end
   if(ret)
   {
     //print debug log
-    LOG_D("[success] match black and white list, action : %d", param.action);
+    LOG_D("[success] match black and white list, action : %d", param.action_);
     /*save attack info*/
-    atlog.AttackIp   = forwardIp_;
-    atlog.AttackTime = nowtime;
-    atlog.RuleId     = param.id;
-    atlog.AttackLoad = param.mode;
-    atlog.RuleName   = param.desc;
-    atlog.type = (param.action == ATCTION_DROP) ? "black" : "white";
-    atlog.AttackedApp = ruleArr.GetAppName();
-    atlog.action = (param.action == ATCTION_DROP) ? "drop" : "pass";
+    atlog.attack_ip_   = forwardIp_;
+    atlog.attack_time_ = nowtime;
+    atlog.rule_id_     = param.id_;
+    atlog.attack_load_ = param.mode_;
+    atlog.rule_name_   = param.desc_;
+    atlog.type_ = (param.action_ == ATCTION_DROP) ? "black" : "white";
+    atlog.attacked_app_ = ruleArr.GetAppName();
+    atlog.action_ = (param.action_ == ATCTION_DROP) ? "drop" : "pass";
     /*check action and content-length*/
-    if((param.action == ATCTION_DROP) && (clen.length() == 0)) return ModifyNetPackets();
+    if((param.action_ == ATCTION_DROP) && (clen.length() == 0)) return ModifyNetPackets();
     /*return*/
     return FilterStatus::Continue;
   }
@@ -301,7 +301,7 @@ FilterStatus PluginContext::onRequestHeaders(RequestHeaderMap &headers, bool end
   /*list header rule*/
   for (auto &r : ruleArr.GetHeaderRule())
   {
-    auto cfg = r.keys;
+    auto cfg = r.keys_;
     auto deh = ruleArr.GetDetectHeaders();
     deh.insert(deh.end(), cfg.begin(), cfg.end());
     /*list configs*/
@@ -309,24 +309,24 @@ FilterStatus PluginContext::onRequestHeaders(RequestHeaderMap &headers, bool end
     {
       if(key == "body") continue;
       /*get request header*/
-      auto value = GetRequestHeaderInfo(headers, r.matchFunc, key);
+      auto value = GetRequestHeaderInfo(headers, r.match_func_, key);
       //print debug log
-      LOG_D("id : %ld, rule, key : %s, value : %s", r.id, key.c_str(), value.c_str());
+      LOG_D("id : %ld, rule, key : %s, value : %s", r.id_, key.c_str(), value.c_str());
       //check value
       if(value.empty()) continue;
       //regex
-      if (ruleArr.Pcre2Regex(r.id, r.expr, value, smret))
+      if (ruleArr.Pcre2Regex(r.id_, r.expr_, value, smret))
       {
         /*save attack info*/
-        LOG_D("[success] matched header rule success, id : %ld", r.id);
-        atlog.AttackIp = forwardIp_;
-        atlog.AttackTime = nowtime;
-        atlog.RuleId   = r.id;
-        atlog.RuleName = r.name;
-        atlog.AttackLoad = smret.c_str();
-        atlog.AttackedApp = ruleArr.GetAppName();
-        atlog.type = r.type;
-        atlog.action = (ruleArr.GetDefAction() == ATCTION_DROP) ? "drop" : "warn";
+        LOG_D("[success] matched header rule success, id : %ld", r.id_);
+        atlog.attack_ip_ = forwardIp_;
+        atlog.attack_time_ = nowtime;
+        atlog.rule_id_   = r.id_;
+        atlog.rule_name_ = r.name_;
+        atlog.attack_load_ = smret.c_str();
+        atlog.attacked_app_ = ruleArr.GetAppName();
+        atlog.type_ = r.type_;
+        atlog.action_ = (ruleArr.GetDefAction() == ATCTION_DROP) ? "drop" : "warn";
         /*check action and content-length*/
         if((ruleArr.GetDefAction() == ATCTION_DROP) && (clen.length() == 0)) return ModifyNetPackets();
         /*return*/
@@ -348,32 +348,32 @@ FilterStatus PluginContext::onRequestBody(seastar::net::packet &p, bool end_of_s
   /*print debug log*/
   LOG_D("onRequestBody %s", body.c_str());
   /*save request body*/
-  if(atlog.AttackedApp.length() != 0)
+  if(atlog.attacked_app_.length() != 0)
   {
-    atlog.ReqPkg = body;
+    atlog.req_pkg_ = body;
     /*check action*/
-    if(atlog.action == "drop") return ModifyNetPackets();
+    if(atlog.action_ == "drop") return ModifyNetPackets();
   }
   /*print debug log*/
   LOG_D("onRequestBody, continue match request body rule.");
   /*match body rule*/
   for (auto &r : ruleArr.GetBodyRule())
   {
-    for(auto &key : r.keys)
+    for(auto &key : r.keys_)
     {
-      if (ruleArr.Pcre2Regex(r.id, r.expr, body, ret))
+      if (ruleArr.Pcre2Regex(r.id_, r.expr_, body, ret))
       {
         /*save attack info*/
-        LOG_D("[success] matched body rule, id : %ld, action : %d, expr : %s, key : %s", r.id, ruleArr.GetDefAction(), r.expr.c_str(), key.c_str());
-        atlog.AttackIp = forwardIp_;
-        atlog.AttackTime = GetNowTime();
-        atlog.RuleId   = r.id;
-        atlog.RuleName = r.name;
-        atlog.AttackLoad = ret.c_str();
-        atlog.AttackedApp = ruleArr.GetAppName();
-        atlog.type = r.type;
-        atlog.RspPkg = body;
-        atlog.action = (ruleArr.GetDefAction() == ATCTION_DROP) ? "drop" : "warn";
+        LOG_D("[success] matched body rule, id : %ld, action : %d, expr : %s, key : %s", r.id_, ruleArr.GetDefAction(), r.expr_.c_str(), key.c_str());
+        atlog.attack_ip_ = forwardIp_;
+        atlog.attack_time_ = GetNowTime();
+        atlog.rule_id_   = r.id_;
+        atlog.rule_name_ = r.name_;
+        atlog.attack_load_ = ret.c_str();
+        atlog.attacked_app_ = ruleArr.GetAppName();
+        atlog.type_ = r.type_;
+        atlog.rsp_pkg_ = body;
+        atlog.action_ = (ruleArr.GetDefAction() == ATCTION_DROP) ? "drop" : "warn";
         /*check action*/
         if(ruleArr.GetDefAction() == ATCTION_DROP) return ModifyNetPackets();
         /*return*/
@@ -389,12 +389,12 @@ FilterStatus PluginContext::onRequestBody(seastar::net::packet &p, bool end_of_s
 FilterStatus PluginContext::onResponseHeaders(RequestHeaderMap &headers, bool end_of_stream)
 {
   /*get content-type*/
-  atlog.RspContentType = headers.getHttpHeader("content-type");
+  atlog.rsp_content_type_ = headers.getHttpHeader("content-type");
   /*print debug log*/
-  LOG_D("onResponseHeaders, content-type : %s", atlog.RspContentType.c_str());
+  LOG_D("onResponseHeaders, content-type : %s", atlog.rsp_content_type_.c_str());
   /*get response header*/
   auto rspHdr = headers.getHttpHeaderPairs();
-  atlog.RspPkg = FormartRspHeaders(rspHdr);
+  atlog.rsp_pkg_ = FormartRspHeaders(rspHdr);
   /*return*/
   return FilterStatus::Continue;
 }
@@ -402,15 +402,15 @@ FilterStatus PluginContext::onResponseHeaders(RequestHeaderMap &headers, bool en
 /*reponse body*/
 FilterStatus PluginContext::onResponseBody(seastar::net::packet &p, bool end_of_stream)
 {
-  if(atlog.action == "drop") return FilterStatus::Continue;
+  if(atlog.action_ == "drop") return FilterStatus::Continue;
   /*save response body*/
-  if(atlog.AttackedApp.length() != 0)
+  if(atlog.attacked_app_.length() != 0)
   {
     if(p.len() == 0) return FilterStatus::Continue;
     /*save response data*/
-    atlog.RspPkg += p.get_header(0, p.len());
+    atlog.rsp_pkg_ += p.get_header(0, p.len());
     /*print debug log*/
-    LOG_D("save onResponseBody, id : %ld", atlog.RuleId);
+    LOG_D("save onResponseBody, id : %ld", atlog.rule_id_);
   }
   /*return*/
   return FilterStatus::Continue;
@@ -421,7 +421,7 @@ FilterStatus PluginContext::onData(seastar::net::packet &data) {
 }
 
 
-PluginRootContext::PluginRootContext() { pzPostFd = nullptr; }
+PluginRootContext::PluginRootContext() { post_fd_ = nullptr; }
 PluginRootContext::~PluginRootContext() {}
 
 
@@ -464,19 +464,19 @@ bool PluginRootContext::ParseConfiguration(char *config) {
       array = cJSON_GetArrayItem(rules, i);
       if(!array) continue;
       item = cJSON_GetObjectItem(array, "id");
-      if(item) tmp.id = item->valueint;
+      if(item) tmp.id_ = item->valueint;
       item = cJSON_GetObjectItem(array, "level");
-      if(item) tmp.level = item->valueint;
+      if(item) tmp.level_ = item->valueint;
       item = cJSON_GetObjectItem(array, "type");
-      if(item) tmp.type = item->valuestring;
+      if(item) tmp.type_ = item->valuestring;
       item = cJSON_GetObjectItem(array, "name");
-      if(item) tmp.name = item->valuestring;
+      if(item) tmp.name_ = item->valuestring;
       item = cJSON_GetObjectItem(array, "expr");
-      if(item) tmp.expr = item->valuestring;
+      if(item) tmp.expr_ = item->valuestring;
       item = cJSON_GetObjectItem(array, "mode");
-      if(item) tmp.mode = item->valuestring;
+      if(item) tmp.mode_ = item->valuestring;
       item = cJSON_GetObjectItem(array, "Description");
-      if(item) tmp.description = item->valuestring;
+      if(item) tmp.description_ = item->valuestring;
       //save data
       ruleData.AddRule(tmp);
     }
@@ -534,13 +534,13 @@ bool PluginRootContext::ParseConfiguration(char *config) {
       array = cJSON_GetArrayItem(rules, i);
       if(!array) continue;
       item = cJSON_GetObjectItem(array, "id");
-      if(item) bw.id = item->valueint;
+      if(item) bw.id_ = item->valueint;
       item = cJSON_GetObjectItem(array, "name");
-      if(item) bw.name = item->valuestring;
+      if(item) bw.name_ = item->valuestring;
       item = cJSON_GetObjectItem(array, "expr");
-      if(item) bw.expr = item->valuestring;
+      if(item) bw.expr_ = item->valuestring;
       item = cJSON_GetObjectItem(array, "mode");
-      if(item) bw.mode = item->valuestring;
+      if(item) bw.mode_ = item->valuestring;
       //save data
       ruleData.AddBlackWhiteList(bw);
     }
@@ -556,23 +556,23 @@ bool PluginRootContext::ParseConfiguration(char *config) {
   if(item) ruleData.AddAppName(item->valuestring);
   //get cluster key
   item = cJSON_GetObjectItem(root, "cluster_key");
-  if(item) ruleData.cluster_key = item->valuestring;
+  if(item) ruleData.cluster_key_ = item->valuestring;
   //get post host
   item = cJSON_GetObjectItem(root, "namespace");
-  if(item) ruleData.pod_namespace = item->valuestring;
+  if(item) ruleData.pod_namespace_ = item->valuestring;
   //get post host
   item = cJSON_GetObjectItem(root, "kind");
-  if(item) ruleData.res_kind = item->valuestring;
+  if(item) ruleData.res_kind_ = item->valuestring;
   //get post host
   item = cJSON_GetObjectItem(root, "workload_name");
-  if(item) ruleData.res_name = item->valuestring;
+  if(item) ruleData.res_name_ = item->valuestring;
   //get app id
   item = cJSON_GetObjectItem(root, "service_id");
-  if(item) ruleData.app_id = item->valuedouble;
+  if(item) ruleData.app_id_ = item->valuedouble;
   //free json object
   cJSON_Delete(root);
   //print debug log
-  LOG_D("cluster_key : %s, namespace : %s, kind : %s, resource_name : %s", ruleData.cluster_key.c_str(), ruleData.pod_namespace.c_str(), ruleData.res_kind.c_str(), ruleData.res_name.c_str());
+  LOG_D("cluster_key : %s, namespace : %s, kind : %s, resource_name : %s", ruleData.cluster_key_.c_str(), ruleData.pod_namespace_.c_str(), ruleData.res_kind_.c_str(), ruleData.res_name_.c_str());
   //return
   for (const auto& str : sPodIps)
   {
@@ -585,9 +585,9 @@ bool PluginRootContext::ParseConfiguration(char *config) {
 /*insert waf rule*/
 bool PluginRootContext::InsertWafRule(std::string ip, Rules &rule) {
     /*remove key*/
-    WafRules.erase(ip);
+    waf_rules_.erase(ip);
     /*insert data*/
-    auto it = WafRules.insert({ip, rule});
+    auto it = waf_rules_.insert({ip, rule});
     //print debug log
     LOG_D("save waf rule, pod ip : %s", ip.c_str());
     //return
@@ -598,7 +598,7 @@ int PluginRootContext::HttpPost(std::string value) {
   int zRet;
   std::string data;
   //
-  if(!pzPostFd) RETURN_ERROR(1, "[waf] the post fd is nil");
+  if(!post_fd_) RETURN_ERROR(1, "[waf] the post fd is nil");
   //post data
   char buf[11] = {"#%% pre"};
   auto len = value.length();
@@ -606,10 +606,10 @@ int PluginRootContext::HttpPost(std::string value) {
   buf[8] = (len >> 8) & 0xff;
   buf[9] = (len >> 16) & 0xff;
   buf[10] = (len >> 24) & 0xff;
-  zRet = write(*pzPostFd, buf, HEADER_LEN);
+  zRet = write(*post_fd_, buf, HEADER_LEN);
   if(zRet <= 0) RETURN_ERROR(1, "[waf] post waf data");
 
-  zRet = write(*pzPostFd, value.c_str(), value.length());
+  zRet = write(*post_fd_, value.c_str(), value.length());
   if(zRet <= 0) RETURN_ERROR(1, "[waf] post waf data");
   //print debug log
   data = (value.length() > 1024) ? value.substr(0, 1024) : value;
@@ -639,7 +639,7 @@ bool PluginRootContext::RemoveWafRule(char *config)
   {
     array = cJSON_GetArrayItem(item, i);
     if(!array) continue;
-    WafRules.erase(array->valuestring);
+    waf_rules_.erase(array->valuestring);
   }
   //free json object
   cJSON_Delete(root);

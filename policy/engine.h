@@ -21,40 +21,40 @@ enum class NetPolicyRule {
 };
 
 struct RulePort {
-  uint16_t end_port; //端口段上限
-  uint16_t port;     //端口段下限
-  uint8_t proto;     //协议
+  uint16_t end_port_; //端口段上限
+  uint16_t port_;     //端口段下限
+  uint8_t proto_;     //协议
 };
 
 struct RuleDetail {
-  char proto;                    //协议
-  int priority;                  //权重
-  int addrType;                  // ipv4 OR ipv6
-  FlowDir direction;             //流量策略方向
-  NetPolicyRule action;          //策略
-  std::vector<RulePort> vPorts;  //
-  std::string policyKey;         //策略主键
-  std::string srcIp;             //源地址
-  std::string dstIp;             //目的地址
+  char proto_;                    //协议
+  int priority_;                  //权重
+  int addr_type_;                 // ipv4 OR ipv6
+  FlowDir direction_;             //流量策略方向
+  NetPolicyRule action_;          //策略
+  std::vector<RulePort> ports_;   //
+  std::string policy_key_;        //策略主键
+  std::string src_ip_;            //源地址
+  std::string dst_ip_;            //目的地址
 };
 
 struct HttpRuleInfo {
-  uint8_t direction;
-  NetPolicyRule action;
-  std::string host;
-  std::string method;
-  std::string path;
+  uint8_t direction_;
+  NetPolicyRule action_;
+  std::string host_;
+  std::string method_;
+  std::string path_;
 };
 
 struct FiveTuple {
-  char proto;
-  uint16_t totLen;
-  uint16_t srcPort;
-  uint16_t dstPort;
-  uint32_t uzSrcAddr;
-  uint32_t uzDstAddr;
-  std::string srcAddr;
-  std::string dstAddr;
+  char proto_;
+  uint16_t tot_len_;
+  uint16_t src_port_;
+  uint16_t dst_port_;
+  uint32_t src_addr_u32_;
+  uint32_t dst_addr_u32_;
+  std::string src_addr_;
+  std::string dst_addr_;
 };
 
 class PolicyEngine {
@@ -75,13 +75,13 @@ public:
   bool handle();
 
 private:
-  std::unordered_map<std::string, RuleDetail> NetInputPolicyRule;
-  std::unordered_map<std::string, RuleDetail> NetOutputPolicyRule;
-  std::unordered_map<std::string, std::vector<HttpRuleInfo>> NetInputHttpPolicy;
-  std::unordered_map<std::string, std::vector<HttpRuleInfo>> NetOutputHttpPolicy;
-  std::unordered_map<std::string, std::unordered_map<std::string, FlowDir>*> NetPolicyKey;
-  std::set<int> MaskCidr;
-  std::set<int> Priority;
+  std::unordered_map<std::string, RuleDetail> net_input_policy_rule_;
+  std::unordered_map<std::string, RuleDetail> net_output_policy_rule_;
+  std::unordered_map<std::string, std::vector<HttpRuleInfo>> net_input_http_policy_;
+  std::unordered_map<std::string, std::vector<HttpRuleInfo>> net_output_http_policy_;
+  std::unordered_map<std::string, std::unordered_map<std::string, FlowDir>*> net_policy_key_;
+  std::set<int> mask_cidr_;
+  std::set<int> priority_;
 };
 
 } // namespace policy

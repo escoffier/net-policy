@@ -99,24 +99,24 @@ using FLOW_DIR = FlowDir;
 /*TCP/UDP伪首部*/
 struct PseudoHeader
 {
-    uint32_t  saddr;
-    uint32_t  daddr;
-    uint8_t   placeholder;
-    uint8_t   protocol;
-    uint16_t  length;
+    uint32_t  saddr_;
+    uint32_t  daddr_;
+    uint8_t   placeholder_;
+    uint8_t   protocol_;
+    uint16_t  length_;
 };
 using PSEUDO_HEADER = PseudoHeader; // legacy alias
 
 struct TcpFourTupleV4
 {
-    uint32_t src_addr;
-    uint32_t dst_addr;
-    uint16_t src_port;
-    uint16_t dst_port;
+    uint32_t src_addr_;
+    uint32_t dst_addr_;
+    uint16_t src_port_;
+    uint16_t dst_port_;
 
     bool operator<(const TcpFourTupleV4& other) const noexcept {
-        return std::tie(src_addr, dst_addr, src_port, dst_port) <
-               std::tie(other.src_addr, other.dst_addr, other.src_port, other.dst_port);
+        return std::tie(src_addr_, dst_addr_, src_port_, dst_port_) <
+               std::tie(other.src_addr_, other.dst_addr_, other.src_port_, other.dst_port_);
     }
 };
 using TCP_FOUR_TUPLE_V4 = TcpFourTupleV4; // legacy alias
@@ -171,38 +171,38 @@ public:
 
 struct RcvEpollCb
 {
-    int32_t fd;
-    RcvCbFunc epoll_in_func; // epoll EPOLLIN
-    NFQ_RES_INFO *nfq_res;
+    int32_t fd_;
+    RcvCbFunc epoll_in_func_; // epoll EPOLLIN
+    NFQ_RES_INFO *nfq_res_;
 };
 using RCV_EPOLL_CB = RcvEpollCb; // legacy alias
 
 struct NetCtrlInfo
 {
-    int  pid;           // 进程PID
-    int  level;         // 日志级别
-    uint64_t pod_id;
-    std::string policy_key;
-    std::string uuid;
-    NetDataType msg_type; // 数据类型
+    int  pid_;           // 进程PID
+    int  level_;         // 日志级别
+    uint64_t pod_id_;
+    std::string policy_key_;
+    std::string uuid_;
+    NetDataType msg_type_; // 数据类型
 };
 using NET_CTRL_INFO = NetCtrlInfo; // legacy alias
 
 struct RulePort
 {
-    uint16_t end_port; // 端口段上限
-    uint16_t port;    // 端口段下限
-    uint8_t  proto;   // 协议
+    uint16_t end_port_; // 端口段上限
+    uint16_t port_;    // 端口段下限
+    uint8_t  proto_;   // 协议
 };
 using RULE_PORT = RulePort; // legacy alias
 
 struct HTTP_RULE_INFO
 {
-    uint8_t direction;
-    NetPolicyRule action;
-    std::string host;
-    std::string method;
-    std::string path;
+    uint8_t direction_;
+    NetPolicyRule action_;
+    std::string host_;
+    std::string method_;
+    std::string path_;
 };
 
 /*NFQUE*/
