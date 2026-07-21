@@ -356,6 +356,18 @@ public:
     void PrintPolicyLog();
 };
 
+/*control-channel server — owns the connected client fd and registers it with epoll*/
+class CtrlServer
+{
+public:
+    /*accept a new client; closes any previously connected fd, registers new fd with epoll*/
+    int Accept(int epoll_fd, int client_fd);
+
+private:
+    int client_fd_ = 0;
+    RcvEpollCb epoll_cb_;
+};
+
 /*post-notification server — owns the client fd and sends match/WAF events*/
 class PostServer
 {

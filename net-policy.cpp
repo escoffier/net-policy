@@ -48,7 +48,7 @@ struct u32_mask {
 /*static value*/
 static int g_local_net_ns_fd = 0;
 static PostServer g_post_server;
-static int g_client_fd = 0;
+static CtrlServer g_ctrl_server;
 static PolicyRule g_micro_rule;
 
 static std::unordered_map<uint32_t, uint8_t> g_nodes_ip;
@@ -318,6 +318,32 @@ err:
     close(fd);
   /*return*/
   return -1;
+}
+
+/*forward declaration — defined later in this file*/
+int ParseRcvData(int32_t epoll_fd, int32_t fd, void* ptr);
+
+/*CtrlServer implementation*/
+int CtrlServer::Accept(int epoll_fd, int client_fd) {
+  struct epoll_event ev;
+  if (client_fd_ > 0) {
+    if (client_fd != client_fd_)
+      close(client_fd_);
+    LOG_W("close old globe fd, old fd : %d, new fd : %d.", client_fd_, client_fd);
+  }
+  LOG_I("accept new unix socket link, fd : %d, log level : %d", client_fd, g_log_level);
+  client_fd_ = client_fd;
+  fcntl(client_fd, F_SETFL, fcntl(client_fd, F_GETFL) | O_NONBLOCK);
+  epoll_cb_.fd_ = client_fd_;
+  epoll_cb_.epoll_in_func_ = ParseRcvData;
+  ev.data.ptr = &epoll_cb_;
+  ev.events = EPOLLIN;
+  int ret = epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &ev);
+  if (ret < 0) {
+    close(client_fd);
+    LOG_E("add new client to epoll failed, %s.", strerror(errno));
+  }
+  return 0;
 }
 
 /*PostServer implementation*/
@@ -1935,40 +1961,14 @@ rsp:
 }
 
 int ProcAcceptEvent(int32_t epoll_fd, int32_t fd, void* ptr) {
-  int ret, zClientFd;
+  int zClientFd;
   socklen_t cliAddrLen;
-  struct epoll_event ev;
   struct sockaddr_in address;
-  static RCV_EPOLL_CB DaeEvent;
-  // client address length
   cliAddrLen = sizeof(struct sockaddr_in);
   zClientFd = accept(fd, (struct sockaddr*)&address, &cliAddrLen);
   if (zClientFd <= 0)
     RETURN_ERROR(0, "accept a new client failed, %s.", strerror(errno));
-  /*close old fd*/
-  if (g_client_fd > 0) {
-    if (zClientFd != g_client_fd)
-      close(g_client_fd);
-    LOG_W("close old globe fd, old fd : %d, new fd : %d.", g_client_fd, zClientFd);
-  }
-  /*print debug log*/
-  LOG_I("accept new unix socket link, fd : %d, log level : %d", zClientFd, g_log_level);
-  /*save fd*/
-  g_client_fd = zClientFd;
-  // noblock
-  fcntl(zClientFd, F_SETFL, fcntl(zClientFd, F_GETFL) | O_NONBLOCK);
-  /*callback*/
-  DaeEvent.fd_ = g_client_fd;
-  DaeEvent.epoll_in_func_ = ParseRcvData;
-  // epoll event
-  ev.data.ptr = &DaeEvent;
-  ev.events = EPOLLIN;
-  ret = epoll_ctl(epoll_fd, EPOLL_CTL_ADD, zClientFd, &ev);
-  if (ret < 0) {
-    close(zClientFd);
-    LOG_E("add new client to epoll failed, %s.", strerror(errno));
-  }
-  return 0;
+  return g_ctrl_server.Accept(epoll_fd, zClientFd);
 }
 
 int ProcAcceptPostLinkEvent(int32_t epoll_fd, int32_t fd, void* ptr) {
