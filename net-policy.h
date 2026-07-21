@@ -8,6 +8,7 @@
 #include <vector>
 #include <set>
 #include <netinet/in.h>
+#include <unistd.h>
 #include "vector"
 #include "cjson.h"
 #include "libmnl/libmnl.h"
@@ -407,6 +408,7 @@ private:
 class CtrlServer
 {
 public:
+    ~CtrlServer() { if (client_fd_ > 0) close(client_fd_); }
     /*accept a new client; closes any previously connected fd, registers new fd with epoll*/
     int Accept(int epoll_fd, int client_fd);
 
@@ -419,6 +421,7 @@ private:
 class PostServer
 {
 public:
+    ~PostServer() { if (post_link_fd_ > 0) close(post_link_fd_); }
     /*accept a new client; closes any previously connected fd*/
     void Accept(int client_fd);
     /*send a policy-match notification; returns 0 on success, -1 on error*/
