@@ -49,13 +49,7 @@ struct u32_mask {
 static int g_local_net_ns_fd = 0;
 static PostServer g_post_server;
 static CtrlServer g_ctrl_server;
-static PolicyRule g_micro_rule;
-
-static std::unordered_map<uint32_t, uint8_t> g_nodes_ip;
-static std::map<TCP_FOUR_TUPLE_V4, http::ConnectionPtr> g_tcp_ct_input;
-static std::map<TCP_FOUR_TUPLE_V4, http::ConnectionPtr> g_tcp_ct_output;
-static std::unordered_map<std::string, std::vector<HTTP_RULE_INFO>> g_net_input_http_policy;
-static std::unordered_map<std::string, std::vector<HTTP_RULE_INFO>> g_net_output_http_policy;
+static MicroSegEngine g_microseg;
 net::ConnectionManager g_connection_manager;
 static int g_ipt_ver = 0;
 
@@ -320,6 +314,22 @@ err:
   return -1;
 }
 
+/*MicroSegEngine implementation*/
+void MicroSegEngine::DeletePolicy(const std::string& name) {
+  input_http_policy_.erase(name);
+  output_http_policy_.erase(name);
+  policy_rule_.DeletePolicy(FlowDir::kIngress, name);
+  policy_rule_.DeletePolicy(FlowDir::kEgress, name);
+}
+
+int MicroSegEngine::AddHttpPolicy(FlowDir dir, const std::string& key, HTTP_RULE_INFO& rule) {
+  auto& http = (dir == FlowDir::kIngress) ? input_http_policy_ : output_http_policy_;
+  auto& rules = http[key];
+  LOG_D("add http policy : %s, rules so far : %zu.", key.c_str(), rules.size());
+  rules.push_back(rule);
+  return 0;
+}
+
 /*forward declaration — defined later in this file*/
 int ParseRcvData(int32_t epoll_fd, int32_t fd, void* ptr);
 
@@ -405,15 +415,14 @@ static NET_POLICY_RULE MatchHttpPolicyRule(const std::vector<HTTP_RULE_INFO>& ht
 static NET_POLICY_RULE MatchNetPolicyRule(FiveTuple& tuple, FLOW_DIR dir, RuleDetail& detail) {
   std::vector<std::string> rule_keys;
   /*is node ip*/
-  auto nodeIt = g_nodes_ip.find(tuple.src_addr_u32_);
-  if (nodeIt != g_nodes_ip.end())
+  if (g_microseg.IsNodeIp(tuple.src_addr_u32_))
     return NetPolicyRule::kDefault;
   /*get rule map*/
-  auto rules = g_micro_rule.GetPolicyTree(dir);
+  auto rules = g_microseg.GetPolicyTree(dir);
   if (rules->RuleSize() == 0)
     return NetPolicyRule::kDefault;
   /*get rule key*/
-  g_micro_rule.CreateRuleKeyByTuple(tuple, dir, rule_keys);
+  g_microseg.CreateRuleKeyByTuple(tuple, dir, rule_keys);
   /*遍历规则进行匹配*/
   for (int i = 0; i < (int)rule_keys.size(); i++) {
     /*匹配规则*/
@@ -691,8 +700,8 @@ static int input_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct 
   switch (tuple.proto_) {
   case IPPROTO_TCP:
     /*query conntrack info*/
-    tcp_it = g_tcp_ct_input.find(ct_key);
-    if (tcp_it == g_tcp_ct_input.end()) {
+    tcp_it = g_microseg.TcpCtInput().find(ct_key);
+    if (tcp_it == g_microseg.TcpCtInput().end()) {
       /*tcp syn*/
       if (tcphdr.syn != 0)
         break;
@@ -706,7 +715,7 @@ static int input_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct 
     found = true;
     /*tcp fin*/
     if ((tcphdr.fin == 1) || (tcphdr.rst == 1)) {
-      g_tcp_ct_input.erase(ct_key);
+      g_microseg.TcpCtInput().erase(ct_key);
       /*print debug log*/
       LOG_D("microseg-dp input data, delete conntrack info, src: %s:%d, dest : %s:%d",
             tuple.src_addr_.c_str(), tuple.src_port_, tuple.dst_addr_.c_str(), tuple.dst_port_);
@@ -731,9 +740,9 @@ static int input_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct 
     if (rule_ret == NetPolicyRule::kDefault)
       return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllow), 0, NULL);
     /*query http rule*/
-    auto http_rule = g_net_input_http_policy.find(rule_key);
+    auto http_rule = g_microseg.InputHttpPolicy().find(rule_key);
     /*check http rule*/
-    if ((http_rule == g_net_input_http_policy.end()) || (tuple.proto_ == IPPROTO_UDP) ||
+    if ((http_rule == g_microseg.InputHttpPolicy().end()) || (tuple.proto_ == IPPROTO_UDP) ||
         (tuple.proto_ == IPPROTO_ICMP) || (http_rule->second.empty())) {
       /*post match message*/
       g_post_server.SendMatchMsg(tuple, rule_ret, dir, rule_key);
@@ -756,7 +765,7 @@ static int input_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct 
           tuple.src_addr_.c_str(), tuple.dst_addr_.c_str(), offset, data_len);
     auto conn = std::make_unique<http::Connection>(rule_key);
     conn->setTcpSeq(tcp_seq + 1);
-    g_tcp_ct_input.insert({ct_key, std::move(conn)});
+    g_microseg.TcpCtInput().insert({ct_key, std::move(conn)});
     /*return*/
     return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllowReq), 0, NULL);
   }
@@ -764,11 +773,11 @@ static int input_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct 
   LOG_D("microseg-dp  input data, src: %s, dest : %s, offset : %d, data len : %d",
         tuple.src_addr_.c_str(), tuple.dst_addr_.c_str(), offset, data_len);
   /*can not find tcp conntrack*/
-  if (tcp_it == g_tcp_ct_input.end()) {
+  if (tcp_it == g_microseg.TcpCtInput().end()) {
     LOG_D(
         "microseg-dp input not sync, new conntrack, src: %s, dest : %s, offset : %d, data len : %d",
         tuple.src_addr_.c_str(), tuple.dst_addr_.c_str(), offset, data_len);
-    auto [it, success] = g_tcp_ct_input.insert({ct_key, std::make_unique<http::Connection>(rule_key)});
+    auto [it, success] = g_microseg.TcpCtInput().insert({ct_key, std::make_unique<http::Connection>(rule_key)});
     if (success) {
       tcp_it = it;
     }
@@ -796,8 +805,8 @@ static int input_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct 
   /*get rule key*/
   rule_key = tcp_it->second->getRuleKey();
   /*query http rule*/
-  auto http_rule = g_net_input_http_policy.find(rule_key);
-  if (http_rule == g_net_input_http_policy.end())
+  auto http_rule = g_microseg.InputHttpPolicy().find(rule_key);
+  if (http_rule == g_microseg.InputHttpPolicy().end())
     return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kDefault), 0, NULL);
   // process header
   rule_ret = MatchHttpPolicyRule(http_rule->second, header);
@@ -877,8 +886,8 @@ static int output_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct
   switch (tuple.proto_) {
   case IPPROTO_TCP:
     /*query conntrack info*/
-    tcp_it = g_tcp_ct_output.find(ct_key);
-    if (tcp_it == g_tcp_ct_output.end()) {
+    tcp_it = g_microseg.TcpCtOutput().find(ct_key);
+    if (tcp_it == g_microseg.TcpCtOutput().end()) {
       /*tcp syn*/
       if (tcphdr.syn != 0)
         break;
@@ -892,7 +901,7 @@ static int output_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct
     found = true;
     /*tcp fin*/
     if ((tcphdr.fin == 1) || (tcphdr.rst == 1)) {
-      g_tcp_ct_output.erase(ct_key);
+      g_microseg.TcpCtOutput().erase(ct_key);
       /*print debug log*/
       LOG_D("microseg-dp out data, delete conntrack info, src: %s:%d, dest : %s:%d",
             tuple.src_addr_.c_str(), tuple.src_port_, tuple.dst_addr_.c_str(), tuple.dst_port_);
@@ -917,9 +926,9 @@ static int output_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct
     if (rule_ret == NetPolicyRule::kDefault)
       return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllow), 0, NULL);
     /*query http rule*/
-    auto http_rule = g_net_output_http_policy.find(rule_key);
+    auto http_rule = g_microseg.OutputHttpPolicy().find(rule_key);
     /*check http rule*/
-    if ((http_rule == g_net_output_http_policy.end()) || (tuple.proto_ == IPPROTO_UDP) ||
+    if ((http_rule == g_microseg.OutputHttpPolicy().end()) || (tuple.proto_ == IPPROTO_UDP) ||
         (tuple.proto_ == IPPROTO_ICMP) || (http_rule->second.empty())) {
       /*post match message*/
       g_post_server.SendMatchMsg(tuple, rule_ret, dir, rule_key);
@@ -941,7 +950,7 @@ static int output_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct
           rule_key.c_str(), tuple.src_addr_.c_str(), tuple.dst_addr_.c_str(), offset, data_len);
     auto conn = std::make_unique<http::Connection>(rule_key);
     conn->setTcpSeq(tcp_seq + 1);
-    g_tcp_ct_output.insert({ct_key, std::move(conn)});
+    g_microseg.TcpCtOutput().insert({ct_key, std::move(conn)});
     /*return*/
     return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllowRsp), 0, NULL);
   }
@@ -949,11 +958,11 @@ static int output_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct
   LOG_D("microseg-dp output data, src: %s, dest : %s, offset : %d, data len : %d",
         tuple.src_addr_.c_str(), tuple.dst_addr_.c_str(), offset, data_len);
   /*can not find tcp conntrack*/
-  if (tcp_it == g_tcp_ct_output.end()) {
+  if (tcp_it == g_microseg.TcpCtOutput().end()) {
     LOG_D("microseg-dp output not sync, new conntrack, src: %s, dest : %s, offset : %d, data len : "
           "%d",
           tuple.src_addr_.c_str(), tuple.dst_addr_.c_str(), offset, data_len);
-    auto [it, success] = g_tcp_ct_output.insert({ct_key, std::make_unique<http::Connection>(rule_key)});
+    auto [it, success] = g_microseg.TcpCtOutput().insert({ct_key, std::make_unique<http::Connection>(rule_key)});
     if (success) {
       tcp_it = it;
     }
@@ -981,8 +990,8 @@ static int output_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct
   if (header.parseState_ != ParseState::Done)
     return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllowRsp), 0, NULL);
   /*query http rule*/
-  auto http_rule = g_net_output_http_policy.find(rule_key);
-  if (http_rule == g_net_output_http_policy.end())
+  auto http_rule = g_microseg.OutputHttpPolicy().find(rule_key);
+  if (http_rule == g_microseg.OutputHttpPolicy().end())
     return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kDefault), 0, NULL);
   // process header
   rule_ret = MatchHttpPolicyRule(http_rule->second, header);
@@ -1160,7 +1169,7 @@ err:
 int InitNfqueue(int epoll_fd, NET_CTRL_INFO& ctrl) {
   int ret;
   // check resource — duplicated resource is not an error
-  if (g_micro_rule.GetNfqRes(ctrl.pod_id_) != nullptr)
+  if (g_microseg.GetNfqRes(ctrl.pod_id_) != nullptr)
     RETURN_WARN(0, "duplicated pod resource, pid : %d.", ctrl.pid_);
   // new memory
   auto nfq_res = std::make_unique<NFQ_RES_INFO>();
@@ -1187,7 +1196,7 @@ int InitNfqueue(int epoll_fd, NET_CTRL_INFO& ctrl) {
   if (ret != 0)
     GOTO_ERROR(err, "add %d epoll event failed.", ctrl.pid_);
   /*insert nfqueue — transfer ownership*/
-  ret = g_micro_rule.NewNfQueRes(ctrl.pod_id_, std::move(nfq_res));
+  ret = g_microseg.NewNfQueRes(ctrl.pod_id_, std::move(nfq_res));
   if (ret != 0)
     GOTO_ERROR(err, "insert nfqueue resource failed, pid : %d.", ctrl.pid_);
   /*return*/
@@ -1204,24 +1213,13 @@ int DeletePolicy(std::string& name) {
   if (name.empty())
     RETURN_ERROR(0, "the policy name is empty.");
 
-  /*clear input http policy*/
-  g_net_input_http_policy.erase(name);
-  /*clear output http policy*/
-  g_net_output_http_policy.erase(name);
-  /*clear*/
-  g_micro_rule.DeletePolicy(FlowDir::kIngress, name);
-  /*clear*/
-  g_micro_rule.DeletePolicy(FlowDir::kEgress, name);
+  g_microseg.DeletePolicy(name);
   /*return*/
   return 0;
 }
 
 int AddNewHttpPolicy(FLOW_DIR dir, std::string& key, HTTP_RULE_INFO& http_rule) {
-  auto& http = (dir == FlowDir::kIngress) ? g_net_input_http_policy : g_net_output_http_policy;
-  auto& rules = http[key]; // default-constructs vector if key absent
-  LOG_D("add http policy : %s, rules so far : %zu.", key.c_str(), rules.size());
-  rules.push_back(http_rule);
-  return 0;
+  return g_microseg.AddHttpPolicy(dir, key, http_rule);
 }
 
 /*add policy*/
@@ -1232,7 +1230,7 @@ int AddNewPolicy(RuleDetail& policy, RULE_PORT& stPort) {
   /*print debug log*/
   // PrintPolicyData(policy, stPort);
   /*处理下发的规则*/
-  return g_micro_rule.AddPolicyToTree(policy, stPort);
+  return g_microseg.AddPolicy(policy, stPort);
 }
 
 /*update iptable rule*/
@@ -1241,7 +1239,7 @@ void UpdateMark(std::unordered_map<uint64_t, string>& cgRes) {
   FiveTuple tuple = {};
 
   for (auto it = cgRes.begin(); it != cgRes.end(); it++) {
-    auto res = g_micro_rule.GetNfqRes(it->first);
+    auto res = g_microseg.GetNfqRes(it->first);
     if (res == nullptr)
       CONTINUE_ERROR("can not find pod resource, pod id : %lu.", it->first);
     // set mark
@@ -1432,9 +1430,9 @@ int ParseNodeCfg(char* buf) {
     uzIp = ipv4StringToInt(ip);
     // add or delete node ip
     if (action == 0) {
-      g_nodes_ip.erase(uzIp);
+      g_microseg.RemoveNodeIp(uzIp);
     } else {
-      g_nodes_ip[uzIp] = 1;
+      g_microseg.AddNodeIp(uzIp);
     }
   }
   // free resource
@@ -1839,13 +1837,13 @@ int ParseRcvData(int32_t epoll_fd, int32_t fd, void* ptr) {
     goto rsp;
 
   case NetDataType::kPodDie:
-    ret = g_micro_rule.DeleteNfQueRes(epoll_fd, ctrl.pod_id_);
+    ret = g_microseg.DeleteNfQueRes(epoll_fd, ctrl.pod_id_);
     goto rsp;
 
   case NetDataType::kAddRule:
     ret = ParseNetPolicy(data_buf);
     /*print rule size*/
-    g_micro_rule.PrintPolicyLog();
+    g_microseg.PrintPolicyLog();
     goto rsp;
 
   case NetDataType::kDelRule:
@@ -1869,7 +1867,7 @@ int ParseRcvData(int32_t epoll_fd, int32_t fd, void* ptr) {
     goto rsp;
 
   case NetDataType::kConfDump:
-    respBody = g_micro_rule.GetAllConfig(ctrl.policy_key_);
+    respBody = g_microseg.GetAllConfig(ctrl.policy_key_);
     goto rsp;
 
   case NetDataType::kConnDump:
@@ -1877,7 +1875,7 @@ int ParseRcvData(int32_t epoll_fd, int32_t fd, void* ptr) {
     goto rsp;
 
   case NetDataType::kReset:
-    ret = g_micro_rule.ClearCfg();
+    ret = g_microseg.ClearCfg();
     ;
     goto rsp;
 
@@ -2138,7 +2136,7 @@ int main(int argc, char* argv[]) {
   if (ret < 0)
     GOTO_ERROR(err, "listen the client connect request! err : %s.", strerror(errno));
   //
-  g_micro_rule.efd_ = epfd;
+  g_microseg.SetEfd(epfd);
   //
   unixEvent.fd_ = zListenFd;
   unixEvent.epoll_in_func_ = ProcAcceptEvent;

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <map>
 #include <memory>
 #include <unordered_map>
 #include <string>
@@ -354,6 +355,52 @@ public:
     cJSON *GetAllConfig(std::string name);
     /*打印日志*/
     void PrintPolicyLog();
+};
+
+/*micro-segmentation engine — owns the policy rule set and all companion state*/
+class MicroSegEngine
+{
+public:
+    /*set the epoll fd used by the underlying NFQ resources*/
+    void SetEfd(int efd) { policy_rule_.efd_ = efd; }
+
+    /*---- NFQ resource lifecycle (delegated to PolicyRule/NfQueData) ----*/
+    NFQ_RES_INFO* GetNfqRes(uint64_t pod_id)      { return policy_rule_.GetNfqRes(pod_id); }
+    int  NewNfQueRes(uint64_t pod_id, std::unique_ptr<NFQ_RES_INFO> res)
+                                                   { return policy_rule_.NewNfQueRes(pod_id, std::move(res)); }
+    int  DeleteNfQueRes(int efd, uint64_t pod_id)  { return policy_rule_.DeleteNfQueRes(efd, pod_id); }
+
+    /*---- network policy (delegated to PolicyRule) ----*/
+    PolicyTree* GetPolicyTree(FlowDir dir)         { return policy_rule_.GetPolicyTree(dir); }
+    void CreateRuleKeyByTuple(FiveTuple& t, FlowDir d, std::vector<std::string>& v)
+                                                   { policy_rule_.CreateRuleKeyByTuple(t, d, v); }
+    int  AddPolicy(RuleDetail& policy, RulePort& port) { return policy_rule_.AddPolicyToTree(policy, port); }
+    void DeletePolicy(const std::string& name);    /*erases HTTP rules AND net policy for both directions*/
+    int  ClearCfg()                                { return policy_rule_.ClearCfg(); }
+    void PrintPolicyLog()                          { policy_rule_.PrintPolicyLog(); }
+    cJSON* GetAllConfig(const std::string& name)   { return policy_rule_.GetAllConfig(name); }
+
+    /*---- HTTP L7 policy ----*/
+    int  AddHttpPolicy(FlowDir dir, const std::string& key, HTTP_RULE_INFO& rule);
+    std::unordered_map<std::string, std::vector<HTTP_RULE_INFO>>& InputHttpPolicy()  { return input_http_policy_; }
+    std::unordered_map<std::string, std::vector<HTTP_RULE_INFO>>& OutputHttpPolicy() { return output_http_policy_; }
+
+    /*---- node IP registry ----*/
+    bool IsNodeIp(uint32_t ip) const               { return nodes_ip_.count(ip) > 0; }
+    void AddNodeIp(uint32_t ip)                    { nodes_ip_[ip] = 1; }
+    void RemoveNodeIp(uint32_t ip)                 { nodes_ip_.erase(ip); }
+
+    /*---- TCP connection tracking ----*/
+    std::map<TcpFourTupleV4, http::ConnectionPtr>& TcpCtInput()  { return tcp_ct_input_; }
+    std::map<TcpFourTupleV4, http::ConnectionPtr>& TcpCtOutput() { return tcp_ct_output_; }
+
+private:
+    PolicyRule                                                         policy_rule_;
+    std::unordered_map<uint32_t, uint8_t>                             nodes_ip_;
+    std::map<TcpFourTupleV4, http::ConnectionPtr>                     tcp_ct_input_;
+    std::map<TcpFourTupleV4, http::ConnectionPtr>                     tcp_ct_output_;
+    std::unordered_map<std::string, std::vector<HTTP_RULE_INFO>>      input_http_policy_;
+    std::unordered_map<std::string, std::vector<HTTP_RULE_INFO>>      output_http_policy_;
 };
 
 /*control-channel server — owns the connected client fd and registers it with epoll*/
