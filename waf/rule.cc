@@ -323,7 +323,7 @@ std::string SaveHeadersInfo(AttackedLog &r, std::unordered_map<std::string, std:
     if(scheme.empty()) scheme = "http";
     /*uri*/
     uri = method + " " + path + " " + scheme + "/1.1";
-    r.ReqPkg = uri + other + "\r\n";
+    r.req_pkg_ = uri + other + "\r\n";
     /*url*/
     auto pos = path.find("?");
     if(pos != std::string::npos) {
@@ -573,41 +573,41 @@ Rules::~Rules() {}
 //init
 void Rules::InitRule()
 {
-    this->WhiteList.clear();
-    this->BlackList.clear();
-    this->HeaderRules.clear();
-    this->BodyRules.clear();
-    this->domain.clear();
-    this->detectHeader.clear();
-    this->ignore.clear();
-    this->ForceWhiteList.clear();
+    this->white_list_.clear();
+    this->black_list_.clear();
+    this->header_rules_.clear();
+    this->body_rules_.clear();
+    this->domain_.clear();
+    this->detect_header_.clear();
+    this->ignore_.clear();
+    this->force_white_list_.clear();
 }
 
 void Rules::AddRule(Rule rule)
 {
     std::vector<std::string> headers, bodys;
     /*format mode*/
-    rule.matchFunc = ParseModeInfo(rule.mode);
-    if(rule.matchFunc.size() == 0) RETURN_ERROR(, "parse rule mode failed, mode : %s", rule.mode.c_str());
+    rule.match_func_ = ParseModeInfo(rule.mode_);
+    if(rule.match_func_.size() == 0) RETURN_ERROR(, "parse rule mode failed, mode : %s", rule.mode_.c_str());
 
     /*print debug log*/
-    LOG_D("func back : %s", rule.matchFunc.back().c_str());
+    LOG_D("func back : %s", rule.match_func_.back().c_str());
     /*request type*/
-    ParseDecodeType(rule.matchFunc.back(), headers, bodys);
+    ParseDecodeType(rule.match_func_.back(), headers, bodys);
     /*push header rule*/
     if(headers.size() > 0)
     {
-        rule.keys.assign(headers.begin(), headers.end());
-        HeaderRules.push_back(rule);
-        LOG_D("add header rule id : %ld, mode : %s, keys size : %d", rule.id, rule.mode.c_str(), (int)rule.keys.size());
+        rule.keys_.assign(headers.begin(), headers.end());
+        header_rules_.push_back(rule);
+        LOG_D("add header rule id : %ld, mode : %s, keys size : %d", rule.id_, rule.mode_.c_str(), (int)rule.keys_.size());
     }
     /*push body rule*/
     if(bodys.size() > 0)
     {
-        rule.keys.clear();
-        rule.keys.assign(bodys.begin(), bodys.end());
-        BodyRules.push_back(rule);
-        LOG_D("add body rule id : %ld, mode : %s, keys size : %d", rule.id, rule.mode.c_str(), (int)rule.keys.size());
+        rule.keys_.clear();
+        rule.keys_.assign(bodys.begin(), bodys.end());
+        body_rules_.push_back(rule);
+        LOG_D("add body rule id : %ld, mode : %s, keys size : %d", rule.id_, rule.mode_.c_str(), (int)rule.keys_.size());
     }
 }
 
@@ -628,7 +628,7 @@ void Rules::AddIgnoreType(std::string &value)
 {
     if(value.length() == 0) return;
     //insert
-    this->ignore.insert(std::make_pair(value, 0));
+    this->ignore_.insert(std::make_pair(value, 0));
     //print debug log
     LOG_D("ignore type : %s", value.c_str());
 }
@@ -638,7 +638,7 @@ void Rules::AddDetectHeader(std::string &value)
 {
     if(value.length() == 0) return;
     //push back
-    this->detectHeader.push_back(value);
+    this->detect_header_.push_back(value);
     //print debug log
     LOG_D("detect header : %s", value.c_str());
 }
@@ -648,7 +648,7 @@ void Rules::AddDomain(std::string &value)
 { 
     if(value.length() == 0) return;
     //push back
-    this->domain.push_back(value);
+    this->domain_.push_back(value);
     //print debug log
     LOG_D("domain : %s", value.c_str());
 }
@@ -657,11 +657,11 @@ void Rules::AddDomain(std::string &value)
 void Rules::AddDefAction(std::string value)
 {
     if(value == "passthrough") {
-        this->defAction = ACTION_BYPASS;
+        this->def_action_ = ACTION_BYPASS;
     } else if(value == "alert") {
-        this->defAction = ATCION_ALERT;
+        this->def_action_ = ATCION_ALERT;
     } else if(value == "protect") {
-        this->defAction = ATCTION_DROP;
+        this->def_action_ = ATCTION_DROP;
     }
 }
 
@@ -669,9 +669,9 @@ void Rules::AddDefAction(std::string value)
 void Rules::AddForceWhiteList(BWList &bw)
 {
     int i;
-    if(bw.mode != "strong-white") return;
+    if(bw.mode_ != "strong-white") return;
 
-    auto para = split(bw.expr, ",");
+    auto para = split(bw.expr_, ",");
     for(i = 0; i < (int)para.size(); i++)
     {
         auto argv = para.at(i);
@@ -680,16 +680,16 @@ void Rules::AddForceWhiteList(BWList &bw)
         //check cidr
         auto pos = argv.find("/");
         if(pos == std::string::npos) {
-            bw.rtype.push_back(AUTO_RULE_IP_EQUAL);
+            bw.rtype_.push_back(AUTO_RULE_IP_EQUAL);
         } else {
-            bw.rtype.push_back(AUTO_RULE_IP_CIDR);
+            bw.rtype_.push_back(AUTO_RULE_IP_CIDR);
         }
-        bw.rdata.push_back(argv);
+        bw.rdata_.push_back(argv);
     }
     //mode
-    bw.action = ACTION_BYPASS;
-    bw.desc   =  "IP强白名单";
-    this->ForceWhiteList.push_back(bw);
+    bw.action_ = ACTION_BYPASS;
+    bw.desc_   =  "IP强白名单";
+    this->force_white_list_.push_back(bw);
 }
 
 /*add black list and white list*/
@@ -697,12 +697,12 @@ void Rules::AddBlackWhiteList(BWList &bw)
 {
     int i, j;
     std::string rinfo, argv;
-    bw.rtype.clear();
-    bw.rdata.clear();
+    bw.rtype_.clear();
+    bw.rdata_.clear();
     /*check force white*/
-    if(bw.mode == "strong-white") return AddForceWhiteList(bw);
+    if(bw.mode_ == "strong-white") return AddForceWhiteList(bw);
     /*count || && number*/
-    auto input = CountRuleTagNumWithDelSpace(bw.expr);
+    auto input = CountRuleTagNumWithDelSpace(bw.expr_);
     auto data = split(input, "||");
     for(i = 0; i < (int)data.size(); i++)
     {
@@ -712,54 +712,54 @@ void Rules::AddBlackWhiteList(BWList &bw)
             argv = removeSpeStr(value.at(j), " ");
             argv = removeSpeStr(argv, "(");
             argv = removeSpeStr(argv, ")");
-            input = replaceString(input, argv, std::to_string(bw.rtype.size()));
+            input = replaceString(input, argv, std::to_string(bw.rtype_.size()));
             /*get rule info*/
             rinfo = getRuleVaule(argv);
             /*find string*/
             auto pos = argv.find("path ==");
             if(pos != std::string::npos) {
-                bw.rdata.push_back(rinfo);
-                bw.rtype.push_back(AUTO_RULE_PATH_EQUAL);
+                bw.rdata_.push_back(rinfo);
+                bw.rtype_.push_back(AUTO_RULE_PATH_EQUAL);
                 continue;
             }
             //path match
             pos = argv.find("path matches");
             if(pos != std::string::npos) {
-                bw.rdata.push_back(rinfo);
-                bw.rtype.push_back(AUTO_RULE_PATH_REG);
+                bw.rdata_.push_back(rinfo);
+                bw.rtype_.push_back(AUTO_RULE_PATH_REG);
                 continue;
             }
             //ip
             pos = argv.find("ip ==");
             if(pos != std::string::npos) {
-                bw.rdata.push_back(rinfo);
-                bw.rtype.push_back(AUTO_RULE_IP_EQUAL);
+                bw.rdata_.push_back(rinfo);
+                bw.rtype_.push_back(AUTO_RULE_IP_EQUAL);
                 continue;
             }
             //ip cidr
             pos = argv.find("ip CIDR");
             if(pos != std::string::npos) {
-                bw.rdata.push_back(rinfo);
-                bw.rtype.push_back(AUTO_RULE_IP_CIDR);
+                bw.rdata_.push_back(rinfo);
+                bw.rtype_.push_back(AUTO_RULE_IP_CIDR);
                 continue;
             }
         }
     }
     /*save operation expression*/
-    bw.oprexpr = delSpace(input);
+    bw.oprexpr_ = delSpace(input);
     /*print debug  log*/
-    LOG_D("[bwlist] opr expr : [%s], src : [%s], mode : %s", input.c_str(), bw.expr.c_str(), bw.mode.c_str());
+    LOG_D("[bwlist] opr expr : [%s], src : [%s], mode : %s", input.c_str(), bw.expr_.c_str(), bw.mode_.c_str());
     //mode
-    if(bw.mode == "black")
+    if(bw.mode_ == "black")
     {
-        bw.action = ATCTION_DROP;
+        bw.action_ = ATCTION_DROP;
         //push back
-        this->BlackList.push_back(bw);
+        this->black_list_.push_back(bw);
     }
     else
     {
-        bw.action = ACTION_BYPASS;
-        this->WhiteList.push_back(bw);
+        bw.action_ = ACTION_BYPASS;
+        this->white_list_.push_back(bw);
     }
 }
 
@@ -828,16 +828,16 @@ bool Rules::MatchIgnoreType(std::string &src)
     auto pos = value.at(0).rfind(".");
     if(pos == std::string::npos) return false;
     auto data = value.at(0).substr(pos);
-    auto it = this->ignore.find(data);
-    return (it == this->ignore.end()) ? false : true;
+    auto it = this->ignore_.find(data);
+    return (it == this->ignore_.end()) ? false : true;
 }
 
 /*match ignore type*/
 bool Rules::MatchDomain(std::string &src)
 {
-    for(int i = 0; i < (int)this->domain.size(); i++)
+    for(int i = 0; i < (int)this->domain_.size(); i++)
     {
-        if(src == this->domain.at(i)) return true;
+        if(src == this->domain_.at(i)) return true;
     }
     return false;
 }
@@ -848,16 +848,16 @@ bool Rules::MatchForceWhiteList(std::vector<std::string> &ips, std::string &path
     int mask, j, n, i;
     std::string sip, rip, ip;
     std::vector<std::string> data;
-    if((this->ForceWhiteList.size() == 0) || (ips.size() == 0)) return false;
+    if((this->force_white_list_.size() == 0) || (ips.size() == 0)) return false;
     /*set action*/
-    policy.action = ACTION_BYPASS;
-    policy.desc   = "IP强白名单";
-    policy.mode   = ips.at(0);
+    policy.action_ = ACTION_BYPASS;
+    policy.desc_   = "IP强白名单";
+    policy.mode_   = ips.at(0);
     /*list black and white list*/
-    for(i = 0; i < (int)this->ForceWhiteList.size(); i++)
+    for(i = 0; i < (int)this->force_white_list_.size(); i++)
     {
-        auto wType = this->ForceWhiteList.at(i).rtype;
-        auto wRule = this->ForceWhiteList.at(i).rdata;
+        auto wType = this->force_white_list_.at(i).rtype_;
+        auto wRule = this->force_white_list_.at(i).rdata_;
         for(j = 0; j < (int)wRule.size(); j++)
         {
             switch (wType.at(j))
@@ -867,8 +867,8 @@ bool Rules::MatchForceWhiteList(std::vector<std::string> &ips, std::string &path
                 {
                     ip = ips.at(n);
                     if(ip != wRule.at(j)) continue;
-                    policy = this->ForceWhiteList.at(i);
-                    policy.mode = ip;
+                    policy = this->force_white_list_.at(i);
+                    policy.mode_ = ip;
                     return true;
                 }
                 break;
@@ -880,8 +880,8 @@ bool Rules::MatchForceWhiteList(std::vector<std::string> &ips, std::string &path
                     ip = ips.at(n);
                     rip = calculateNetworkAddress(ip, mask);
                     if(rip != sip) continue;
-                    policy = this->ForceWhiteList.at(i);
-                    policy.mode = ip;
+                    policy = this->force_white_list_.at(i);
+                    policy.mode_ = ip;
                     return true;
                 }
                 break;
@@ -892,7 +892,7 @@ bool Rules::MatchForceWhiteList(std::vector<std::string> &ips, std::string &path
         }
     }
     /*set reverse action*/
-    policy.action = ATCTION_DROP;
+    policy.action_ = ATCTION_DROP;
     /*return*/
     return true;
 }
@@ -907,13 +907,13 @@ bool Rules::MatchBlackWhiteList(std::vector<std::string> &ips, std::string &path
     std::vector<std::string> data, bRet, mode, desc;
     /*white and black list*/
     bwList.clear();
-    bwList.assign(this->WhiteList.begin(), this->WhiteList.end());
-    bwList.insert(bwList.end(), this->BlackList.begin(), this->BlackList.end());
+    bwList.assign(this->white_list_.begin(), this->white_list_.end());
+    bwList.insert(bwList.end(), this->black_list_.begin(), this->black_list_.end());
     /*list black and white list*/
     for(i = 0; i < (int)bwList.size(); i++)
     {
-        auto bwType = bwList.at(i).rtype;
-        auto bwRule = bwList.at(i).rdata;
+        auto bwType = bwList.at(i).rtype_;
+        auto bwRule = bwList.at(i).rdata_;
         /*init vector*/
         bRet.clear();
         mode.clear();
@@ -942,7 +942,7 @@ bool Rules::MatchBlackWhiteList(std::vector<std::string> &ips, std::string &path
                     if(ip != bwRule.at(j)) continue;
                     sMathRet = "true";
                     sMode = ip;
-                    sDesc = (policy.action == ATCTION_DROP) ? "IP黑名单" : "IP白名单";
+                    sDesc = (policy.action_ == ATCTION_DROP) ? "IP黑名单" : "IP白名单";
                     break;
                 }
                 mode.push_back(ip);
@@ -959,7 +959,7 @@ bool Rules::MatchBlackWhiteList(std::vector<std::string> &ips, std::string &path
                     if(rip != sip) continue;
                     sMathRet = "true";
                     sMode = ip;
-                    sDesc = (policy.action == ATCTION_DROP) ? "IP黑名单" : "IP白名单";
+                    sDesc = (policy.action_ == ATCTION_DROP) ? "IP黑名单" : "IP白名单";
                     break;
                 }
                 mode.push_back(ip);
@@ -975,7 +975,7 @@ bool Rules::MatchBlackWhiteList(std::vector<std::string> &ips, std::string &path
                     if(data.at(0) != bwRule.at(j)) break;
                     sMathRet = "true";
                     sMode = path;
-                    sDesc = (policy.action == ATCTION_DROP) ? "路径黑名单" : "路径白名单";
+                    sDesc = (policy.action_ == ATCTION_DROP) ? "路径黑名单" : "路径白名单";
                     break;
                 }
                 mode.push_back(ip);
@@ -991,7 +991,7 @@ bool Rules::MatchBlackWhiteList(std::vector<std::string> &ips, std::string &path
                     if (!std::regex_search(data.at(0), std::regex(bwRule.at(j)))) break;
                     sMathRet = "true";
                     sMode = path;
-                    sDesc = (policy.action == ATCTION_DROP) ? "路径黑名单" : "路径白名单";
+                    sDesc = (policy.action_ == ATCTION_DROP) ? "路径黑名单" : "路径白名单";
                     break;
                 }
                 mode.push_back(ip);
@@ -1004,16 +1004,16 @@ bool Rules::MatchBlackWhiteList(std::vector<std::string> &ips, std::string &path
             }
         }
         /*operation expression*/
-        auto orNum = CountSubstr(policy.oprexpr, "||");
-        auto andNum = CountSubstr(policy.oprexpr, "&&");
+        auto orNum = CountSubstr(policy.oprexpr_, "||");
+        auto andNum = CountSubstr(policy.oprexpr_, "&&");
         auto aCount = orNum + andNum;
         /*one*/
         if(aCount == 0)
         {
             /*not match*/
             if(bRet.at(0).compare("false") == 0) continue;
-            policy.mode = mode.at(0);
-            policy.desc = desc.at(0);
+            policy.mode_ = mode.at(0);
+            policy.desc_ = desc.at(0);
             /*match success*/
             return true;
         }
@@ -1030,8 +1030,8 @@ bool Rules::MatchBlackWhiteList(std::vector<std::string> &ips, std::string &path
             }
             /*match failed*/
             if(!mret) continue;
-            policy.mode = mode.at(n);
-            policy.desc = desc.at(n);
+            policy.mode_ = mode.at(n);
+            policy.desc_ = desc.at(n);
             /*match success*/
             return true;
         }
@@ -1049,22 +1049,22 @@ bool Rules::MatchBlackWhiteList(std::vector<std::string> &ips, std::string &path
             /*match failed*/
             if(!mret) continue;
             /*get match information*/
-            policy.mode = mode.at(n);
-            policy.desc = desc.at(n);
+            policy.mode_ = mode.at(n);
+            policy.desc_ = desc.at(n);
             /*match success*/
             return true;
         }
         /*replace*/
-        policy.mode = "";
-        std::string expr = policy.oprexpr;
+        policy.mode_ = "";
+        std::string expr = policy.oprexpr_;
         for(n = 0; n < (int)bRet.size(); n++)
         {
             expr = replaceString(expr, std::to_string(n), bRet.at(n));
-            if((bRet.at(n).compare("true") == 0) && (policy.mode.empty()))
+            if((bRet.at(n).compare("true") == 0) && (policy.mode_.empty()))
             {
                 /*get mode and desc*/
-                policy.mode = mode.at(n);
-                policy.desc = desc.at(n);
+                policy.mode_ = mode.at(n);
+                policy.desc_ = desc.at(n);
             }
         }
         /*eval*/

@@ -23,8 +23,8 @@
 namespace net {
 
 std::ostream& operator<<(std::ostream& os, const ConnectionID& conn) {
-  os << "connection{ " << ipv4ToString(conn.local_ip) << ":" << conn.local_port << ", "
-     << ipv4ToString(conn.foreign_ip) << ":" << conn.foreign_port << " }";
+  os << "connection{ " << ipv4ToString(conn.local_ip_) << ":" << conn.local_port_ << ", "
+     << ipv4ToString(conn.foreign_ip_) << ":" << conn.foreign_port_ << " }";
   return os;
 }
 
@@ -141,8 +141,8 @@ std::vector<std::string> Tcp::connections() {
   std::vector<std::string> conns{};
   for (auto& [key, value] : tcbs_) {
     std::ostringstream conn;
-    conn << ipv4ToString(key.local_ip) << ":" << key.local_port << ","
-         << ipv4ToString(key.foreign_ip) << ":" << key.foreign_port;
+    conn << ipv4ToString(key.local_ip_) << ":" << key.local_port_ << ","
+         << ipv4ToString(key.foreign_ip_) << ":" << key.foreign_port_;
     conns.push_back(conn.str());
   }
   return conns;

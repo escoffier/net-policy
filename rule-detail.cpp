@@ -228,15 +228,15 @@ bool RuleDetail::MatchRuleDetail(FiveTuple &tuple, FlowDir dir)
     /*匹配端口*/
     for(p = 0; p < (int)this->ports_.size(); p++)
     {
-        if(this->ports_.at(p).end_port == 0)
+        if(this->ports_.at(p).end_port_ == 0)
         {
             bIsMatch = true;
             break;
         }
         /*check port rang*/
-        if(tuple.dst_port_ > this->ports_.at(p).end_port) continue;
+        if(tuple.dst_port_ > this->ports_.at(p).end_port_) continue;
         /*check min port*/
-        if(tuple.dst_port_ < this->ports_.at(p).port) continue;
+        if(tuple.dst_port_ < this->ports_.at(p).port_) continue;
         /*set match true*/
         bIsMatch = true;
         break;
@@ -248,7 +248,7 @@ bool RuleDetail::MatchRuleDetail(FiveTuple &tuple, FlowDir dir)
     /*print debug log*/
     LOG_D("flow dir %s, match name : %s, dir : %d, action : %d, priority : %d, proto : %d, ip : %s <--> %s port : %d ~ %d",
         (dir == FlowDir::kIngress) ? "ingress" : "egress", this->policy_key_.c_str(), static_cast<int>(this->direction_), static_cast<int>(this->action_), this->priority_,
-        this->proto_, this->src_ip_.c_str(), this->dst_ip_.c_str(), this->ports_.at(p).port, this->ports_.at(p).end_port);
+        this->proto_, this->src_ip_.c_str(), this->dst_ip_.c_str(), this->ports_.at(p).port_, this->ports_.at(p).end_port_);
     /*return*/
     return true;
 }
@@ -264,7 +264,7 @@ void RuleDetail::PrintRuleDetail(std::string desc)
     for(int i = 0; i < (int)this->ports_.size(); i++)
     {
         memset(buf, 0, sizeof(buf));
-        sprintf(buf, "%d ~ %d", this->ports_.at(i).port, this->ports_.at(i).end_port);
+        sprintf(buf, "%d ~ %d", this->ports_.at(i).port_, this->ports_.at(i).end_port_);
         ports += buf;
         if((i + 1) < (int)this->ports_.size()) ports += ",";
     }
@@ -285,7 +285,7 @@ bool RuleGroup::AddRuleDetail(RuleDetail rule, RULE_PORT &stPort)
     if(it == this->rules_.end())
     {
         /*print debug log*/
-        LOG_D("create policy name : %s, action : %d, mutil port : %d ~ %d.", rule.policy_key_.c_str(), rule.action_, stPort.port, stPort.end_port);
+        LOG_D("create policy name : %s, action : %d, mutil port : %d ~ %d.", rule.policy_key_.c_str(), rule.action_, stPort.port_, stPort.end_port_);
         /*save policy port*/
         rule.AddPortsCfg(stPort);
         /*make shared*/
@@ -300,7 +300,7 @@ bool RuleGroup::AddRuleDetail(RuleDetail rule, RULE_PORT &stPort)
     /*add port config*/
     detail->AddPortsCfg(stPort);
     /*print debug log*/
-    LOG_D("add policy name : %s, dir : %d, action : %d, mutil port : %d ~ %d, port num : %d", rule.policy_key_.c_str(), rule.direction_, rule.action_, stPort.port, stPort.end_port, (int)detail->ports_.size());
+    LOG_D("add policy name : %s, dir : %d, action : %d, mutil port : %d ~ %d, port num : %d", rule.policy_key_.c_str(), rule.direction_, rule.action_, stPort.port_, stPort.end_port_, (int)detail->ports_.size());
     /*print debug log*/
     detail->PrintRuleDetail("add");
     /*return*/
@@ -327,7 +327,7 @@ bool RuleGroup::MatchRule(FiveTuple &tuple, RuleDetail &detail, FlowDir dir)
     /*遍历规则列表*/
     for(auto it = this->rules_.begin(); it != this->rules_.end(); it++)
     {
-        detail = it->second;
+        detail.AssignFrom(it->second);
         auto ret = detail.MatchRuleDetail(tuple, dir);
         if(ret) return true;
     }

@@ -47,15 +47,9 @@ struct u32_mask {
 
 /*static value*/
 static int g_local_net_ns_fd = 0;
-static int g_post_link_fd = 0;
-static int g_client_fd = 0;
-static PolicyRule g_micro_rule;
-
-static std::unordered_map<uint32_t, uint8_t> g_nodes_ip;
-static std::map<TCP_FOUR_TUPLE_V4, http::ConnectionPtr> g_tcp_ct_input;
-static std::map<TCP_FOUR_TUPLE_V4, http::ConnectionPtr> g_tcp_ct_output;
-static std::unordered_map<std::string, std::vector<HTTP_RULE_INFO>> g_net_input_http_policy;
-static std::unordered_map<std::string, std::vector<HTTP_RULE_INFO>> g_net_output_http_policy;
+static PostServer g_post_server;
+static CtrlServer g_ctrl_server;
+static MicroSegEngine g_microseg;
 net::ConnectionManager g_connection_manager;
 static int g_ipt_ver = 0;
 
@@ -206,18 +200,18 @@ uint16_t TcpCsum(char* packet) {
   memset(buffer, 0, sizeof(buffer));
   /*pesudo header*/
   pseudo = (PSEUDO_HEADER*)buffer;
-  pseudo->daddr = iphdr->daddr;
-  pseudo->saddr = iphdr->saddr;
-  pseudo->placeholder = 0;
-  pseudo->protocol = iphdr->protocol;
-  pseudo->length = htons(ntohs(iphdr->tot_len) - (iphdr->ihl << 2));
+  pseudo->daddr_ = iphdr->daddr;
+  pseudo->saddr_ = iphdr->saddr;
+  pseudo->placeholder_ = 0;
+  pseudo->protocol_ = iphdr->protocol;
+  pseudo->length_ = htons(ntohs(iphdr->tot_len) - (iphdr->ihl << 2));
   /*tcp header*/
   ttcphdr = (struct tcphdr*)(buffer + sizeof(PSEUDO_HEADER));
-  memcpy(ttcphdr, tcpphdr, ntohs(pseudo->length));
+  memcpy(ttcphdr, tcpphdr, ntohs(pseudo->length_));
   ttcphdr->check = 0;
   /*checksum*/
   return csum((uint16_t*)buffer,
-              ntohs(pseudo->length) +
+              ntohs(pseudo->length_) +
                   sizeof(PSEUDO_HEADER)); // sizeof(PSEUDO_HEADER) + sizeof(UDP_HEADER));
 }
 
@@ -227,7 +221,7 @@ void PrintPolicyData(RuleDetail& r, RULE_PORT& stPort) {
             "[policy] name : %s, dir : %d, action : %d, priority : %d, proto : %d, ip : %s <--> %s "
             "port : %d ~ %d\n",
             r.policy_key_.c_str(), r.direction_, r.action_, r.priority_, r.proto_, r.src_ip_.c_str(),
-            r.dst_ip_.c_str(), stPort.port, stPort.end_port);
+            r.dst_ip_.c_str(), stPort.port_, stPort.end_port_);
   }
 }
 
@@ -235,9 +229,9 @@ std::string PrintPortsData(std::vector<RULE_PORT>& ports) {
   std::string value = "";
   if (g_log_level > 0) {
     for (int p = 0; p < (int)ports.size(); p++) {
-      value += std::to_string(ports.at(p).port);
+      value += std::to_string(ports.at(p).port_);
       value += " ~ ";
-      value += std::to_string(ports.at(p).end_port);
+      value += std::to_string(ports.at(p).end_port_);
       if (p != ((int)ports.size() - 1))
         value += ", ";
     }
@@ -320,40 +314,86 @@ err:
   return -1;
 }
 
-/*post match message*/
-static int PostMatchMsg(FiveTuple& tuple, NET_POLICY_RULE action, FLOW_DIR dir, string& rule_key) {
+/*MicroSegEngine implementation*/
+void MicroSegEngine::DeletePolicy(const std::string& name) {
+  input_http_policy_.erase(name);
+  output_http_policy_.erase(name);
+  policy_rule_.DeletePolicy(FlowDir::kIngress, name);
+  policy_rule_.DeletePolicy(FlowDir::kEgress, name);
+}
+
+int MicroSegEngine::AddHttpPolicy(FlowDir dir, const std::string& key, HTTP_RULE_INFO& rule) {
+  auto& http = (dir == FlowDir::kIngress) ? input_http_policy_ : output_http_policy_;
+  auto& rules = http[key];
+  LOG_D("add http policy : %s, rules so far : %zu.", key.c_str(), rules.size());
+  rules.push_back(rule);
+  return 0;
+}
+
+/*forward declaration — defined later in this file*/
+int ParseRcvData(int32_t epoll_fd, int32_t fd, void* ptr);
+
+/*CtrlServer implementation*/
+int CtrlServer::Accept(int epoll_fd, int client_fd) {
+  struct epoll_event ev;
+  if (client_fd_ > 0) {
+    if (client_fd != client_fd_)
+      close(client_fd_);
+    LOG_W("close old globe fd, old fd : %d, new fd : %d.", client_fd_, client_fd);
+  }
+  LOG_I("accept new unix socket link, fd : %d, log level : %d", client_fd, g_log_level);
+  client_fd_ = client_fd;
+  fcntl(client_fd, F_SETFL, fcntl(client_fd, F_GETFL) | O_NONBLOCK);
+  epoll_cb_.fd_ = client_fd_;
+  epoll_cb_.epoll_in_func_ = ParseRcvData;
+  ev.data.ptr = &epoll_cb_;
+  ev.events = EPOLLIN;
+  int ret = epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &ev);
+  if (ret < 0) {
+    close(client_fd);
+    LOG_E("add new client to epoll failed, %s.", strerror(errno));
+  }
+  return 0;
+}
+
+/*PostServer implementation*/
+void PostServer::Accept(int client_fd) {
+  if (post_link_fd_ > 0) {
+    if (client_fd != post_link_fd_)
+      close(post_link_fd_);
+    LOG_W("close old globe post fd, old fd : %d, new fd : %d.", post_link_fd_, client_fd);
+  }
+  post_link_fd_ = client_fd;
+  http::extension::RootContext.SetPostFd(&post_link_fd_);
+  fcntl(client_fd, F_SETFL, fcntl(client_fd, F_GETFL) | O_NONBLOCK);
+}
+
+int PostServer::SendMatchMsg(FiveTuple& tuple, NetPolicyRule action, FlowDir dir,
+                             const std::string& rule_key) {
   int ret, len;
   char buf[11] = {"#%% pre"};
   char data[1024];
-  /*post socket fd*/
-  if (g_post_link_fd <= 0)
+  if (post_link_fd_ <= 0)
     return 0;
-  /*init memory*/
   memset(data, 0, sizeof(data));
-  /*json data*/
   sprintf(data,
           "{\"type\":\"microseg\",\"proto\":%d,\"action\":%d,\"direction\":%d,\"src_port\":%d,"
           "\"dst_port\":%d,\"src_ip\":\"%s\",\"dst_ip\":\"%s\",\"policy_name\":\"%s\"}",
-          tuple.proto_, static_cast<int>(action), static_cast<int>(dir), tuple.src_port_, tuple.dst_port_, tuple.src_addr_.c_str(),
-          tuple.dst_addr_.c_str(), rule_key.c_str());
-  /*print debug log*/
+          tuple.proto_, static_cast<int>(action), static_cast<int>(dir), tuple.src_port_,
+          tuple.dst_port_, tuple.src_addr_.c_str(), tuple.dst_addr_.c_str(), rule_key.c_str());
   if (!((tuple.proto_ == IPPROTO_UDP) && (tuple.dst_port_ == 53)))
     LOG_D("[post] post micro seg data : %s", data);
-  /*data len*/
   len = (int)strlen(data);
-  /*send data*/
   buf[7] = len & 0xff;
   buf[8] = (len >> 8) & 0xff;
   buf[9] = (len >> 16) & 0xff;
   buf[10] = (len >> 24) & 0xff;
-  ret = write(g_post_link_fd, buf, 11);
+  ret = write(post_link_fd_, buf, 11);
   if (ret <= 0)
     GOTO_ERROR(err, "post match msg to server failed, %s.", strerror(errno));
-  /*post data*/
-  ret = write(g_post_link_fd, data, len);
+  ret = write(post_link_fd_, data, len);
   if (ret <= 0)
     GOTO_ERROR(err, "post match msg to server failed, %s.", strerror(errno));
-  /*return*/
   return 0;
 err:
   return -1;
@@ -363,10 +403,10 @@ err:
 static NET_POLICY_RULE MatchHttpPolicyRule(const std::vector<HTTP_RULE_INFO>& http_rules,
                                            http::Header state) {
   for (const auto& rule : http_rules) {
-    if (!rule.host.empty()   && (rule.host   != state.host_))   continue;
-    if (!rule.method.empty() && (rule.method != state.method_)) continue;
-    if (!rule.path.empty()   && (rule.path   != state.path_))   continue;
-    return rule.action;
+    if (!rule.host_.empty()   && (rule.host_   != state.host_))   continue;
+    if (!rule.method_.empty() && (rule.method_ != state.method_)) continue;
+    if (!rule.path_.empty()   && (rule.path_   != state.path_))   continue;
+    return rule.action_;
   }
   return NetPolicyRule::kDefault;
 }
@@ -375,15 +415,14 @@ static NET_POLICY_RULE MatchHttpPolicyRule(const std::vector<HTTP_RULE_INFO>& ht
 static NET_POLICY_RULE MatchNetPolicyRule(FiveTuple& tuple, FLOW_DIR dir, RuleDetail& detail) {
   std::vector<std::string> rule_keys;
   /*is node ip*/
-  auto nodeIt = g_nodes_ip.find(tuple.src_addr_u32_);
-  if (nodeIt != g_nodes_ip.end())
+  if (g_microseg.IsNodeIp(tuple.src_addr_u32_))
     return NetPolicyRule::kDefault;
   /*get rule map*/
-  auto rules = g_micro_rule.GetPolicyTree(dir);
+  auto rules = g_microseg.GetPolicyTree(dir);
   if (rules->RuleSize() == 0)
     return NetPolicyRule::kDefault;
   /*get rule key*/
-  g_micro_rule.CreateRuleKeyByTuple(tuple, dir, rule_keys);
+  g_microseg.CreateRuleKeyByTuple(tuple, dir, rule_keys);
   /*遍历规则进行匹配*/
   for (int i = 0; i < (int)rule_keys.size(); i++) {
     /*匹配规则*/
@@ -653,16 +692,16 @@ static int input_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct 
     }
   }
   /*tcp four tuple*/
-  ct_key.dst_port = tuple.dst_port_;
-  ct_key.src_port = tuple.src_port_;
-  ct_key.dst_addr = tuple.dst_addr_u32_;
-  ct_key.src_addr = tuple.src_addr_u32_;
+  ct_key.dst_port_ = tuple.dst_port_;
+  ct_key.src_port_ = tuple.src_port_;
+  ct_key.dst_addr_ = tuple.dst_addr_u32_;
+  ct_key.src_addr_ = tuple.src_addr_u32_;
   /*tcp protocol*/
   switch (tuple.proto_) {
   case IPPROTO_TCP:
     /*query conntrack info*/
-    tcp_it = g_tcp_ct_input.find(ct_key);
-    if (tcp_it == g_tcp_ct_input.end()) {
+    tcp_it = g_microseg.TcpCtInput().find(ct_key);
+    if (tcp_it == g_microseg.TcpCtInput().end()) {
       /*tcp syn*/
       if (tcphdr.syn != 0)
         break;
@@ -676,7 +715,7 @@ static int input_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct 
     found = true;
     /*tcp fin*/
     if ((tcphdr.fin == 1) || (tcphdr.rst == 1)) {
-      g_tcp_ct_input.erase(ct_key);
+      g_microseg.TcpCtInput().erase(ct_key);
       /*print debug log*/
       LOG_D("microseg-dp input data, delete conntrack info, src: %s:%d, dest : %s:%d",
             tuple.src_addr_.c_str(), tuple.src_port_, tuple.dst_addr_.c_str(), tuple.dst_port_);
@@ -701,12 +740,12 @@ static int input_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct 
     if (rule_ret == NetPolicyRule::kDefault)
       return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllow), 0, NULL);
     /*query http rule*/
-    auto http_rule = g_net_input_http_policy.find(rule_key);
+    auto http_rule = g_microseg.InputHttpPolicy().find(rule_key);
     /*check http rule*/
-    if ((http_rule == g_net_input_http_policy.end()) || (tuple.proto_ == IPPROTO_UDP) ||
+    if ((http_rule == g_microseg.InputHttpPolicy().end()) || (tuple.proto_ == IPPROTO_UDP) ||
         (tuple.proto_ == IPPROTO_ICMP) || (http_rule->second.empty())) {
       /*post match message*/
-      PostMatchMsg(tuple, rule_ret, dir, rule_key);
+      g_post_server.SendMatchMsg(tuple, rule_ret, dir, rule_key);
       // deny
       if (rule_ret == NetPolicyRule::kDeny) {
         LOG_D("input drop %s %s:%u -> %s:%u ", GetProtoString(tuple.proto_), tuple.src_addr_.c_str(),
@@ -726,7 +765,7 @@ static int input_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct 
           tuple.src_addr_.c_str(), tuple.dst_addr_.c_str(), offset, data_len);
     auto conn = std::make_unique<http::Connection>(rule_key);
     conn->setTcpSeq(tcp_seq + 1);
-    g_tcp_ct_input.insert({ct_key, std::move(conn)});
+    g_microseg.TcpCtInput().insert({ct_key, std::move(conn)});
     /*return*/
     return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllowReq), 0, NULL);
   }
@@ -734,11 +773,11 @@ static int input_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct 
   LOG_D("microseg-dp  input data, src: %s, dest : %s, offset : %d, data len : %d",
         tuple.src_addr_.c_str(), tuple.dst_addr_.c_str(), offset, data_len);
   /*can not find tcp conntrack*/
-  if (tcp_it == g_tcp_ct_input.end()) {
+  if (tcp_it == g_microseg.TcpCtInput().end()) {
     LOG_D(
         "microseg-dp input not sync, new conntrack, src: %s, dest : %s, offset : %d, data len : %d",
         tuple.src_addr_.c_str(), tuple.dst_addr_.c_str(), offset, data_len);
-    auto [it, success] = g_tcp_ct_input.insert({ct_key, std::make_unique<http::Connection>(rule_key)});
+    auto [it, success] = g_microseg.TcpCtInput().insert({ct_key, std::make_unique<http::Connection>(rule_key)});
     if (success) {
       tcp_it = it;
     }
@@ -766,8 +805,8 @@ static int input_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct 
   /*get rule key*/
   rule_key = tcp_it->second->getRuleKey();
   /*query http rule*/
-  auto http_rule = g_net_input_http_policy.find(rule_key);
-  if (http_rule == g_net_input_http_policy.end())
+  auto http_rule = g_microseg.InputHttpPolicy().find(rule_key);
+  if (http_rule == g_microseg.InputHttpPolicy().end())
     return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kDefault), 0, NULL);
   // process header
   rule_ret = MatchHttpPolicyRule(http_rule->second, header);
@@ -777,7 +816,7 @@ static int input_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct 
   if (rule_ret == NetPolicyRule::kDefault)
     return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllowReq), 0, NULL);
   /*post match message*/
-  PostMatchMsg(tuple, rule_ret, FlowDir::kIngress, rule_key);
+  g_post_server.SendMatchMsg(tuple, rule_ret, FlowDir::kIngress, rule_key);
   /*rst tcp link*/
   if (rule_ret == NetPolicyRule::kDeny)
     rst_tcp_link(pkg);
@@ -839,16 +878,16 @@ static int output_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct
     }
   }
   /*tcp four tuple*/
-  ct_key.dst_port = tuple.dst_port_;
-  ct_key.src_port = tuple.src_port_;
-  ct_key.dst_addr = tuple.dst_addr_u32_;
-  ct_key.src_addr = tuple.src_addr_u32_;
+  ct_key.dst_port_ = tuple.dst_port_;
+  ct_key.src_port_ = tuple.src_port_;
+  ct_key.dst_addr_ = tuple.dst_addr_u32_;
+  ct_key.src_addr_ = tuple.src_addr_u32_;
   /*tcp protocol*/
   switch (tuple.proto_) {
   case IPPROTO_TCP:
     /*query conntrack info*/
-    tcp_it = g_tcp_ct_output.find(ct_key);
-    if (tcp_it == g_tcp_ct_output.end()) {
+    tcp_it = g_microseg.TcpCtOutput().find(ct_key);
+    if (tcp_it == g_microseg.TcpCtOutput().end()) {
       /*tcp syn*/
       if (tcphdr.syn != 0)
         break;
@@ -862,7 +901,7 @@ static int output_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct
     found = true;
     /*tcp fin*/
     if ((tcphdr.fin == 1) || (tcphdr.rst == 1)) {
-      g_tcp_ct_output.erase(ct_key);
+      g_microseg.TcpCtOutput().erase(ct_key);
       /*print debug log*/
       LOG_D("microseg-dp out data, delete conntrack info, src: %s:%d, dest : %s:%d",
             tuple.src_addr_.c_str(), tuple.src_port_, tuple.dst_addr_.c_str(), tuple.dst_port_);
@@ -887,12 +926,12 @@ static int output_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct
     if (rule_ret == NetPolicyRule::kDefault)
       return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllow), 0, NULL);
     /*query http rule*/
-    auto http_rule = g_net_output_http_policy.find(rule_key);
+    auto http_rule = g_microseg.OutputHttpPolicy().find(rule_key);
     /*check http rule*/
-    if ((http_rule == g_net_output_http_policy.end()) || (tuple.proto_ == IPPROTO_UDP) ||
+    if ((http_rule == g_microseg.OutputHttpPolicy().end()) || (tuple.proto_ == IPPROTO_UDP) ||
         (tuple.proto_ == IPPROTO_ICMP) || (http_rule->second.empty())) {
       /*post match message*/
-      PostMatchMsg(tuple, rule_ret, dir, rule_key);
+      g_post_server.SendMatchMsg(tuple, rule_ret, dir, rule_key);
       // deny
       if (rule_ret == NetPolicyRule::kDeny) {
         LOG_D("output drop %s %s:%u -> %s:%u ", GetProtoString(tuple.proto_), tuple.src_addr_.c_str(),
@@ -911,7 +950,7 @@ static int output_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct
           rule_key.c_str(), tuple.src_addr_.c_str(), tuple.dst_addr_.c_str(), offset, data_len);
     auto conn = std::make_unique<http::Connection>(rule_key);
     conn->setTcpSeq(tcp_seq + 1);
-    g_tcp_ct_output.insert({ct_key, std::move(conn)});
+    g_microseg.TcpCtOutput().insert({ct_key, std::move(conn)});
     /*return*/
     return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllowRsp), 0, NULL);
   }
@@ -919,11 +958,11 @@ static int output_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct
   LOG_D("microseg-dp output data, src: %s, dest : %s, offset : %d, data len : %d",
         tuple.src_addr_.c_str(), tuple.dst_addr_.c_str(), offset, data_len);
   /*can not find tcp conntrack*/
-  if (tcp_it == g_tcp_ct_output.end()) {
+  if (tcp_it == g_microseg.TcpCtOutput().end()) {
     LOG_D("microseg-dp output not sync, new conntrack, src: %s, dest : %s, offset : %d, data len : "
           "%d",
           tuple.src_addr_.c_str(), tuple.dst_addr_.c_str(), offset, data_len);
-    auto [it, success] = g_tcp_ct_output.insert({ct_key, std::make_unique<http::Connection>(rule_key)});
+    auto [it, success] = g_microseg.TcpCtOutput().insert({ct_key, std::make_unique<http::Connection>(rule_key)});
     if (success) {
       tcp_it = it;
     }
@@ -951,8 +990,8 @@ static int output_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct
   if (header.parseState_ != ParseState::Done)
     return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllowRsp), 0, NULL);
   /*query http rule*/
-  auto http_rule = g_net_output_http_policy.find(rule_key);
-  if (http_rule == g_net_output_http_policy.end())
+  auto http_rule = g_microseg.OutputHttpPolicy().find(rule_key);
+  if (http_rule == g_microseg.OutputHttpPolicy().end())
     return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kDefault), 0, NULL);
   // process header
   rule_ret = MatchHttpPolicyRule(http_rule->second, header);
@@ -962,7 +1001,7 @@ static int output_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct
   if (rule_ret == NetPolicyRule::kDefault)
     return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllowRsp), 0, NULL);
   /*post match message*/
-  PostMatchMsg(tuple, rule_ret, FlowDir::kEgress, rule_key);
+  g_post_server.SendMatchMsg(tuple, rule_ret, FlowDir::kEgress, rule_key);
   /*rst tcp link*/
   if (rule_ret == NetPolicyRule::kDeny)
     rst_tcp_link(pkg);
@@ -1055,7 +1094,7 @@ int NfqueueRcvData(int32_t epoll_fd, int32_t fd, void* ptr) {
   RCV_EPOLL_CB* nfqEvent = (RCV_EPOLL_CB*)ptr;
   if (!ptr)
     RETURN_ERROR(0, "the argument pointer is nil.");
-  nfq_res = nfqEvent->nfq_res;
+  nfq_res = nfqEvent->nfq_res_;
   /*read data*/
   ret = read(fd, buf, sizeof(buf));
   if (ret <= 0) {
@@ -1087,14 +1126,14 @@ int AddEpollEvent(int zEvfd, NFQ_RES_INFO* nfq_res) {
   if (!nfqInput || !nfqOutput)
     GOTO_ERROR(err, "new nfqueue resource info memory failed, %s.", strerror(errno));
   /*copy data*/
-  nfqInput->nfq_res = nfq_res;
-  nfqOutput->nfq_res = nfq_res;
+  nfqInput->nfq_res_ = nfq_res;
+  nfqOutput->nfq_res_ = nfq_res;
   /*set nonblock*/
   fcntl(nfq_res->input_fd_, F_SETFL, fcntl(nfq_res->input_fd_, F_GETFL) | O_NONBLOCK);
   fcntl(nfq_res->output_fd_, F_SETFL, fcntl(nfq_res->output_fd_, F_GETFL) | O_NONBLOCK);
   /*input queue event*/
-  nfqInput->fd = nfq_res->input_fd_;
-  nfqInput->epoll_in_func = NfqueueRcvData;
+  nfqInput->fd_ = nfq_res->input_fd_;
+  nfqInput->epoll_in_func_ = NfqueueRcvData;
   // register epoll event
   ev.data.ptr = nfqInput;
   ev.events = EPOLLIN;
@@ -1103,8 +1142,8 @@ int AddEpollEvent(int zEvfd, NFQ_RES_INFO* nfq_res) {
     GOTO_ERROR(err, "add nfqueue handle to epoll failed, pid : %d, %s.", nfq_res->input_fd_,
                strerror(errno));
   /*output queue event*/
-  nfqOutput->fd = nfq_res->output_fd_;
-  nfqOutput->epoll_in_func = NfqueueRcvData;
+  nfqOutput->fd_ = nfq_res->output_fd_;
+  nfqOutput->epoll_in_func_ = NfqueueRcvData;
   // register epoll event
   ev.data.ptr = nfqOutput;
   ev.events = EPOLLIN;
@@ -1130,36 +1169,36 @@ err:
 int InitNfqueue(int epoll_fd, NET_CTRL_INFO& ctrl) {
   int ret;
   // check resource — duplicated resource is not an error
-  if (g_micro_rule.GetNfqRes(ctrl.pod_id) != nullptr)
-    RETURN_WARN(0, "duplicated pod resource, pid : %d.", ctrl.pid);
+  if (g_microseg.GetNfqRes(ctrl.pod_id_) != nullptr)
+    RETURN_WARN(0, "duplicated pod resource, pid : %d.", ctrl.pid_);
   // new memory
   auto nfq_res = std::make_unique<NFQ_RES_INFO>();
   /*memory init*/
   nfq_res->Init();
   /*save pid*/
-  nfq_res->pid_     = ctrl.pid;
-  nfq_res->pod_id_  = ctrl.pod_id;
+  nfq_res->pid_     = ctrl.pid_;
+  nfq_res->pod_id_  = ctrl.pod_id_;
   nfq_res->poll_fd_ = epoll_fd;
   /*init input queue*/
   ret = OpenNfque(FlowDir::kIngress, nfq_res.get());
   if (ret != 0)
-    GOTO_ERROR(err, "init input queue resource failed, pid : %d.", ctrl.pid);
+    GOTO_ERROR(err, "init input queue resource failed, pid : %d.", ctrl.pid_);
   /*init output queue*/
   ret = OpenNfque(FlowDir::kEgress, nfq_res.get());
   if (ret != 0)
-    GOTO_ERROR(err, "init output queue resource failed, pid : %d.", ctrl.pid);
+    GOTO_ERROR(err, "init output queue resource failed, pid : %d.", ctrl.pid_);
   /*init conntrack*/
   ret = OpenConntrack(nfq_res.get());
   if (ret != 0)
-    GOTO_ERROR(err, "init conntrack resource failed, pid : %d.", ctrl.pid);
+    GOTO_ERROR(err, "init conntrack resource failed, pid : %d.", ctrl.pid_);
   /*add epoll event*/
   ret = AddEpollEvent(epoll_fd, nfq_res.get());
   if (ret != 0)
-    GOTO_ERROR(err, "add %d epoll event failed.", ctrl.pid);
+    GOTO_ERROR(err, "add %d epoll event failed.", ctrl.pid_);
   /*insert nfqueue — transfer ownership*/
-  ret = g_micro_rule.NewNfQueRes(ctrl.pod_id, std::move(nfq_res));
+  ret = g_microseg.NewNfQueRes(ctrl.pod_id_, std::move(nfq_res));
   if (ret != 0)
-    GOTO_ERROR(err, "insert nfqueue resource failed, pid : %d.", ctrl.pid);
+    GOTO_ERROR(err, "insert nfqueue resource failed, pid : %d.", ctrl.pid_);
   /*return*/
   return 0;
 
@@ -1174,24 +1213,13 @@ int DeletePolicy(std::string& name) {
   if (name.empty())
     RETURN_ERROR(0, "the policy name is empty.");
 
-  /*clear input http policy*/
-  g_net_input_http_policy.erase(name);
-  /*clear output http policy*/
-  g_net_output_http_policy.erase(name);
-  /*clear*/
-  g_micro_rule.DeletePolicy(FlowDir::kIngress, name);
-  /*clear*/
-  g_micro_rule.DeletePolicy(FlowDir::kEgress, name);
+  g_microseg.DeletePolicy(name);
   /*return*/
   return 0;
 }
 
 int AddNewHttpPolicy(FLOW_DIR dir, std::string& key, HTTP_RULE_INFO& http_rule) {
-  auto& http = (dir == FlowDir::kIngress) ? g_net_input_http_policy : g_net_output_http_policy;
-  auto& rules = http[key]; // default-constructs vector if key absent
-  LOG_D("add http policy : %s, rules so far : %zu.", key.c_str(), rules.size());
-  rules.push_back(http_rule);
-  return 0;
+  return g_microseg.AddHttpPolicy(dir, key, http_rule);
 }
 
 /*add policy*/
@@ -1202,7 +1230,7 @@ int AddNewPolicy(RuleDetail& policy, RULE_PORT& stPort) {
   /*print debug log*/
   // PrintPolicyData(policy, stPort);
   /*处理下发的规则*/
-  return g_micro_rule.AddPolicyToTree(policy, stPort);
+  return g_microseg.AddPolicy(policy, stPort);
 }
 
 /*update iptable rule*/
@@ -1211,7 +1239,7 @@ void UpdateMark(std::unordered_map<uint64_t, string>& cgRes) {
   FiveTuple tuple = {};
 
   for (auto it = cgRes.begin(); it != cgRes.end(); it++) {
-    auto res = g_micro_rule.GetNfqRes(it->first);
+    auto res = g_microseg.GetNfqRes(it->first);
     if (res == nullptr)
       CONTINUE_ERROR("can not find pod resource, pod id : %lu.", it->first);
     // set mark
@@ -1402,9 +1430,9 @@ int ParseNodeCfg(char* buf) {
     uzIp = ipv4StringToInt(ip);
     // add or delete node ip
     if (action == 0) {
-      g_nodes_ip.erase(uzIp);
+      g_microseg.RemoveNodeIp(uzIp);
     } else {
-      g_nodes_ip[uzIp] = 1;
+      g_microseg.AddNodeIp(uzIp);
     }
   }
   // free resource
@@ -1444,7 +1472,7 @@ int ParseNetPolicy(char* buf) {
   /*clear vector ports*/
   rule.ports_.clear();
   rule.policy_key_ = item->valuestring;
-  ctrl.policy_key = rule.policy_key_;
+  ctrl.policy_key_ = rule.policy_key_;
   // clear old policy
   DeletePolicy(rule.policy_key_);
   // create new policy
@@ -1482,8 +1510,8 @@ int ParseNetPolicy(char* buf) {
     // list http rule
     httparr = cJSON_GetObjectItem(array, "http");
     if (httparr) {
-      http.action = rule.action_;
-      http.direction = static_cast<uint8_t>(rule.direction_);
+      http.action_ = rule.action_;
+      http.direction_ = static_cast<uint8_t>(rule.direction_);
       for (int k = 0; k < cJSON_GetArraySize(httparr); k++) {
         item = cJSON_GetArrayItem(httparr, k);
         if (!item)
@@ -1491,15 +1519,15 @@ int ParseNetPolicy(char* buf) {
         param = cJSON_GetObjectItem(item, "host");
         if (!param)
           BREAK_ERROR("get http host failed.");
-        http.host = cJSON_GetStringValue(param);
+        http.host_ = cJSON_GetStringValue(param);
         param = cJSON_GetObjectItem(item, "method");
         if (!param)
           BREAK_ERROR("get http method failed.");
-        http.method = cJSON_GetStringValue(param);
+        http.method_ = cJSON_GetStringValue(param);
         param = cJSON_GetObjectItem(item, "path");
         if (!param)
           BREAK_ERROR("get http path failed.");
-        http.path = cJSON_GetStringValue(param);
+        http.path_ = cJSON_GetStringValue(param);
         /*save http rule*/
         AddNewHttpPolicy(rule.direction_, rule.policy_key_, http);
       }
@@ -1545,15 +1573,15 @@ int ParseNetPolicy(char* buf) {
         //
         item = cJSON_GetObjectItem(param, "endPort");
         if (item)
-          rulePort.end_port = item->valueint;
+          rulePort.end_port_ = item->valueint;
         //
         item = cJSON_GetObjectItem(param, "port");
         if (item)
-          rulePort.port = item->valueint;
+          rulePort.port_ = item->valueint;
         //
-        rulePort.proto = rule.proto_;
+        rulePort.proto_ = rule.proto_;
         //
-        rulePort.end_port = (rulePort.end_port == 0) ? rulePort.port : rulePort.end_port;
+        rulePort.end_port_ = (rulePort.end_port_ == 0) ? rulePort.port_ : rulePort.end_port_;
         // push
         rulePorts.push_back(rulePort);
       }
@@ -1640,40 +1668,40 @@ int ParseRcvJson(char* buf, NET_CTRL_INFO* ctrl) {
   item = cJSON_GetObjectItem(root, "msg_type");
   if (!item)
     GOTO_ERROR(err, "get message type item failed!");
-  ctrl->msg_type = static_cast<NET_DATA_TYPE>(item->valueint);
+  ctrl->msg_type_ = static_cast<NET_DATA_TYPE>(item->valueint);
   // get pid
   item = cJSON_GetObjectItem(root, "pid");
   if (item)
-    ctrl->pid = item->valueint;
+    ctrl->pid_ = item->valueint;
   // get pod id
   item = cJSON_GetObjectItem(root, "pod_id");
   if (item)
-    ctrl->pod_id = (uint64_t)item->valuedouble;
+    ctrl->pod_id_ = (uint64_t)item->valuedouble;
   // get resource key
   item = cJSON_GetObjectItem(root, "policy_name");
   if (item)
-    ctrl->policy_key = item->valuestring;
+    ctrl->policy_key_ = item->valuestring;
   // get uuid
   item = cJSON_GetObjectItem(root, "uuid");
   if (item)
-    ctrl->uuid = item->valuestring;
+    ctrl->uuid_ = item->valuestring;
   // get log level
   item = cJSON_GetObjectItem(root, "level");
   if (item)
-    ctrl->level = item->valueint;
+    ctrl->level_ = item->valueint;
   // free resource
   cJSON_Delete(root);
   // check data
-  switch (ctrl->msg_type) {
+  switch (ctrl->msg_type_) {
   case NetDataType::kPodPid:
   case NetDataType::kPodDie:
-    if (ctrl->pid == 0 || ctrl->pod_id == 0)
-      RETURN_ERROR(-1, "need pod pid, message type : %d.", static_cast<int>(ctrl->msg_type));
+    if (ctrl->pid_ == 0 || ctrl->pod_id_ == 0)
+      RETURN_ERROR(-1, "need pod pid, message type : %d.", static_cast<int>(ctrl->msg_type_));
     break;
   case NetDataType::kAddRule:
   case NetDataType::kDelRule:
-    if (ctrl->policy_key.length() == 0)
-      RETURN_ERROR(-1, "need policy name, message type : %d.", static_cast<int>(ctrl->msg_type));
+    if (ctrl->policy_key_.length() == 0)
+      RETURN_ERROR(-1, "need policy name, message type : %d.", static_cast<int>(ctrl->msg_type_));
     break;
   default:
     break;
@@ -1792,34 +1820,34 @@ int ParseRcvData(int32_t epoll_fd, int32_t fd, void* ptr) {
   if (ret < 0)
     GOTO_ERROR(rsp, "[net] parse receive json failed!");
   /*condition*/
-  switch (ctrl.msg_type) {
+  switch (ctrl.msg_type_) {
   case NetDataType::kPodPid:
     // set ns
-    ret = SetNs(ctrl.pid, const_cast<char*>(kBasePath.data()));
+    ret = SetNs(ctrl.pid_, const_cast<char*>(kBasePath.data()));
     if (ret < 0)
-      GOTO_ERROR(rsp, "setns to %d failed.", ctrl.pid);
+      GOTO_ERROR(rsp, "setns to %d failed.", ctrl.pid_);
     // init nfqueue
     ret = InitNfqueue(epoll_fd, ctrl);
     /*print error info*/
     if (ret != 0)
-      GOTO_ERROR(rsp, "init %d nfqueue failed, ret : %d.", ctrl.pid, ret);
+      GOTO_ERROR(rsp, "init %d nfqueue failed, ret : %d.", ctrl.pid_, ret);
     // write iptables rule
     WriteIptableRule(1, 1);
     /*goto*/
     goto rsp;
 
   case NetDataType::kPodDie:
-    ret = g_micro_rule.DeleteNfQueRes(epoll_fd, ctrl.pod_id);
+    ret = g_microseg.DeleteNfQueRes(epoll_fd, ctrl.pod_id_);
     goto rsp;
 
   case NetDataType::kAddRule:
     ret = ParseNetPolicy(data_buf);
     /*print rule size*/
-    g_micro_rule.PrintPolicyLog();
+    g_microseg.PrintPolicyLog();
     goto rsp;
 
   case NetDataType::kDelRule:
-    ret = DeletePolicy(ctrl.policy_key);
+    ret = DeletePolicy(ctrl.policy_key_);
     goto rsp;
 
   case NetDataType::kAddWafRule:
@@ -1839,7 +1867,7 @@ int ParseRcvData(int32_t epoll_fd, int32_t fd, void* ptr) {
     goto rsp;
 
   case NetDataType::kConfDump:
-    respBody = g_micro_rule.GetAllConfig(ctrl.policy_key);
+    respBody = g_microseg.GetAllConfig(ctrl.policy_key_);
     goto rsp;
 
   case NetDataType::kConnDump:
@@ -1847,7 +1875,7 @@ int ParseRcvData(int32_t epoll_fd, int32_t fd, void* ptr) {
     goto rsp;
 
   case NetDataType::kReset:
-    ret = g_micro_rule.ClearCfg();
+    ret = g_microseg.ClearCfg();
     ;
     goto rsp;
 
@@ -1856,12 +1884,12 @@ int ParseRcvData(int32_t epoll_fd, int32_t fd, void* ptr) {
     goto rsp;
 
   case NetDataType::kLogLevel:
-    g_log_level = ctrl.level;
+    g_log_level = ctrl.level_;
     LOG_I("set log level : %d", g_log_level);
     goto rsp;
 
   default:
-    LOG_E("data type is error, datatype : %d.", static_cast<int>(ctrl.msg_type));
+    LOG_E("data type is error, datatype : %d.", static_cast<int>(ctrl.msg_type_));
     break;
   }
 
@@ -1881,11 +1909,11 @@ rsp:
 
   cJSON_AddNumberToObject(response, "status", ret);
   cJSON_AddNumberToObject(response, "msg_type", static_cast<int>(NetDataType::kRspAck));
-  cJSON_AddStringToObject(response, "uuid", ctrl.uuid.c_str());
+  cJSON_AddStringToObject(response, "uuid", ctrl.uuid_.c_str());
   if (respBody != nullptr)
     cJSON_AddItemToObject(response, "body", respBody);
   /*format reponse data*/
-  if (ctrl.msg_type == NetDataType::kConfDump) {
+  if (ctrl.msg_type_ == NetDataType::kConfDump) {
     result = cJSON_Print(response);
     /*data len*/
     length = (int)strlen(result);
@@ -1909,7 +1937,7 @@ rsp:
   do {
     ret = write(fd, result + offset, length);
     /*print debug log*/
-    if (ctrl.msg_type == NetDataType::kConfDump)
+    if (ctrl.msg_type_ == NetDataType::kConfDump)
       LOG_D("send rsp msg, time : %s, ret: %d, data len %d, offset : %d.", TimeToString().c_str(),
             ret, length, offset);
     if (ret < 0)
@@ -1931,40 +1959,14 @@ rsp:
 }
 
 int ProcAcceptEvent(int32_t epoll_fd, int32_t fd, void* ptr) {
-  int ret, zClientFd;
+  int zClientFd;
   socklen_t cliAddrLen;
-  struct epoll_event ev;
   struct sockaddr_in address;
-  static RCV_EPOLL_CB DaeEvent;
-  // client address length
   cliAddrLen = sizeof(struct sockaddr_in);
   zClientFd = accept(fd, (struct sockaddr*)&address, &cliAddrLen);
   if (zClientFd <= 0)
     RETURN_ERROR(0, "accept a new client failed, %s.", strerror(errno));
-  /*close old fd*/
-  if (g_client_fd > 0) {
-    if (zClientFd != g_client_fd)
-      close(g_client_fd);
-    LOG_W("close old globe fd, old fd : %d, new fd : %d.", g_client_fd, zClientFd);
-  }
-  /*print debug log*/
-  LOG_I("accept new unix socket link, fd : %d, log level : %d", zClientFd, g_log_level);
-  /*save fd*/
-  g_client_fd = zClientFd;
-  // noblock
-  fcntl(zClientFd, F_SETFL, fcntl(zClientFd, F_GETFL) | O_NONBLOCK);
-  /*callback*/
-  DaeEvent.fd = g_client_fd;
-  DaeEvent.epoll_in_func = ParseRcvData;
-  // epoll event
-  ev.data.ptr = &DaeEvent;
-  ev.events = EPOLLIN;
-  ret = epoll_ctl(epoll_fd, EPOLL_CTL_ADD, zClientFd, &ev);
-  if (ret < 0) {
-    close(zClientFd);
-    LOG_E("add new client to epoll failed, %s.", strerror(errno));
-  }
-  return 0;
+  return g_ctrl_server.Accept(epoll_fd, zClientFd);
 }
 
 int ProcAcceptPostLinkEvent(int32_t epoll_fd, int32_t fd, void* ptr) {
@@ -1976,18 +1978,7 @@ int ProcAcceptPostLinkEvent(int32_t epoll_fd, int32_t fd, void* ptr) {
   zClientFd = accept(fd, (struct sockaddr*)&address, &cliAddrLen);
   if (zClientFd <= 0)
     RETURN_ERROR(0, "accept a new client failed, %s.", strerror(errno));
-  /*close old fd*/
-  if (g_post_link_fd > 0) {
-    if (zClientFd != g_post_link_fd)
-      close(g_post_link_fd);
-    LOG_W("close old globe post fd, old fd : %d, new fd : %d.", g_post_link_fd, zClientFd);
-  }
-  /*save fd*/
-  g_post_link_fd = zClientFd;
-  http::extension::RootContext.SetPostFd(&g_post_link_fd);
-
-  // noblock
-  fcntl(zClientFd, F_SETFL, fcntl(zClientFd, F_GETFL) | O_NONBLOCK);
+  g_post_server.Accept(zClientFd);
   // return
   return 0;
 }
@@ -2022,8 +2013,8 @@ int CreatePostServer(int efd, RCV_EPOLL_CB* pstPostEv) {
   if (ret != 0)
     GOTO_ERROR(err, "listen the client connect request! err : %s", strerror(errno));
   //
-  pstPostEv->fd = fd;
-  pstPostEv->epoll_in_func = ProcAcceptPostLinkEvent;
+  pstPostEv->fd_ = fd;
+  pstPostEv->epoll_in_func_ = ProcAcceptPostLinkEvent;
   // register epoll event
   ev.data.ptr = pstPostEv;
   ev.events = EPOLLIN;
@@ -2039,12 +2030,12 @@ err:
 }
 
 void CustomPrefix(std::ostream& s, const google::LogMessageInfo& l, void*) {
-  s << std::setw(4) << 1900 + l.time.year() << '-' << setw(2) << 1 + l.time.month() << '-'
-    << setw(2) << l.time.day() << 'T' << setw(2) << l.time.hour() << ':' << setw(2) << l.time.min()
-    << ':' << setw(2) << l.time.sec() << "." << setw(6) << l.time.usec()
+  s << std::setw(4) << 1900 + l.time.year() << '-' << std::setw(2) << 1 + l.time.month() << '-'
+    << std::setw(2) << l.time.day() << 'T' << std::setw(2) << l.time.hour() << ':' << std::setw(2) << l.time.min()
+    << ':' << std::setw(2) << l.time.sec() << "." << std::setw(6) << l.time.usec()
     << ' '
-    //    << setfill(' ') << setw(5)
-    << l.thread_id << setfill('0') << " {" << l.severity << "} " << l.filename << ':'
+    //    << std::setfill(' ') << std::setw(5)
+    << l.thread_id << std::setfill('0') << " {" << l.severity << "} " << l.filename << ':'
     << l.line_number;
 }
 
@@ -2145,10 +2136,10 @@ int main(int argc, char* argv[]) {
   if (ret < 0)
     GOTO_ERROR(err, "listen the client connect request! err : %s.", strerror(errno));
   //
-  g_micro_rule.efd_ = epfd;
+  g_microseg.SetEfd(epfd);
   //
-  unixEvent.fd = zListenFd;
-  unixEvent.epoll_in_func = ProcAcceptEvent;
+  unixEvent.fd_ = zListenFd;
+  unixEvent.epoll_in_func_ = ProcAcceptEvent;
   // register epoll event
   ev.data.ptr = &unixEvent;
   ev.events = EPOLLIN;
@@ -2164,12 +2155,12 @@ int main(int argc, char* argv[]) {
       if (!pstCbEv)
         continue;
       /*link fd*/
-      zLinkFd = pstCbEv->fd;
+      zLinkFd = pstCbEv->fd_;
       if (events[i].events & EPOLLIN) {
-        if (!pstCbEv->epoll_in_func)
+        if (!pstCbEv->epoll_in_func_)
           continue;
         /*epll in callback*/
-        pstCbEv->epoll_in_func(epfd, zLinkFd, (void*)pstCbEv);
+        pstCbEv->epoll_in_func_(epfd, zLinkFd, (void*)pstCbEv);
       }
     }
   }

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <map>
 #include <memory>
 #include <unordered_map>
 #include <string>
@@ -7,6 +8,7 @@
 #include <vector>
 #include <set>
 #include <netinet/in.h>
+#include <unistd.h>
 #include "vector"
 #include "cjson.h"
 #include "libmnl/libmnl.h"
@@ -99,24 +101,24 @@ using FLOW_DIR = FlowDir;
 /*TCP/UDP伪首部*/
 struct PseudoHeader
 {
-    uint32_t  saddr;
-    uint32_t  daddr;
-    uint8_t   placeholder;
-    uint8_t   protocol;
-    uint16_t  length;
+    uint32_t  saddr_;
+    uint32_t  daddr_;
+    uint8_t   placeholder_;
+    uint8_t   protocol_;
+    uint16_t  length_;
 };
 using PSEUDO_HEADER = PseudoHeader; // legacy alias
 
 struct TcpFourTupleV4
 {
-    uint32_t src_addr;
-    uint32_t dst_addr;
-    uint16_t src_port;
-    uint16_t dst_port;
+    uint32_t src_addr_;
+    uint32_t dst_addr_;
+    uint16_t src_port_;
+    uint16_t dst_port_;
 
     bool operator<(const TcpFourTupleV4& other) const noexcept {
-        return std::tie(src_addr, dst_addr, src_port, dst_port) <
-               std::tie(other.src_addr, other.dst_addr, other.src_port, other.dst_port);
+        return std::tie(src_addr_, dst_addr_, src_port_, dst_port_) <
+               std::tie(other.src_addr_, other.dst_addr_, other.src_port_, other.dst_port_);
     }
 };
 using TCP_FOUR_TUPLE_V4 = TcpFourTupleV4; // legacy alias
@@ -171,38 +173,38 @@ public:
 
 struct RcvEpollCb
 {
-    int32_t fd;
-    RcvCbFunc epoll_in_func; // epoll EPOLLIN
-    NFQ_RES_INFO *nfq_res;
+    int32_t fd_;
+    RcvCbFunc epoll_in_func_; // epoll EPOLLIN
+    NFQ_RES_INFO *nfq_res_;
 };
 using RCV_EPOLL_CB = RcvEpollCb; // legacy alias
 
 struct NetCtrlInfo
 {
-    int  pid;           // 进程PID
-    int  level;         // 日志级别
-    uint64_t pod_id;
-    std::string policy_key;
-    std::string uuid;
-    NetDataType msg_type; // 数据类型
+    int  pid_;           // 进程PID
+    int  level_;         // 日志级别
+    uint64_t pod_id_;
+    std::string policy_key_;
+    std::string uuid_;
+    NetDataType msg_type_; // 数据类型
 };
 using NET_CTRL_INFO = NetCtrlInfo; // legacy alias
 
 struct RulePort
 {
-    uint16_t end_port; // 端口段上限
-    uint16_t port;    // 端口段下限
-    uint8_t  proto;   // 协议
+    uint16_t end_port_; // 端口段上限
+    uint16_t port_;    // 端口段下限
+    uint8_t  proto_;   // 协议
 };
 using RULE_PORT = RulePort; // legacy alias
 
 struct HTTP_RULE_INFO
 {
-    uint8_t direction;
-    NetPolicyRule action;
-    std::string host;
-    std::string method;
-    std::string path;
+    uint8_t direction_;
+    NetPolicyRule action_;
+    std::string host_;
+    std::string method_;
+    std::string path_;
 };
 
 /*NFQUE*/
@@ -354,4 +356,80 @@ public:
     cJSON *GetAllConfig(std::string name);
     /*打印日志*/
     void PrintPolicyLog();
+};
+
+/*micro-segmentation engine — owns the policy rule set and all companion state*/
+class MicroSegEngine
+{
+public:
+    /*set the epoll fd used by the underlying NFQ resources*/
+    void SetEfd(int efd) { policy_rule_.efd_ = efd; }
+
+    /*---- NFQ resource lifecycle (delegated to PolicyRule/NfQueData) ----*/
+    NFQ_RES_INFO* GetNfqRes(uint64_t pod_id)      { return policy_rule_.GetNfqRes(pod_id); }
+    int  NewNfQueRes(uint64_t pod_id, std::unique_ptr<NFQ_RES_INFO> res)
+                                                   { return policy_rule_.NewNfQueRes(pod_id, std::move(res)); }
+    int  DeleteNfQueRes(int efd, uint64_t pod_id)  { return policy_rule_.DeleteNfQueRes(efd, pod_id); }
+
+    /*---- network policy (delegated to PolicyRule) ----*/
+    PolicyTree* GetPolicyTree(FlowDir dir)         { return policy_rule_.GetPolicyTree(dir); }
+    void CreateRuleKeyByTuple(FiveTuple& t, FlowDir d, std::vector<std::string>& v)
+                                                   { policy_rule_.CreateRuleKeyByTuple(t, d, v); }
+    int  AddPolicy(RuleDetail& policy, RulePort& port) { return policy_rule_.AddPolicyToTree(policy, port); }
+    void DeletePolicy(const std::string& name);    /*erases HTTP rules AND net policy for both directions*/
+    int  ClearCfg()                                { return policy_rule_.ClearCfg(); }
+    void PrintPolicyLog()                          { policy_rule_.PrintPolicyLog(); }
+    cJSON* GetAllConfig(const std::string& name)   { return policy_rule_.GetAllConfig(name); }
+
+    /*---- HTTP L7 policy ----*/
+    int  AddHttpPolicy(FlowDir dir, const std::string& key, HTTP_RULE_INFO& rule);
+    std::unordered_map<std::string, std::vector<HTTP_RULE_INFO>>& InputHttpPolicy()  { return input_http_policy_; }
+    std::unordered_map<std::string, std::vector<HTTP_RULE_INFO>>& OutputHttpPolicy() { return output_http_policy_; }
+
+    /*---- node IP registry ----*/
+    bool IsNodeIp(uint32_t ip) const               { return nodes_ip_.count(ip) > 0; }
+    void AddNodeIp(uint32_t ip)                    { nodes_ip_[ip] = 1; }
+    void RemoveNodeIp(uint32_t ip)                 { nodes_ip_.erase(ip); }
+
+    /*---- TCP connection tracking ----*/
+    std::map<TcpFourTupleV4, http::ConnectionPtr>& TcpCtInput()  { return tcp_ct_input_; }
+    std::map<TcpFourTupleV4, http::ConnectionPtr>& TcpCtOutput() { return tcp_ct_output_; }
+
+private:
+    PolicyRule                                                         policy_rule_;
+    std::unordered_map<uint32_t, uint8_t>                             nodes_ip_;
+    std::map<TcpFourTupleV4, http::ConnectionPtr>                     tcp_ct_input_;
+    std::map<TcpFourTupleV4, http::ConnectionPtr>                     tcp_ct_output_;
+    std::unordered_map<std::string, std::vector<HTTP_RULE_INFO>>      input_http_policy_;
+    std::unordered_map<std::string, std::vector<HTTP_RULE_INFO>>      output_http_policy_;
+};
+
+/*control-channel server — owns the connected client fd and registers it with epoll*/
+class CtrlServer
+{
+public:
+    ~CtrlServer() { if (client_fd_ > 0) close(client_fd_); }
+    /*accept a new client; closes any previously connected fd, registers new fd with epoll*/
+    int Accept(int epoll_fd, int client_fd);
+
+private:
+    int client_fd_ = 0;
+    RcvEpollCb epoll_cb_;
+};
+
+/*post-notification server — owns the client fd and sends match/WAF events*/
+class PostServer
+{
+public:
+    ~PostServer() { if (post_link_fd_ > 0) close(post_link_fd_); }
+    /*accept a new client; closes any previously connected fd*/
+    void Accept(int client_fd);
+    /*send a policy-match notification; returns 0 on success, -1 on error*/
+    int  SendMatchMsg(FiveTuple& tuple, NetPolicyRule action, FlowDir dir,
+                      const std::string& rule_key);
+    /*return pointer to the fd so the WAF plugin can write directly*/
+    int* FdPtr() { return &post_link_fd_; }
+
+private:
+    int post_link_fd_ = 0;
 };

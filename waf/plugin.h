@@ -43,14 +43,14 @@ private:
 
 class PluginRootContext {
 private:
-  int *pzPostFd;
-  std::unordered_map<std::string, Rules> WafRules;
+  int *post_fd_;
+  std::unordered_map<std::string, Rules> waf_rules_;
 
 public:
   PluginRootContext();
   ~PluginRootContext();
 
-  void SetPostFd(int *fd) { pzPostFd = fd; }
+  void SetPostFd(int *fd) { post_fd_ = fd; }
 
   int HttpPost(std::string value);
 
@@ -58,8 +58,8 @@ public:
 
   /*find waf rule*/
   bool GetWafRule(std::string ip, Rules &rule) {
-    auto it = WafRules.find(ip);
-    if (it == WafRules.end())
+    auto it = waf_rules_.find(ip);
+    if (it == waf_rules_.end())
       return false;
     /*rule*/
     rule = it->second;
@@ -67,7 +67,7 @@ public:
   }
 
   /*waf rule size*/
-  size_t GetWafRuleSize() { return WafRules.size(); }
+  size_t GetWafRuleSize() { return waf_rules_.size(); }
 
   /*remove waf rule*/
   bool RemoveWafRule(char *config);
