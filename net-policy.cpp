@@ -47,7 +47,7 @@ struct u32_mask {
 
 /*static value*/
 static int g_local_net_ns_fd = 0;
-static int g_post_link_fd = 0;
+static PostServer g_post_server;
 static int g_client_fd = 0;
 static PolicyRule g_micro_rule;
 
@@ -320,40 +320,44 @@ err:
   return -1;
 }
 
-/*post match message*/
-static int PostMatchMsg(FiveTuple& tuple, NET_POLICY_RULE action, FLOW_DIR dir, string& rule_key) {
+/*PostServer implementation*/
+void PostServer::Accept(int client_fd) {
+  if (post_link_fd_ > 0) {
+    if (client_fd != post_link_fd_)
+      close(post_link_fd_);
+    LOG_W("close old globe post fd, old fd : %d, new fd : %d.", post_link_fd_, client_fd);
+  }
+  post_link_fd_ = client_fd;
+  http::extension::RootContext.SetPostFd(&post_link_fd_);
+  fcntl(client_fd, F_SETFL, fcntl(client_fd, F_GETFL) | O_NONBLOCK);
+}
+
+int PostServer::SendMatchMsg(FiveTuple& tuple, NetPolicyRule action, FlowDir dir,
+                             const std::string& rule_key) {
   int ret, len;
   char buf[11] = {"#%% pre"};
   char data[1024];
-  /*post socket fd*/
-  if (g_post_link_fd <= 0)
+  if (post_link_fd_ <= 0)
     return 0;
-  /*init memory*/
   memset(data, 0, sizeof(data));
-  /*json data*/
   sprintf(data,
           "{\"type\":\"microseg\",\"proto\":%d,\"action\":%d,\"direction\":%d,\"src_port\":%d,"
           "\"dst_port\":%d,\"src_ip\":\"%s\",\"dst_ip\":\"%s\",\"policy_name\":\"%s\"}",
-          tuple.proto_, static_cast<int>(action), static_cast<int>(dir), tuple.src_port_, tuple.dst_port_, tuple.src_addr_.c_str(),
-          tuple.dst_addr_.c_str(), rule_key.c_str());
-  /*print debug log*/
+          tuple.proto_, static_cast<int>(action), static_cast<int>(dir), tuple.src_port_,
+          tuple.dst_port_, tuple.src_addr_.c_str(), tuple.dst_addr_.c_str(), rule_key.c_str());
   if (!((tuple.proto_ == IPPROTO_UDP) && (tuple.dst_port_ == 53)))
     LOG_D("[post] post micro seg data : %s", data);
-  /*data len*/
   len = (int)strlen(data);
-  /*send data*/
   buf[7] = len & 0xff;
   buf[8] = (len >> 8) & 0xff;
   buf[9] = (len >> 16) & 0xff;
   buf[10] = (len >> 24) & 0xff;
-  ret = write(g_post_link_fd, buf, 11);
+  ret = write(post_link_fd_, buf, 11);
   if (ret <= 0)
     GOTO_ERROR(err, "post match msg to server failed, %s.", strerror(errno));
-  /*post data*/
-  ret = write(g_post_link_fd, data, len);
+  ret = write(post_link_fd_, data, len);
   if (ret <= 0)
     GOTO_ERROR(err, "post match msg to server failed, %s.", strerror(errno));
-  /*return*/
   return 0;
 err:
   return -1;
@@ -706,7 +710,7 @@ static int input_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct 
     if ((http_rule == g_net_input_http_policy.end()) || (tuple.proto_ == IPPROTO_UDP) ||
         (tuple.proto_ == IPPROTO_ICMP) || (http_rule->second.empty())) {
       /*post match message*/
-      PostMatchMsg(tuple, rule_ret, dir, rule_key);
+      g_post_server.SendMatchMsg(tuple, rule_ret, dir, rule_key);
       // deny
       if (rule_ret == NetPolicyRule::kDeny) {
         LOG_D("input drop %s %s:%u -> %s:%u ", GetProtoString(tuple.proto_), tuple.src_addr_.c_str(),
@@ -777,7 +781,7 @@ static int input_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct 
   if (rule_ret == NetPolicyRule::kDefault)
     return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllowReq), 0, NULL);
   /*post match message*/
-  PostMatchMsg(tuple, rule_ret, FlowDir::kIngress, rule_key);
+  g_post_server.SendMatchMsg(tuple, rule_ret, FlowDir::kIngress, rule_key);
   /*rst tcp link*/
   if (rule_ret == NetPolicyRule::kDeny)
     rst_tcp_link(pkg);
@@ -892,7 +896,7 @@ static int output_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct
     if ((http_rule == g_net_output_http_policy.end()) || (tuple.proto_ == IPPROTO_UDP) ||
         (tuple.proto_ == IPPROTO_ICMP) || (http_rule->second.empty())) {
       /*post match message*/
-      PostMatchMsg(tuple, rule_ret, dir, rule_key);
+      g_post_server.SendMatchMsg(tuple, rule_ret, dir, rule_key);
       // deny
       if (rule_ret == NetPolicyRule::kDeny) {
         LOG_D("output drop %s %s:%u -> %s:%u ", GetProtoString(tuple.proto_), tuple.src_addr_.c_str(),
@@ -962,7 +966,7 @@ static int output_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct
   if (rule_ret == NetPolicyRule::kDefault)
     return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllowRsp), 0, NULL);
   /*post match message*/
-  PostMatchMsg(tuple, rule_ret, FlowDir::kEgress, rule_key);
+  g_post_server.SendMatchMsg(tuple, rule_ret, FlowDir::kEgress, rule_key);
   /*rst tcp link*/
   if (rule_ret == NetPolicyRule::kDeny)
     rst_tcp_link(pkg);
@@ -1976,18 +1980,7 @@ int ProcAcceptPostLinkEvent(int32_t epoll_fd, int32_t fd, void* ptr) {
   zClientFd = accept(fd, (struct sockaddr*)&address, &cliAddrLen);
   if (zClientFd <= 0)
     RETURN_ERROR(0, "accept a new client failed, %s.", strerror(errno));
-  /*close old fd*/
-  if (g_post_link_fd > 0) {
-    if (zClientFd != g_post_link_fd)
-      close(g_post_link_fd);
-    LOG_W("close old globe post fd, old fd : %d, new fd : %d.", g_post_link_fd, zClientFd);
-  }
-  /*save fd*/
-  g_post_link_fd = zClientFd;
-  http::extension::RootContext.SetPostFd(&g_post_link_fd);
-
-  // noblock
-  fcntl(zClientFd, F_SETFL, fcntl(zClientFd, F_GETFL) | O_NONBLOCK);
+  g_post_server.Accept(zClientFd);
   // return
   return 0;
 }

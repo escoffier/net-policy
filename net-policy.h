@@ -355,3 +355,19 @@ public:
     /*打印日志*/
     void PrintPolicyLog();
 };
+
+/*post-notification server — owns the client fd and sends match/WAF events*/
+class PostServer
+{
+public:
+    /*accept a new client; closes any previously connected fd*/
+    void Accept(int client_fd);
+    /*send a policy-match notification; returns 0 on success, -1 on error*/
+    int  SendMatchMsg(FiveTuple& tuple, NetPolicyRule action, FlowDir dir,
+                      const std::string& rule_key);
+    /*return pointer to the fd so the WAF plugin can write directly*/
+    int* FdPtr() { return &post_link_fd_; }
+
+private:
+    int post_link_fd_ = 0;
+};
