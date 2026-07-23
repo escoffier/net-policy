@@ -308,7 +308,7 @@ class PolicyTree : public RuleChain
 {
 public:
     /*policy tree*/
-    std::unordered_map<std::string, std::unordered_map<std::string, FlowDir>*> tree_;
+    std::unordered_map<std::string, std::unique_ptr<std::unordered_map<std::string, FlowDir>>> tree_;
 
 public:
     PolicyTree();
