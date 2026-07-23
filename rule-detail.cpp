@@ -194,13 +194,13 @@ std::string RuleDetail::CreateRuleKey(int& mask) {
   switch (this->direction_) {
   case FlowDir::kIngress:
     Ipv4CidrToIp(this->src_ip_, ip, mask);
-    /*create key*/
-    sprintf(buff, "%d-%d-%s-%s", this->priority_, this->proto_, ip.c_str(), this->dst_ip_.c_str());
+    /*create key: embed mask so /24 and /16 on the same base address don't collide*/
+    snprintf(buff, sizeof(buff), "%d-%d-%s/%d-%s", this->priority_, this->proto_, ip.c_str(), mask, this->dst_ip_.c_str());
     break;
   default:
     Ipv4CidrToIp(this->dst_ip_, ip, mask);
     /*create key*/
-    sprintf(buff, "%d-%d-%s-%s", this->priority_, this->proto_, this->src_ip_.c_str(), ip.c_str());
+    snprintf(buff, sizeof(buff), "%d-%d-%s-%s/%d", this->priority_, this->proto_, this->src_ip_.c_str(), ip.c_str(), mask);
     break;
   }
   key = buff;
@@ -319,16 +319,13 @@ void RuleGroup::DeleteRule(std::string policyName) {
 /*匹配策略*/
 bool RuleGroup::MatchRule(FiveTuple &tuple, RuleDetail &detail, FlowDir dir)
 {
-    if(this->rules_.size() == 0) return false;
-    /*遍历规则列表*/
-    for(auto it = this->rules_.begin(); it != this->rules_.end(); it++)
-    {
-        detail.AssignFrom(it->second);
-        auto ret = detail.MatchRuleDetail(tuple, dir);
-        if(ret) return true;
+    /*遍历规则列表 — defer copy until a match is confirmed*/
+    for (auto& [key, rule_ptr] : this->rules_) {
+        if (rule_ptr->MatchRuleDetail(tuple, dir)) {
+            detail.AssignFrom(rule_ptr);
+            return true;
+        }
     }
-
-    /*return*/
     return false;
 }
 
@@ -511,16 +508,23 @@ void PolicyRule::CreateRuleKeyByTuple(FiveTuple& tuple, FlowDir dir,
       /*clear data*/
       dstaddr.clear();
       srcaddr.clear();
+      char cidr_buf[64];
       switch (dir) {
       case FlowDir::kIngress:
-        srcaddr.push_back("0.0.0.0");
-        srcaddr.push_back(Ipv4CidrToIp(tuple.src_addr_, *iter));
+        /*wildcard source — mask=32 matches CreateRuleKey("0.0.0.0")*/
+        srcaddr.push_back("0.0.0.0/32");
+        snprintf(cidr_buf, sizeof(cidr_buf), "%s/%d",
+                 Ipv4CidrToIp(tuple.src_addr_, *iter).c_str(), *iter);
+        srcaddr.push_back(cidr_buf);
         dstaddr.push_back(tuple.dst_addr_);
         break;
       default:
         srcaddr.push_back(tuple.src_addr_);
-        dstaddr.push_back("0.0.0.0");
-        dstaddr.push_back(Ipv4CidrToIp(tuple.dst_addr_, *iter));
+        /*wildcard dest — mask=32 matches CreateRuleKey("0.0.0.0")*/
+        dstaddr.push_back("0.0.0.0/32");
+        snprintf(cidr_buf, sizeof(cidr_buf), "%s/%d",
+                 Ipv4CidrToIp(tuple.dst_addr_, *iter).c_str(), *iter);
+        dstaddr.push_back(cidr_buf);
         break;
       }
       // list priority
@@ -595,7 +599,7 @@ int PolicyRule::DeletePolicy(FlowDir dir, std::string name) {
 /*获取所有规则配置*/
 cJSON* PolicyRule::GetAllConfig(std::string name) {
   NFQ_RES_INFO* res;
-  cJSON *containers = nullptr, *tcp = nullptr, *r, *item;
+  cJSON *containers = nullptr, *tcp = nullptr, *r = nullptr, *item;
   cJSON *config = nullptr, *inrule = nullptr, *outrule = nullptr;
 
   tcp = cJSON_CreateObject();
@@ -607,59 +611,49 @@ cJSON* PolicyRule::GetAllConfig(std::string name) {
   if (!config || !outrule || !inrule || !tcp || !containers)
     GOTO_ERROR(err, "create json object failed.");
 
-  for (auto it = this->input_tree_.chain_.begin(); it != this->input_tree_.chain_.end(); it++) {
-    auto rule = it->second;
-    if (rule == nullptr)
-      continue;
+  /*iterate one tree and append matching rules to arr
+   * when name is non-empty: O(1) lookup per group (rules_ keyed by policy_key_)
+   * when name is empty: iterate all rules in every group*/
+  for (int dir_idx = 0; dir_idx < 2; dir_idx++) {
+    PolicyTree& tree  = (dir_idx == 0) ? this->input_tree_ : this->output_tree_;
+    cJSON*      arr   = (dir_idx == 0) ? inrule            : outrule;
+    const char* label = (dir_idx == 0) ? "inbound_rules"   : "outbound_rules";
 
-    for (auto rd = rule->rules_.begin(); rd != rule->rules_.end(); rd++) {
-      if (!name.empty() && name != rd->second->policy_key_)
-        continue;
-
-      r = cJSON_CreateObject();
-      if (!r)
-        GOTO_ERROR(err, "create json object failed.");
-
-      cJSON_AddStringToObject(r, "policy_name", rd->second->policy_key_.c_str());
-      cJSON_AddNumberToObject(r, "priority", rd->second->priority_);
-      cJSON_AddStringToObject(r, "direction",
-                              utility::directionString(rd->second->direction_).data());
-      cJSON_AddStringToObject(r, "action", utility::actionString(rd->second->action_).data());
-      cJSON_AddStringToObject(r, "protocol", utility::protocolString(rd->second->proto_).data());
-      cJSON_AddNumberToObject(r, "protocol_int", rd->second->proto_);
-      cJSON_AddStringToObject(r, "from_address", rd->second->src_ip_.c_str());
-      cJSON_AddStringToObject(r, "to_address", rd->second->dst_ip_.c_str());
-      cJSON_AddItemToArray(inrule, r);
+    for (auto& [chain_key, rule_group] : tree.chain_) {
+      if (!rule_group) continue;
+      if (!name.empty()) {
+        auto it = rule_group->rules_.find(name);
+        if (it == rule_group->rules_.end()) continue;
+        const auto& rd = it->second;
+        r = cJSON_CreateObject();
+        if (!r) GOTO_ERROR(err, "create json object failed.");
+        cJSON_AddStringToObject(r, "policy_name", rd->policy_key_.c_str());
+        cJSON_AddNumberToObject(r, "priority", rd->priority_);
+        cJSON_AddStringToObject(r, "direction", utility::directionString(rd->direction_).data());
+        cJSON_AddStringToObject(r, "action", utility::actionString(rd->action_).data());
+        cJSON_AddStringToObject(r, "protocol", utility::protocolString(rd->proto_).data());
+        cJSON_AddNumberToObject(r, "protocol_int", rd->proto_);
+        cJSON_AddStringToObject(r, "from_address", rd->src_ip_.c_str());
+        cJSON_AddStringToObject(r, "to_address", rd->dst_ip_.c_str());
+        cJSON_AddItemToArray(arr, r);
+      } else {
+        for (auto& [pname, rd] : rule_group->rules_) {
+          r = cJSON_CreateObject();
+          if (!r) GOTO_ERROR(err, "create json object failed.");
+          cJSON_AddStringToObject(r, "policy_name", rd->policy_key_.c_str());
+          cJSON_AddNumberToObject(r, "priority", rd->priority_);
+          cJSON_AddStringToObject(r, "direction", utility::directionString(rd->direction_).data());
+          cJSON_AddStringToObject(r, "action", utility::actionString(rd->action_).data());
+          cJSON_AddStringToObject(r, "protocol", utility::protocolString(rd->proto_).data());
+          cJSON_AddNumberToObject(r, "protocol_int", rd->proto_);
+          cJSON_AddStringToObject(r, "from_address", rd->src_ip_.c_str());
+          cJSON_AddStringToObject(r, "to_address", rd->dst_ip_.c_str());
+          cJSON_AddItemToArray(arr, r);
+        }
+      }
     }
+    cJSON_AddItemToObject(config, label, arr);
   }
-  cJSON_AddItemToObject(config, "inbound_rules", inrule);
-
-  for (auto it = this->output_tree_.chain_.begin(); it != this->output_tree_.chain_.end(); it++) {
-    auto rule = it->second;
-    if (rule == nullptr)
-      continue;
-
-    for (auto rd = rule->rules_.begin(); rd != rule->rules_.end(); rd++) {
-      if (!name.empty() && name != rd->second->policy_key_)
-        continue;
-
-      r = cJSON_CreateObject();
-      if (!r)
-        GOTO_ERROR(err, "create json object failed.");
-
-      cJSON_AddStringToObject(r, "policy_name", rd->second->policy_key_.c_str());
-      cJSON_AddNumberToObject(r, "priority", rd->second->priority_);
-      cJSON_AddStringToObject(r, "direction",
-                              utility::directionString(rd->second->direction_).data());
-      cJSON_AddStringToObject(r, "action", utility::actionString(rd->second->action_).data());
-      cJSON_AddStringToObject(r, "protocol", utility::protocolString(rd->second->proto_).data());
-      cJSON_AddNumberToObject(r, "protocol_int", rd->second->proto_);
-      cJSON_AddStringToObject(r, "from_address", rd->second->src_ip_.c_str());
-      cJSON_AddStringToObject(r, "to_address", rd->second->dst_ip_.c_str());
-      cJSON_AddItemToArray(outrule, r);
-    }
-  }
-  cJSON_AddItemToObject(config, "outbound_rules", outrule);
 
   if (!name.empty())
     return config;
