@@ -497,43 +497,41 @@ int PolicyRule::ClearCfg() {
 /*通过五元组生成规则*/
 void PolicyRule::CreateRuleKeyByTuple(FiveTuple& tuple, FlowDir dir,
                                       std::vector<std::string>& value) {
-  std::vector<std::string> srcaddr, dstaddr;
-  /*init*/
   value.clear();
-  /*create key*/
-  for (auto it = this->priority_.begin(); it != this->priority_.end(); ++it) {
-    for (auto iter = this->mask_cidr_.begin(); iter != this->mask_cidr_.end(); ++iter) {
-      dstaddr.clear();
-      srcaddr.clear();
-      std::string cidr = Ipv4CidrToIp(
-          (dir == FlowDir::kIngress) ? tuple.src_addr_ : tuple.dst_addr_, *iter)
-          + "/" + std::to_string(*iter);
-      switch (dir) {
-      case FlowDir::kIngress:
-        /*wildcard source — mask=32 matches CreateRuleKey("0.0.0.0")*/
-        srcaddr.push_back("0.0.0.0/32");
-        srcaddr.push_back(cidr);
-        dstaddr.push_back(tuple.dst_addr_);
-        break;
-      default:
-        srcaddr.push_back(tuple.src_addr_);
-        /*wildcard dest — mask=32 matches CreateRuleKey("0.0.0.0")*/
-        dstaddr.push_back("0.0.0.0/32");
-        dstaddr.push_back(cidr);
-        break;
-      }
-      for (const auto& src : srcaddr) {
-        for (const auto& dst : dstaddr) {
-          /*specific-protocol key*/
-          value.push_back(std::to_string(*it) + "-" + std::to_string(tuple.proto_)
-                          + "-" + src + "-" + dst);
-          /*all-protocol key (proto=0)*/
-          value.push_back(std::to_string(*it) + "-0-" + src + "-" + dst);
-        }
-      }
+  /*exact capacity: per priority — 2 wildcard keys + 2 CIDR keys per mask*/
+  value.reserve(this->priority_.size() * 2 * (1 + this->mask_cidr_.size()));
+
+  const bool     ingress   = (dir == FlowDir::kIngress);
+  /*the address that gets CIDR-masked depends on direction and is fixed per packet*/
+  const std::string& cidr_addr  = ingress ? tuple.src_addr_ : tuple.dst_addr_;
+  /*the address used verbatim (no masking) in the key*/
+  const std::string& exact_addr = ingress ? tuple.dst_addr_ : tuple.src_addr_;
+  const std::string  proto_str  = std::to_string(tuple.proto_);
+
+  for (const auto priority : this->priority_) {
+    /*cache the two key prefixes — reused for every key in this priority*/
+    const std::string proto_pfx  = std::to_string(priority) + "-" + proto_str   + "-";
+    const std::string proto0_pfx = std::to_string(priority) + "-0-";
+
+    /*wildcard key: any-source (ingress) or any-dest (egress).
+     * does NOT depend on CIDR mask — generate once per priority, not M times.*/
+    const std::string wildcard_suffix = ingress
+        ? "0.0.0.0/32-" + exact_addr
+        :  exact_addr   + "-0.0.0.0/32";
+    value.push_back(proto_pfx  + wildcard_suffix);
+    value.push_back(proto0_pfx + wildcard_suffix);
+
+    /*CIDR-masked keys: one pair (proto-specific + proto=0) per mask*/
+    for (const auto mask : this->mask_cidr_) {
+      const std::string cidr        = Ipv4CidrToIp(cidr_addr, mask) + "/" + std::to_string(mask);
+      const std::string cidr_suffix = ingress
+          ? cidr       + "-" + exact_addr
+          : exact_addr + "-" + cidr;
+      value.push_back(proto_pfx  + cidr_suffix);
+      value.push_back(proto0_pfx + cidr_suffix);
     }
   }
-  /*print debug log*/
+
   LOG_T("create rule key num : %lu, priority size : %lu, mark size : %lu.", value.size(),
         this->priority_.size(), this->mask_cidr_.size());
 }
