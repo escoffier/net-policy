@@ -497,53 +497,38 @@ int PolicyRule::ClearCfg() {
 /*通过五元组生成规则*/
 void PolicyRule::CreateRuleKeyByTuple(FiveTuple& tuple, FlowDir dir,
                                       std::vector<std::string>& value) {
-  char buff[128] = {0};
-  char data[128] = {0};
   std::vector<std::string> srcaddr, dstaddr;
   /*init*/
   value.clear();
   /*create key*/
   for (auto it = this->priority_.begin(); it != this->priority_.end(); ++it) {
     for (auto iter = this->mask_cidr_.begin(); iter != this->mask_cidr_.end(); ++iter) {
-      /*clear data*/
       dstaddr.clear();
       srcaddr.clear();
-      char cidr_buf[64];
+      std::string cidr = Ipv4CidrToIp(
+          (dir == FlowDir::kIngress) ? tuple.src_addr_ : tuple.dst_addr_, *iter)
+          + "/" + std::to_string(*iter);
       switch (dir) {
       case FlowDir::kIngress:
         /*wildcard source — mask=32 matches CreateRuleKey("0.0.0.0")*/
         srcaddr.push_back("0.0.0.0/32");
-        snprintf(cidr_buf, sizeof(cidr_buf), "%s/%d",
-                 Ipv4CidrToIp(tuple.src_addr_, *iter).c_str(), *iter);
-        srcaddr.push_back(cidr_buf);
+        srcaddr.push_back(cidr);
         dstaddr.push_back(tuple.dst_addr_);
         break;
       default:
         srcaddr.push_back(tuple.src_addr_);
         /*wildcard dest — mask=32 matches CreateRuleKey("0.0.0.0")*/
         dstaddr.push_back("0.0.0.0/32");
-        snprintf(cidr_buf, sizeof(cidr_buf), "%s/%d",
-                 Ipv4CidrToIp(tuple.dst_addr_, *iter).c_str(), *iter);
-        dstaddr.push_back(cidr_buf);
+        dstaddr.push_back(cidr);
         break;
       }
-      // list priority
-      for (size_t i = 0; i < srcaddr.size(); i++) {
-        for (size_t j = 0; j < dstaddr.size(); j++) {
-          memset(buff, 0, sizeof(buff));
-          sprintf(buff, "%d-%d-%s-%s", *it, tuple.proto_, srcaddr.at(i).c_str(),
-                  dstaddr.at(j).c_str());
-          /*save key*/
-          value.push_back(buff);
-          /*print debug log*/
-          // tuple.PrintData(buff, 2);
-          /*all protocol*/
-          memset(data, 0, sizeof(data));
-          sprintf(data, "%d-0-%s-%s", *it, srcaddr.at(i).c_str(), dstaddr.at(j).c_str());
-          /*save key*/
-          value.push_back(data);
-          /*print debug log*/
-          // tuple.PrintData(data, 2);
+      for (const auto& src : srcaddr) {
+        for (const auto& dst : dstaddr) {
+          /*specific-protocol key*/
+          value.push_back(std::to_string(*it) + "-" + std::to_string(tuple.proto_)
+                          + "-" + src + "-" + dst);
+          /*all-protocol key (proto=0)*/
+          value.push_back(std::to_string(*it) + "-0-" + src + "-" + dst);
         }
       }
     }
