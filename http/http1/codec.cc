@@ -63,7 +63,6 @@ void ConnectionImpl::setFilterManager(HttpFilterManagerPtr filterManager) {
 }
 
 void ConnectionImpl::onUrl(std::string_view url) {
-  url_.clear();
   url_.append(url);
   VLOG(6) << "url : " << url_ << std::endl;
 }
@@ -126,6 +125,10 @@ ConnectionImpl::ConnectionImpl(bool serverSide, HttpFilterManagerPtr filterManag
   // http_parser_init(&parser_, HTTP_REQUEST);
 
   llhttp_settings_init(&settings_);
+  settings_.on_message_begin = [](llhttp_t* parser) -> int {
+    reinterpret_cast<ConnectionImpl*>(parser->data)->resetState();
+    return 0;
+  };
   settings_.on_method = [](llhttp_t* parser, const char* at, size_t length) -> int { return 0; };
   settings_.on_method_complete = [](llhttp_t* parser) -> int {
     VLOG(6) << "method: " << llhttp_method_name((llhttp_method_t)parser->method) << std::endl;

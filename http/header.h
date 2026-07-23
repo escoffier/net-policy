@@ -54,6 +54,8 @@ public:
 
   void add(std::string key, std::string value) { kv_.insert({key, value}); };
 
+  void clear() { kv_.clear(); }
+
   friend std::ostream& operator<<(std::ostream& os, RequestHeaderMap& headers);
 
 private:

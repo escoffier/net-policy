@@ -47,6 +47,14 @@ public:
     header_fields_.push_back(field);
   };
 
+  void resetState() {
+    url_.clear();
+    header_ = {"", "", "", ParseState::Continue};
+    header_fields_.clear();
+    header_values_.clear();
+    headerMap_.clear();
+  }
+
   void onHeaderValue(std::string value) {
     header_values_.push_back(value);
   };
