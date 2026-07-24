@@ -349,7 +349,7 @@ public:
     /*将规则添加到链上*/
     int AddPolicyToTree(RuleDetail &policy, RULE_PORT &stPort);
     /*通过五元组生成规则*/
-    void CreateRuleKeyByTuple(FiveTuple &tuple, FlowDir dir, std::vector<std::string> &value);
+    std::vector<std::string> CreateRuleKeyByTuple(FiveTuple &tuple, FlowDir dir);
     /*获取策略map*/
     PolicyTree *GetPolicyTree(FlowDir dir);
     /*获取所有规则配置*/
@@ -373,8 +373,8 @@ public:
 
     /*---- network policy (delegated to PolicyRule) ----*/
     PolicyTree* GetPolicyTree(FlowDir dir)         { return policy_rule_.GetPolicyTree(dir); }
-    void CreateRuleKeyByTuple(FiveTuple& t, FlowDir d, std::vector<std::string>& v)
-                                                   { policy_rule_.CreateRuleKeyByTuple(t, d, v); }
+    std::vector<std::string> CreateRuleKeyByTuple(FiveTuple& t, FlowDir d)
+                                                   { return policy_rule_.CreateRuleKeyByTuple(t, d); }
     int  AddPolicy(RuleDetail& policy, RulePort& port) { return policy_rule_.AddPolicyToTree(policy, port); }
     void DeletePolicy(const std::string& name);    /*erases HTTP rules AND net policy for both directions*/
     int  ClearCfg()                                { return policy_rule_.ClearCfg(); }

@@ -495,9 +495,8 @@ int PolicyRule::ClearCfg() {
 }
 
 /*通过五元组生成规则*/
-void PolicyRule::CreateRuleKeyByTuple(FiveTuple& tuple, FlowDir dir,
-                                      std::vector<std::string>& value) {
-  value.clear();
+std::vector<std::string> PolicyRule::CreateRuleKeyByTuple(FiveTuple& tuple, FlowDir dir) {
+  std::vector<std::string> value;
   /*exact capacity: per priority — 2 wildcard keys + 2 CIDR keys per mask*/
   value.reserve(this->priority_.size() * 2 * (1 + this->mask_cidr_.size()));
 
@@ -534,6 +533,7 @@ void PolicyRule::CreateRuleKeyByTuple(FiveTuple& tuple, FlowDir dir,
 
   LOG_T("create rule key num : %lu, priority size : %lu, mark size : %lu.", value.size(),
         this->priority_.size(), this->mask_cidr_.size());
+  return value;
 }
 
 /*获取策略map*/

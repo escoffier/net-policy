@@ -413,7 +413,6 @@ static NET_POLICY_RULE MatchHttpPolicyRule(const std::vector<HTTP_RULE_INFO>& ht
 
 /*math net policy rule*/
 static NET_POLICY_RULE MatchNetPolicyRule(FiveTuple& tuple, FLOW_DIR dir, RuleDetail& detail) {
-  std::vector<std::string> rule_keys;
   /*is node ip*/
   if (g_microseg.IsNodeIp(tuple.src_addr_u32_))
     return NetPolicyRule::kDefault;
@@ -422,7 +421,7 @@ static NET_POLICY_RULE MatchNetPolicyRule(FiveTuple& tuple, FLOW_DIR dir, RuleDe
   if (rules->RuleSize() == 0)
     return NetPolicyRule::kDefault;
   /*get rule key*/
-  g_microseg.CreateRuleKeyByTuple(tuple, dir, rule_keys);
+  auto rule_keys = g_microseg.CreateRuleKeyByTuple(tuple, dir);
   /*遍历规则进行匹配*/
   for (int i = 0; i < (int)rule_keys.size(); i++) {
     /*匹配规则*/
