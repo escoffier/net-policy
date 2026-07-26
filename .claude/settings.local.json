@@ -1,7 +1,8 @@
 {
   "permissions": {
     "allow": [
-      "Bash(docker run:*)"
+      "Bash(docker run:*)",
+      "Bash(docker exec gracious_bardeen:*)"
     ]
   }
 }
