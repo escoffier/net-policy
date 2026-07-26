@@ -65,7 +65,7 @@ public:
 
   std::string CreatePolicyRuleKey(RuleDetail& info);
 
-  int CreatePolicyRuleKey(FiveTuple& tuple, FlowDir dir, std::vector<std::string>& value);
+  std::vector<std::string> CreatePolicyRuleKey(FiveTuple& tuple, FlowDir dir);
 
   NetPolicyRule MatchNetPolicyRule(FiveTuple& tuple, FlowDir dir, std::string& rule_key);
 

@@ -218,7 +218,6 @@ FilterStatus PluginContext::onRequestHeaders(RequestHeaderMap &headers, bool end
 {
   bool ret;
   BWList param = {};
-  std::string smret;
   std::string value, path;
   std::int64_t nowtime = GetNowTime();
   /*get request header pairs*/
@@ -315,7 +314,7 @@ FilterStatus PluginContext::onRequestHeaders(RequestHeaderMap &headers, bool end
       //check value
       if(value.empty()) continue;
       //regex
-      if (ruleArr.Pcre2Regex(r.id_, r.expr_, value, smret))
+      if (auto smret = ruleArr.Pcre2Regex(r.id_, r.expr_, value))
       {
         /*save attack info*/
         LOG_D("[success] matched header rule success, id : %ld", r.id_);
@@ -323,7 +322,7 @@ FilterStatus PluginContext::onRequestHeaders(RequestHeaderMap &headers, bool end
         atlog.attack_time_ = nowtime;
         atlog.rule_id_   = r.id_;
         atlog.rule_name_ = r.name_;
-        atlog.attack_load_ = smret.c_str();
+        atlog.attack_load_ = smret->c_str();
         atlog.attacked_app_ = ruleArr.GetAppName();
         atlog.type_ = r.type_;
         atlog.action_ = (ruleArr.GetDefAction() == ATCTION_DROP) ? "drop" : "warn";
@@ -340,7 +339,7 @@ FilterStatus PluginContext::onRequestHeaders(RequestHeaderMap &headers, bool end
 
 FilterStatus PluginContext::onRequestBody(seastar::net::packet &p, bool end_of_stream) 
 {
-  std::string ret, body;
+  std::string body;
   /*check body length*/
   if(p.len() == 0) return FilterStatus::Continue;
   /*body*/
@@ -361,7 +360,7 @@ FilterStatus PluginContext::onRequestBody(seastar::net::packet &p, bool end_of_s
   {
     for(auto &key : r.keys_)
     {
-      if (ruleArr.Pcre2Regex(r.id_, r.expr_, body, ret))
+      if (auto ret = ruleArr.Pcre2Regex(r.id_, r.expr_, body))
       {
         /*save attack info*/
         LOG_D("[success] matched body rule, id : %ld, action : %d, expr : %s, key : %s", r.id_, ruleArr.GetDefAction(), r.expr_.c_str(), key.c_str());
@@ -369,7 +368,7 @@ FilterStatus PluginContext::onRequestBody(seastar::net::packet &p, bool end_of_s
         atlog.attack_time_ = GetNowTime();
         atlog.rule_id_   = r.id_;
         atlog.rule_name_ = r.name_;
-        atlog.attack_load_ = ret.c_str();
+        atlog.attack_load_ = ret->c_str();
         atlog.attacked_app_ = ruleArr.GetAppName();
         atlog.type_ = r.type_;
         atlog.rsp_pkg_ = body;

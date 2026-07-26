@@ -763,12 +763,11 @@ void Rules::AddBlackWhiteList(BWList &bw)
     }
 }
 
-/*pcre2 match*/
-bool Rules::Pcre2Regex(std::uint64_t id, std::string &expr, std::string &src, std::string &dst)
+/*pcre2 match — returns matched substring, or nullopt on no match*/
+std::optional<std::string> Rules::Pcre2Regex(std::uint64_t id, std::string &expr, std::string &src)
 {
-    bool ret = false;
+    std::optional<std::string> result;
     pcre2_code *re = nullptr;
-    std::string buf;
     PCRE2_UCHAR buffer[256];
     int errorcode, rc;
     PCRE2_SIZE erroroffset;
@@ -781,9 +780,9 @@ bool Rules::Pcre2Regex(std::uint64_t id, std::string &expr, std::string &src, st
     if(!re)
     {
         pcre2_get_error_message(errorcode, buffer, sizeof(buffer));
-        buf = (char *)buffer;
-        LOG_E("PCRE2 compilation failed, id : %lu, erroroffset : %d, error : %s, number : %d", id, (int)erroroffset, buf.c_str(), errorcode);
-        return false;
+        LOG_E("PCRE2 compilation failed, id : %lu, erroroffset : %d, error : %s, number : %d",
+              id, (int)erroroffset, (char *)buffer, errorcode);
+        return std::nullopt;
     }
     // 匹配正则表达式
     pcre2_match_data *match_data = pcre2_match_data_create_from_pattern(re, NULL);
@@ -792,9 +791,7 @@ bool Rules::Pcre2Regex(std::uint64_t id, std::string &expr, std::string &src, st
         LOG_E("PCRE2 match data create from pattern failed, id : %lu", id);
         goto end;
     }
-    /*ovector pointer*/
     ovector = pcre2_get_ovector_pointer(match_data);
-    /*pcre2 match*/
     rc = pcre2_match(re, input, PCRE2_ZERO_TERMINATED, 0, 0, match_data, NULL);
     while (rc > 0)
     {
@@ -802,24 +799,17 @@ bool Rules::Pcre2Regex(std::uint64_t id, std::string &expr, std::string &src, st
         {
             substring_start  = input + ovector[2 * i];
             substring_length = ovector[2 * i + 1] - ovector[2 * i];
-            dst = (char *)substring_start;
-            /*set result state*/
-            ret = true;
-            /*goto end*/
+            result = std::string(reinterpret_cast<const char*>(substring_start), substring_length);
             goto end;
         }
-
         input = substring_start + substring_length;
         rc = pcre2_match(re, input, PCRE2_ZERO_TERMINATED, 0, 0, match_data, NULL);
-        /*ovector pointer*/
         ovector = pcre2_get_ovector_pointer(match_data);
     }
 end:
-    /*free*/
     if(match_data) pcre2_match_data_free(match_data);
     if(re) pcre2_code_free(re);
-    /*return*/
-    return ret;
+    return result;
 }
 
 bool Rules::MatchIgnoreType(std::string &src)

@@ -2,6 +2,7 @@
 
 #include <map>
 #include <memory>
+#include <optional>
 #include <unordered_map>
 #include <string>
 #include <tuple>
@@ -198,6 +199,13 @@ struct RulePort
 };
 using RULE_PORT = RulePort; // legacy alias
 
+/*result of RuleDetail::CreateRuleKey — key string plus extracted CIDR mask*/
+struct RuleKeyResult
+{
+    std::string key;
+    int         mask;
+};
+
 struct HTTP_RULE_INFO
 {
     uint8_t direction_;
@@ -253,7 +261,7 @@ public:
     /*清除端口配置*/
     void ClearPortsCfg();
     /*生成用于匹配的策略*/
-    std::string CreateRuleKey(int &mask);
+    RuleKeyResult CreateRuleKey();
     /*匹配策略详情*/
     bool MatchRuleDetail(FiveTuple &tuple, FlowDir dir);
     /*打印策略详情*/
@@ -274,7 +282,7 @@ public:
     /*删除匹配策略*/
     void DeleteRule(std::string policyName);
     /*匹配策略*/
-    bool MatchRule(FiveTuple &tuple, RuleDetail &detail, FlowDir dir);
+    std::optional<RuleDetail> MatchRule(FiveTuple &tuple, FlowDir dir);
     /*获取规则数*/
     size_t GetRulesSize();
 };
@@ -296,7 +304,7 @@ public:
     /*set dir*/
     void SetRuleDir(FlowDir);
     /*匹配规则*/
-    bool MatchRuleGroup(std::string &key, FiveTuple &tuple, RuleDetail &detail);
+    std::optional<RuleDetail> MatchRuleGroup(std::string &key, FiveTuple &tuple);
     /*生成匹配规则,并保持到链上*/
     int AddRuleToChain(std::string key, RuleDetail &policy, RULE_PORT &stPort);
     /*从链上删除规则*/
@@ -320,7 +328,7 @@ public:
     /*delete policy*/
     int DeletePolicyFromTree(std::string &name);
     /*将规则添加到链上*/
-    int AddPolicyToChain(RuleDetail &policy, RULE_PORT &stPort, int &zMask);
+    int AddPolicyToChain(RuleDetail &policy, RULE_PORT &stPort);
 };
 
 /*网络策略详情*/

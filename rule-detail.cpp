@@ -33,27 +33,23 @@
 using std::make_pair;
 using std::string;
 
-void Ipv4CidrToIp(std::string cidr, std::string& ip, int& mask) {
+/*parse CIDR string "a.b.c.d/n" → {network_ip, mask}; bare IPs default to /32*/
+static std::pair<std::string, int> ParseCidr(const std::string& cidr) {
   struct in_addr addr;
   uint32_t uzIpaddr, uzMask;
-  size_t index;
-  string sip, smask;
-  smask = "32";
-  sip = cidr;
-  index = cidr.find("/");
-  if (index != string::npos) {
-    sip = cidr.substr(0, index);
-    smask = cidr.substr(index + 1);
+  std::string sip = cidr;
+  int mask = 32;
+  auto index = cidr.find('/');
+  if (index != std::string::npos) {
+    sip  = cidr.substr(0, index);
+    mask = std::stoi(cidr.substr(index + 1));
   }
   uzIpaddr = ntohl(inet_addr(sip.c_str()));
-  uzMask = std::stoi(smask);
-  mask = static_cast<int>(uzMask);
-  uzMask = ~0u << (32 - uzMask);
-  /*count network address*/
+  uzMask   = ~0u << (32 - mask);
   uzIpaddr &= uzMask;
   addr.s_addr = htonl(uzIpaddr);
   char buf[INET_ADDRSTRLEN];
-  ip = inet_ntop(AF_INET, &addr, buf, sizeof(buf));
+  return { inet_ntop(AF_INET, &addr, buf, sizeof(buf)), mask };
 }
 
 std::string Ipv4CidrToIp(std::string ip, int mask) {
@@ -188,24 +184,22 @@ void RuleDetail::AddPortsCfg(RULE_PORT& port) { this->ports_.push_back(port); }
 /*清除端口配置*/
 void RuleDetail::ClearPortsCfg() { this->ports_.clear(); }
 /*生成用于匹配的策略*/
-std::string RuleDetail::CreateRuleKey(int& mask) {
-  string key, ip;
+RuleKeyResult RuleDetail::CreateRuleKey() {
   char buff[128] = {0};
   switch (this->direction_) {
-  case FlowDir::kIngress:
-    Ipv4CidrToIp(this->src_ip_, ip, mask);
-    /*create key: embed mask so /24 and /16 on the same base address don't collide*/
-    snprintf(buff, sizeof(buff), "%d-%d-%s/%d-%s", this->priority_, this->proto_, ip.c_str(), mask, this->dst_ip_.c_str());
-    break;
-  default:
-    Ipv4CidrToIp(this->dst_ip_, ip, mask);
-    /*create key*/
-    snprintf(buff, sizeof(buff), "%d-%d-%s-%s/%d", this->priority_, this->proto_, this->src_ip_.c_str(), ip.c_str(), mask);
-    break;
+  case FlowDir::kIngress: {
+    auto [ip, mask] = ParseCidr(this->src_ip_);
+    snprintf(buff, sizeof(buff), "%d-%d-%s/%d-%s",
+             this->priority_, this->proto_, ip.c_str(), mask, this->dst_ip_.c_str());
+    return { buff, mask };
   }
-  key = buff;
-  /*return*/
-  return key;
+  default: {
+    auto [ip, mask] = ParseCidr(this->dst_ip_);
+    snprintf(buff, sizeof(buff), "%d-%d-%s-%s/%d",
+             this->priority_, this->proto_, this->src_ip_.c_str(), ip.c_str(), mask);
+    return { buff, mask };
+  }
+  }
 }
 
 /*匹配策略详情*/
@@ -317,16 +311,13 @@ void RuleGroup::DeleteRule(std::string policyName) {
 }
 
 /*匹配策略*/
-bool RuleGroup::MatchRule(FiveTuple &tuple, RuleDetail &detail, FlowDir dir)
+std::optional<RuleDetail> RuleGroup::MatchRule(FiveTuple &tuple, FlowDir dir)
 {
-    /*遍历规则列表 — defer copy until a match is confirmed*/
     for (auto& [key, rule_ptr] : this->rules_) {
-        if (rule_ptr->MatchRuleDetail(tuple, dir)) {
-            detail.AssignFrom(rule_ptr);
-            return true;
-        }
+        if (rule_ptr->MatchRuleDetail(tuple, dir))
+            return *rule_ptr;
     }
-    return false;
+    return std::nullopt;
 }
 
 /*获取规则数*/
@@ -345,15 +336,12 @@ void RuleChain::SetRuleDir(FlowDir direction) { this->dir_ = direction; }
 void RuleChain::RuleChainClear() { this->chain_.clear(); }
 
 /*匹配规则*/
-bool RuleChain::MatchRuleGroup(std::string& key, FiveTuple& tuple, RuleDetail& detail) {
-  /*match rule*/
+std::optional<RuleDetail> RuleChain::MatchRuleGroup(std::string& key, FiveTuple& tuple) {
   auto it = this->chain_.find(key);
   if (it == this->chain_.end())
-    return false;
-  /*print debug log*/
+    return std::nullopt;
   tuple.PrintData(key);
-  /*match rule*/
-  return it->second->MatchRule(tuple, detail, this->dir_);
+  return it->second->MatchRule(tuple, this->dir_);
 }
 
 /*生成匹配规则,并保持到链上*/
@@ -452,7 +440,7 @@ int PolicyTree::DeletePolicyFromTree(std::string& name) {
 }
 
 /*将规则添加到链上*/
-int PolicyTree::AddPolicyToChain(RuleDetail& policy, RULE_PORT& stPort, int& zMask) {
+int PolicyTree::AddPolicyToChain(RuleDetail& policy, RULE_PORT& stPort) {
   /*query or create the per-policy key map*/
   auto it = this->tree_.find(policy.policy_key_);
   if (it == this->tree_.end()) {
@@ -465,8 +453,8 @@ int PolicyTree::AddPolicyToChain(RuleDetail& policy, RULE_PORT& stPort, int& zMa
     LOG_D("create new policy : [%s]", policy.policy_key_.c_str());
   }
   auto& ruleMap = *it->second;
-  /*create policy rule key*/
-  auto key = policy.CreateRuleKey(zMask);
+  /*create policy rule key — mask extracted by caller via CreateRuleKey()*/
+  auto [key, mask_unused] = policy.CreateRuleKey();
   /*写入匹配规则*/
   auto ret = this->AddRuleToChain(key, policy, stPort);
   if (ret != 0)
@@ -559,16 +547,15 @@ void PolicyRule::AddMaskAndPriority(int priority, int mask) {
 
 /*将规则添加到链上*/
 int PolicyRule::AddPolicyToTree(RuleDetail& policy, RULE_PORT& stPort) {
-  int zMask = 0;
+  /*extract mask from CIDR in policy before inserting into chain*/
+  auto [key_unused, mask] = policy.CreateRuleKey();
   /*get policy tree*/
   auto tree = this->GetPolicyTree(policy.direction_);
-  /*return*/
-  auto ret = tree->AddPolicyToChain(policy, stPort, zMask);
+  auto ret = tree->AddPolicyToChain(policy, stPort);
   if (ret != 0)
     RETURN_ERROR(ret, "add policy to chain failed.");
-  /*save priority*/
-  this->AddMaskAndPriority(policy.priority_, zMask);
-  /*return*/
+  /*save priority and mask for future key generation*/
+  this->AddMaskAndPriority(policy.priority_, mask);
   return 0;
 }
 

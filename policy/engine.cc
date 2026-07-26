@@ -8,26 +8,21 @@
 
 namespace policy {
 
-static void Ipv4CidrToIp(std::string cidr, std::string &ip, int &mask) {
+static std::pair<std::string, int> ParseCidr(const std::string& cidr) {
   struct in_addr addr;
   uint32_t uzIpaddr, uzMask;
-  size_t index;
-  std::string sip, smask;
-  smask = "32";
-  sip = cidr;
-  index = cidr.find("/");
+  std::string sip = cidr;
+  int mask = 32;
+  auto index = cidr.find('/');
   if (index != std::string::npos) {
-    sip = cidr.substr(0, index);
-    smask = cidr.substr(index + 1);
+    sip  = cidr.substr(0, index);
+    mask = std::atoi(cidr.c_str() + index + 1);
   }
   uzIpaddr = ntohl(inet_addr(sip.c_str()));
-  uzMask = atoi(smask.c_str());
-  mask = uzMask;
-  uzMask = ~0 << (32 - uzMask);
-  /*count network address*/
+  uzMask   = ~0u << (32 - mask);
   uzIpaddr &= uzMask;
   addr.s_addr = htonl(uzIpaddr);
-  ip = inet_ntoa(addr);
+  return { inet_ntoa(addr), mask };
 }
 
 static std::string Ipv4CidrToIp(std::string ip, int mask) {
@@ -66,24 +61,25 @@ static ::std::string PrintPortsData(std::vector<RulePort> &ports) {
 }
 
 std::string PolicyEngine::CreatePolicyRuleKey(RuleDetail &info) {
-  int mask;
-  std::string key, ip;
   char buff[128] = {0};
+  int  mask      = 32;
   switch (info.direction_) {
-  case FlowDir::kIngress:
-    Ipv4CidrToIp(info.src_ip_, ip, mask);
-    /*create key*/
+  case FlowDir::kIngress: {
+    auto [ip, m] = ParseCidr(info.src_ip_);
+    mask = m;
     sprintf(buff, "%d-%d-%s-%s", info.priority_, info.proto_, ip.c_str(),
             info.dst_ip_.c_str());
     break;
-  case FlowDir::kEgress:
-    Ipv4CidrToIp(info.dst_ip_, ip, mask);
-    /*create key*/
+  }
+  case FlowDir::kEgress: {
+    auto [ip, m] = ParseCidr(info.dst_ip_);
+    mask = m;
     sprintf(buff, "%d-%d-%s-%s", info.priority_, info.proto_, info.src_ip_.c_str(),
             ip.c_str());
     break;
+  }
   default:
-    return key;
+    return {};
   }
   /*save cidr*/
   if ((mask > 0) && (mask <= 32))
@@ -93,8 +89,7 @@ std::string PolicyEngine::CreatePolicyRuleKey(RuleDetail &info) {
   /*print debug log*/
   LOG_D("create policy rule key : [%s], priority : %d, priority size : %d",
         buff, info.priority_, (int)priority_.size());
-  key = buff;
-  return key;
+  return buff;
 }
 
 int PolicyEngine::AddNewPolicy(RuleDetail &policy, RulePort &stPort) {
@@ -169,13 +164,10 @@ int PolicyEngine::AddNewHttpPolicy(FlowDir dir, std::string &key,
   return 0;
 }
 
-int PolicyEngine::CreatePolicyRuleKey(FiveTuple &tuple, FlowDir dir,
-                                      std::vector<std::string> &value) {
+std::vector<std::string> PolicyEngine::CreatePolicyRuleKey(FiveTuple &tuple, FlowDir dir) {
   char buff[128] = {0};
+  std::vector<std::string> value;
   std::vector<std::string> srcaddr, dstaddr;
-  /*init*/
-  value.clear();
-  /*create key*/
   for (auto it = priority_.begin(); it != priority_.end(); ++it) {
     for (auto iter = mask_cidr_.begin(); iter != mask_cidr_.end(); ++iter) {
       switch (dir) {
@@ -190,34 +182,25 @@ int PolicyEngine::CreatePolicyRuleKey(FiveTuple &tuple, FlowDir dir,
         dstaddr.push_back(Ipv4CidrToIp(tuple.dst_addr_, *iter));
         break;
       default:
-        return -1;
+        return value;
       }
-      // list priority
       for (size_t i = 0; i < srcaddr.size(); i++) {
         for (size_t j = 0; j < dstaddr.size(); j++) {
           memset(buff, 0, sizeof(buff));
           sprintf(buff, "%d-%d-%s-%s", *it, tuple.proto_, srcaddr.at(i).c_str(),
                   dstaddr.at(j).c_str());
-          /*print debug log*/
-          // if(tuple.dstPort == 80) LOG_D("rule key : [%s]", buff);
-          /*save key*/
           value.push_back(buff);
-          // all protocol
           memset(buff, 0, sizeof(buff));
           sprintf(buff, "%d-0-%s-%s", *it, srcaddr.at(i).c_str(),
                   dstaddr.at(j).c_str());
-          /*save key*/
           value.push_back(buff);
-          /*print debug log*/
-          // if(tuple.dstPort == 80) LOG_D("rule key : [%s]", buff);
         }
       }
-      /*clear data*/
       dstaddr.clear();
       srcaddr.clear();
     }
   }
-  return 0;
+  return value;
 }
 
 NetPolicyRule PolicyEngine::MatchNetPolicyRule(FiveTuple &tuple, FlowDir dir,
@@ -234,7 +217,7 @@ NetPolicyRule PolicyEngine::MatchNetPolicyRule(FiveTuple &tuple, FlowDir dir,
   if (ruleQue->size() == 0)
     return NetPolicyRule::kDefault;
   /*get rule key*/
-  CreatePolicyRuleKey(tuple, dir, ruleKeys);
+  ruleKeys = CreatePolicyRuleKey(tuple, dir);
   // print debug log
   // LOG_D("create rule key num : %lu.", ruleKeys.size());
   for (int i = 0; i < (int)ruleKeys.size(); i++) {

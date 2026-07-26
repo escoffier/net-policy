@@ -411,59 +411,43 @@ static NET_POLICY_RULE MatchHttpPolicyRule(const std::vector<HTTP_RULE_INFO>& ht
   return NetPolicyRule::kDefault;
 }
 
-/*math net policy rule*/
-static NET_POLICY_RULE MatchNetPolicyRule(FiveTuple& tuple, FLOW_DIR dir, RuleDetail& detail) {
-  /*is node ip*/
+/*match net policy rule — returns matched RuleDetail, or nullopt if no rule fired*/
+static std::optional<RuleDetail> MatchNetPolicyRule(FiveTuple& tuple, FLOW_DIR dir) {
   if (g_microseg.IsNodeIp(tuple.src_addr_u32_))
-    return NetPolicyRule::kDefault;
-  /*get rule map*/
+    return std::nullopt;
   auto rules = g_microseg.GetPolicyTree(dir);
   if (rules->RuleSize() == 0)
-    return NetPolicyRule::kDefault;
-  /*get rule key*/
+    return std::nullopt;
   auto rule_keys = g_microseg.CreateRuleKeyByTuple(tuple, dir);
-  /*遍历规则进行匹配*/
-  for (int i = 0; i < (int)rule_keys.size(); i++) {
-    /*匹配规则*/
-    auto found = rules->MatchRuleGroup(rule_keys.at(i), tuple, detail);
-    if (!found)
-      continue;
-    /*reverse selection*/
-    return detail.action_;
+  for (auto& key : rule_keys) {
+    if (auto matched = rules->MatchRuleGroup(key, tuple))
+      return matched;
   }
-
-  return NetPolicyRule::kDefault;
+  return std::nullopt;
 }
 
 /*match micro policy rule*/
 static NET_POLICY_RULE MatchMicroPolicyRule(FiveTuple& tuple, FLOW_DIR& dir,
                                             std::string& rule_key) {
+  auto detail = MatchNetPolicyRule(tuple, dir);
+  if (!detail)
+    return NetPolicyRule::kDefault;
+  rule_key = detail->policy_key_;
+  if (detail->action_ == NetPolicyRule::kAllow)
+    return detail->action_;
+  /*reverse-match: check whether the reverse direction has a higher-priority rule*/
   FiveTuple data;
-  FLOW_DIR fdir;
-  RuleDetail detail, revDetail;
-  /*策略匹配*/
-  auto ret = MatchNetPolicyRule(tuple, dir, detail);
-  if (ret == NetPolicyRule::kDefault)
-    return ret;
-  /*判断匹配上的策略*/
-  rule_key = detail.policy_key_;
-  if (ret == NetPolicyRule::kAllow)
-    return ret;
-  /*交换地址信息*/
   tuple.ReverseTuple(data);
-  fdir = (dir == FlowDir::kIngress) ? FlowDir::kEgress : FlowDir::kIngress;
-  /*反向匹配策略*/
-  auto result = MatchNetPolicyRule(data, fdir, revDetail);
-  if (result == NetPolicyRule::kDefault)
-    return ret;
-  /*根据权重进行匹配*/
-  if (detail.priority_ <= revDetail.priority_)
-    return ret;
-  /*处理策略匹配结果*/
-  tuple = data;
-  dir = fdir;
-  rule_key = revDetail.policy_key_;
-  return result;
+  FLOW_DIR fdir = (dir == FlowDir::kIngress) ? FlowDir::kEgress : FlowDir::kIngress;
+  auto revDetail = MatchNetPolicyRule(data, fdir);
+  if (!revDetail)
+    return detail->action_;
+  if (detail->priority_ <= revDetail->priority_)
+    return detail->action_;
+  tuple    = data;
+  dir      = fdir;
+  rule_key = revDetail->policy_key_;
+  return revDetail->action_;
 }
 
 /*update session callback*/

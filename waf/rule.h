@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <iostream>
+#include <optional>
 #include <string>
 #include <vector>
 #include <regex>
@@ -136,8 +137,8 @@ public:
     std::vector<std::string> GetDetectHeaders() { return detect_header_; }
     /*get default action*/
     uint8_t GetDefAction() { return def_action_; }
-    /*pcre2 match*/
-    bool Pcre2Regex(std::uint64_t id, std::string &expr, std::string &src, std::string &dst);
+    /*pcre2 match — returns matched substring, or nullopt on no match*/
+    std::optional<std::string> Pcre2Regex(std::uint64_t id, std::string &expr, std::string &src);
     /*match ignore type*/
     bool MatchIgnoreType(std::string &src);
     /*match ignore type*/
