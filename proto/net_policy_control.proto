@@ -1,0 +1,163 @@
+syntax = "proto3";
+package netpolicy.v1;
+
+import "proto/net_policy_common.proto";
+
+// Replaces the raw-socket request/response control channel (port 9999, NetDataType
+// enum, net-policy.h:59-78). This runs ALONGSIDE the existing raw-socket CtrlServer,
+// not instead of it -- see the migration plan for the dual-protocol rationale.
+//
+// kRspAck (5) is intentionally not modeled here: it is the daemon's own response
+// tag today, never a client request. kPostNet (6) is intentionally not migrated:
+// it is dead/unhandled in the legacy dispatch switch (falls to `default:`,
+// net-policy.cpp:1874-1876) and is out of scope for this migration.
+service NetPolicyControl {
+  rpc PodUp(PodUpRequest)                       returns (StatusResponse);          // NetDataType::kPodPid
+  rpc PodDown(PodDownRequest)                   returns (StatusResponse);          // NetDataType::kPodDie
+  rpc AddPolicyRule(AddPolicyRuleRequest)       returns (StatusResponse);          // NetDataType::kAddRule
+  rpc DeletePolicyRule(DeletePolicyRuleRequest) returns (StatusResponse);          // NetDataType::kDelRule
+  rpc AddWafRule(AddWafRuleRequest)             returns (StatusResponse);          // NetDataType::kAddWafRule
+  rpc DeleteWafRule(DeleteWafRuleRequest)       returns (StatusResponse);          // NetDataType::kDelWafRule
+  rpc DumpHeapProfile(DumpHeapProfileRequest)   returns (StatusResponse);          // NetDataType::kHeapDump
+  rpc DumpConfig(DumpConfigRequest)             returns (DumpConfigResponse);      // NetDataType::kConfDump
+  rpc DumpConnections(DumpConnectionsRequest)   returns (DumpConnectionsResponse); // NetDataType::kConnDump
+  rpc ResetConfig(ResetConfigRequest)           returns (StatusResponse);          // NetDataType::kReset
+  rpc UpdateNodeConfig(UpdateNodeConfigRequest) returns (StatusResponse);          // NetDataType::kNodeCfg
+  rpc SetLogLevel(SetLogLevelRequest)           returns (StatusResponse);          // NetDataType::kLogLevel
+}
+
+// mirrors the {status, uuid} reply shape built at net-policy.cpp:1893-1897;
+// uuid is optional going forward since gRPC's own call/response pairing removes
+// the need for a client-supplied correlation id, kept only for migration convenience.
+message StatusResponse {
+  int32  status = 1;
+  string uuid   = 2;
+}
+
+// NetCtrlInfo.pid_/pod_id_, validated at ParseRcvJson net-policy.cpp:1679-1683
+message PodUpRequest {
+  int32  pid    = 1;
+  uint64 pod_id = 2;
+}
+message PodDownRequest {
+  uint64 pod_id = 1;
+}
+
+// mirrors one element of rules[] in ParseNetPolicy's expected JSON, net-policy.cpp:1466-1628
+message PolicyRuleSpec {
+  PolicyAction  action      = 1;
+  FlowDirection direction   = 2;
+  L4Protocol    protocol    = 3;  // optional; UNSPECIFIED == "any", net-policy.cpp:1486-1492
+  repeated HttpMatchRule   http_rules     = 4;  // net-policy.cpp:1494-1517
+  repeated AddressEndpoint from_addresses = 5;  // net-policy.cpp:1519-1544
+  repeated AddressEndpoint to_addresses   = 6;  // net-policy.cpp:1578-1602
+  repeated PortRange       ports          = 7;  // net-policy.cpp:1546-1571
+  int32 priority = 8;  // must be 1..128, validated in AddNewPolicy net-policy.cpp:1211
+}
+message AddPolicyRuleRequest {
+  string policy_name = 1;  // ctrl.policy_key_ / rule.policy_key_, net-policy.cpp:1452-1458
+  repeated PolicyRuleSpec rules = 2;
+}
+message DeletePolicyRuleRequest {
+  string policy_name = 1;
+}
+
+// mirrors Rule, waf/rule.h:55-65 (fields set by ParseConfiguration, waf/plugin.cc:462-481)
+message WafRule {
+  int64  id          = 1;
+  int64  level       = 2;
+  string type        = 3;
+  string name        = 4;
+  string expr        = 5;
+  string mode        = 6;
+  string description = 7;  // JSON key on the wire is "Description" (capital D), waf/plugin.cc:477
+}
+// mirrors BWList's fields as read by ParseConfiguration, waf/plugin.cc:532-545
+// (BWList itself has additional fields -- action_/desc_/oprexpr_/rtype_/rdata_ -- that
+// ParseConfiguration never populates from JSON; they are intentionally omitted here too)
+message BlackWhiteListEntry {
+  uint64 id   = 1;
+  string name = 2;
+  string expr = 3;
+  string mode = 4;
+}
+// mirrors the full field set ParseConfiguration reads, waf/plugin.cc:427-581
+message AddWafRuleRequest {
+  repeated string pod_ips = 1;
+  repeated WafRule rules = 2;
+  repeated string domains = 3;
+  repeated string excluded_file_types = 4;
+  repeated string detect_headers = 5;
+  repeated BlackWhiteListEntry black_white_lists = 6;
+  string uri = 7;
+  string mode = 8;           // default action, Rules::AddDefAction
+  string name = 9;           // app name
+  string cluster_key = 10;
+  string k8s_namespace = 11; // JSON key on the wire is "namespace"
+  string kind = 12;
+  string workload_name = 13;
+  uint64 service_id = 14;
+}
+message DeleteWafRuleRequest {
+  repeated string pod_ips = 1;  // waf/plugin.cc:621+ (pod_ips only)
+}
+
+// admin::Heap::handleHeapProfile expects a JSON {"enable":"y"|"n"} string, admin/profile.cc:30-56;
+// the control-service bridge converts this bool to that string when building the call.
+message DumpHeapProfileRequest {
+  bool enable = 1;
+}
+
+// empty policy_name == dump all, ctrl.policy_key_ semantics, net-policy.cpp:1853
+message DumpConfigRequest {
+  string policy_name = 1;
+}
+
+// typed replacement for the generic `body` blob the legacy protocol returns for kConfDump;
+// mirrors PolicyRule::GetAllConfig's cJSON shape, rule-detail.cpp:570-655
+message PolicyRuleConfigEntry {
+  string policy_name  = 1;
+  int32  priority      = 2;
+  string direction     = 3;  // utility::directionString()
+  string action        = 4;  // utility::actionString()
+  string protocol      = 5;  // utility::protocolString()
+  int32  protocol_int  = 6;
+  string from_address  = 7;
+  string to_address    = 8;
+}
+message ContainerInfo {  // rule-detail.cpp:636-641
+  int32  pid    = 1;
+  uint64 pod_id = 2;
+}
+message DumpConfigResponse {
+  repeated PolicyRuleConfigEntry inbound_rules  = 1;
+  repeated PolicyRuleConfigEntry outbound_rules = 2;
+  repeated ContainerInfo containers = 3;  // only populated when policy_name is empty, rule-detail.cpp:628-643
+  int64 tcp_connections = 4;              // rule-detail.cpp:645
+}
+
+// dumpConnectons, net-policy.cpp:1701-1718
+message DumpConnectionsRequest {
+  int32 limit = 1;
+}
+message DumpConnectionsResponse {
+  int64 total = 1;
+  repeated string items = 2;
+}
+
+message ResetConfigRequest {}
+
+// ParseNodeCfg, net-policy.cpp:1382-1430
+message UpdateNodeConfigRequest {
+  enum Action {
+    ACTION_UNSPECIFIED = 0;
+    ACTION_ADD          = 1;
+    ACTION_DELETE       = 2;
+  }
+  Action action = 1;
+  repeated string node_ips = 2;
+}
+
+message SetLogLevelRequest {
+  int32 level = 1;  // ctrl.level_, net-policy.cpp:1869-1871
+}

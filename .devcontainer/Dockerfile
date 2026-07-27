@@ -6,7 +6,7 @@ RUN sed -i 's/archive.ubuntu.com/mirrors.aliyun.com/g' /etc/apt/sources.list
 
 RUN apt-get -y update \
   && apt-get -y install --no-install-recommends git clang clangd cmake make tar ca-certificates autoconf automake autotools-dev patch libtool libgflags-dev wget libfmt-dev libboost-dev \
-  liblzma-dev zlib1g-dev 2>&1 \
+  liblzma-dev zlib1g-dev libssl-dev 2>&1 \
   && apt-get clean \
   && rm -rf /var/lib/apt/lists/*p
 
@@ -41,3 +41,31 @@ RUN wget https://github.com/nghttp2/nghttp2/archive/refs/tags/v1.56.0.tar.gz && 
 
 RUN wget https://github.com/PCRE2Project/pcre2/archive/refs/tags/pcre2-10.42.tar.gz && tar -zxvf pcre2-10.42.tar.gz \
   && cd pcre2-pcre2-10.42 && cmake -S . -B build && cmake --build build --target install
+
+# --- gRPC control-plane toolchain (see proto/ and grpc/) ---
+# Same "wget release tarball, cmake, install into system prefix" style as above.
+# Built with `package` provider mode so each step links against the previously
+# installed system packages instead of expecting git submodules.
+RUN wget https://github.com/abseil/abseil-cpp/archive/refs/tags/20230802.1.tar.gz -O abseil-cpp-20230802.1.tar.gz && tar -zxvf abseil-cpp-20230802.1.tar.gz \
+  && cd abseil-cpp-20230802.1 && cmake -DCMAKE_CXX_STANDARD=17 -DABSL_PROPAGATE_CXX_STD=ON -DABSL_ENABLE_INSTALL=ON -DBUILD_SHARED_LIBS=OFF -S . -B build && cmake --build build --target install
+
+RUN wget https://github.com/c-ares/c-ares/archive/refs/tags/cares-1_19_1.tar.gz -O c-ares-1.19.1.tar.gz && tar -zxvf c-ares-1.19.1.tar.gz \
+  && cd c-ares-cares-1_19_1 && cmake -DCARES_SHARED=OFF -DCARES_STATIC=ON -S . -B build && cmake --build build --target install
+
+RUN wget https://github.com/google/re2/archive/refs/tags/2023-11-01.tar.gz -O re2-2023-11-01.tar.gz && tar -zxvf re2-2023-11-01.tar.gz \
+  && cd re2-2023-11-01 && cmake -DBUILD_SHARED_LIBS=OFF -S . -B build && cmake --build build --target install
+
+RUN wget https://github.com/protocolbuffers/protobuf/releases/download/v21.12/protobuf-cpp-3.21.12.tar.gz && tar -zxvf protobuf-cpp-3.21.12.tar.gz \
+  && cd protobuf-3.21.12 && cmake -Dprotobuf_BUILD_TESTS=OFF -Dprotobuf_BUILD_SHARED_LIBS=OFF -S cmake -B build && cmake --build build --target install
+
+RUN wget https://github.com/grpc/grpc/archive/refs/tags/v1.54.3.tar.gz -O grpc-1.54.3.tar.gz && tar -zxvf grpc-1.54.3.tar.gz \
+  && cd grpc-1.54.3 && cmake -DgRPC_BUILD_TESTS=OFF \
+       -DgRPC_INSTALL=ON \
+       -DgRPC_ABSL_PROVIDER=package \
+       -DgRPC_CARES_PROVIDER=package \
+       -DgRPC_PROTOBUF_PROVIDER=package \
+       -DgRPC_RE2_PROVIDER=package \
+       -DgRPC_SSL_PROVIDER=package \
+       -DgRPC_ZLIB_PROVIDER=package \
+       -DBUILD_SHARED_LIBS=OFF \
+       -S . -B build && cmake --build build --target install

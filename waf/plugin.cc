@@ -12,6 +12,7 @@
 #include "net/stream.h"
 #include "plugin.h"
 #include "log.h"
+#include "grpc/event_bridge.h"
 
 
 namespace http {
@@ -140,7 +141,9 @@ FilterStatus PluginContext::onClose()
   if(!str) GOTO_ERROR(err, "json format failed.");
   /*http post*/
   RootContext.HttpPost(str);
-  
+  /*publish to gRPC subscribers too -- see grpc/event_bridge.h*/
+  grpc_bridge::GetEventBridge().PublishWafAttack(ruleArr, atlog);
+
 err:
   if(root) cJSON_Delete(root);
   if(str) cJSON_free(str);

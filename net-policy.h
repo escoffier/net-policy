@@ -55,6 +55,8 @@ extern void ClearIptabelsRule();
 extern int SetNs(int pid, char *basePath);
 /*connection manager*/
 extern net::ConnectionManager g_connection_manager;
+/*daemon entrypoint; defined in net-policy.cpp, called from main.cpp*/
+extern int RunNetPolicyDaemon(int argc, char* argv[]);
 
 enum class NetDataType : int
 {

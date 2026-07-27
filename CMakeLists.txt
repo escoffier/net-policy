@@ -20,6 +20,9 @@ find_package(llhttp REQUIRED)
 enable_testing()
 find_package(GTest REQUIRED)
 
+find_package(Protobuf REQUIRED)
+find_package(gRPC REQUIRED)
+
 # add_subdirectory(third-party/llhttp-release-v9.0.1)
 include(FetchContent)
 
@@ -54,16 +57,62 @@ set(SOURCES
     net/udp.cc
     http/extension/log.cc
     admin/profile.cc
+    main.cpp
     net-policy.cpp
     rule-detail.cpp
     waf/plugin.cc
     waf/rule.cc
+    grpc/work_queue.cc
+    grpc/proto_json_bridge.cc
+    grpc/control_service.cc
+    grpc/event_bridge.cc
+    grpc/event_service.cc
+    grpc/grpc_server.cc
 )
 
 add_subdirectory(libnfnetlink)
 add_subdirectory(libmnl)
 add_subdirectory(libnetfilter_conntrack)
 add_subdirectory(libnetfilter_queue)
+
+# --- gRPC/protobuf codegen for proto/*.proto (see grpc/ and proto/ for the control-plane
+# gRPC migration; this runs alongside the existing raw-socket control plane, not instead
+# of it) ---
+set(NET_POLICY_PROTO_FILES
+    proto/net_policy_common.proto
+    proto/net_policy_control.proto
+    proto/net_policy_events.proto
+)
+set(NET_POLICY_PROTO_GEN_DIR ${CMAKE_CURRENT_BINARY_DIR}/proto-gen/proto)
+file(MAKE_DIRECTORY ${NET_POLICY_PROTO_GEN_DIR})
+
+set(NET_POLICY_PROTO_GENERATED_SRCS "")
+foreach(proto_file ${NET_POLICY_PROTO_FILES})
+  get_filename_component(proto_name ${proto_file} NAME_WE)
+  set(pb_cc      ${NET_POLICY_PROTO_GEN_DIR}/${proto_name}.pb.cc)
+  set(pb_h       ${NET_POLICY_PROTO_GEN_DIR}/${proto_name}.pb.h)
+  set(grpc_pb_cc ${NET_POLICY_PROTO_GEN_DIR}/${proto_name}.grpc.pb.cc)
+  set(grpc_pb_h  ${NET_POLICY_PROTO_GEN_DIR}/${proto_name}.grpc.pb.h)
+  add_custom_command(
+    OUTPUT ${pb_cc} ${pb_h} ${grpc_pb_cc} ${grpc_pb_h}
+    COMMAND protobuf::protoc
+    ARGS --cpp_out=${CMAKE_CURRENT_BINARY_DIR}/proto-gen
+         --grpc_out=${CMAKE_CURRENT_BINARY_DIR}/proto-gen
+         --plugin=protoc-gen-grpc=$<TARGET_FILE:gRPC::grpc_cpp_plugin>
+         -I ${CMAKE_CURRENT_SOURCE_DIR}
+         ${CMAKE_CURRENT_SOURCE_DIR}/${proto_file}
+    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/${proto_file}
+    COMMENT "Generating gRPC/protobuf code for ${proto_file}"
+    VERBATIM)
+  list(APPEND NET_POLICY_PROTO_GENERATED_SRCS ${pb_cc} ${grpc_pb_cc})
+endforeach()
+
+# Generated code isn't held to this project's -Wall -Werror (see target_compile_options
+# below, which applies only to the net-rule target) -- protobuf/grpc generated sources
+# routinely trip -Wunused-parameter/-Wshadow that would otherwise break the build.
+set_source_files_properties(${NET_POLICY_PROTO_GENERATED_SRCS} PROPERTIES COMPILE_OPTIONS "-w")
+
+list(APPEND SOURCES ${NET_POLICY_PROTO_GENERATED_SRCS})
 
 add_executable(net-rule ${SOURCES})
 # add_definitions("-Wall -g")
@@ -100,23 +149,25 @@ target_compile_options(${PROJECT_NAME}
   PRIVATE ${PRIVATE_CXX_FLAGS})
 
 
-target_include_directories(net-rule PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/)
-target_link_libraries(net-rule 
-  libnfnetlink 
-  libnetfilter_queue 
-  libnetfilter_conntrack 
-  libnghttp2.a 
-  libpcre2-8.a 
-  libpcre2-posix.a 
-  fmt::fmt-header-only 
-  llhttp::llhttp_static 
-  glog.a 
-  gflags.a 
+target_include_directories(net-rule PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/ ${CMAKE_CURRENT_BINARY_DIR}/proto-gen)
+target_link_libraries(net-rule
+  libnfnetlink
+  libnetfilter_queue
+  libnetfilter_conntrack
+  libnghttp2.a
+  libpcre2-8.a
+  libpcre2-posix.a
+  fmt::fmt-header-only
+  llhttp::llhttp_static
+  glog.a
+  gflags.a
   ${CMAKE_THREAD_LIBS_INIT}
   libunwind.a
   liblzma.a
   libz.a
   libtcmalloc_and_profiler.a
+  gRPC::grpc++
+  protobuf::libprotobuf
 )
 
 # target_link_libraries(net-rule 
@@ -153,6 +204,68 @@ GTest::gtest_main)
 include(GoogleTest)
 gtest_discover_tests(net_rule_test)
 
+# --- gRPC control-plane tests ---
+# Kept separate from net_rule_test (which deliberately excludes NFQUEUE/iptables/policy-engine
+# code) since these tests link net-policy.cpp/rule-detail.cpp/waf/* to exercise real
+# g_microseg/WAF state through the new gRPC control service. Safe to link GTest::gtest_main
+# alongside net-policy.cpp now that net-policy.cpp no longer defines main() (see main.cpp).
+add_executable(net_rule_grpc_test
+    net/utility.cc
+    net/filter.cc
+    net/filter_factory.cc
+    net/ip.cc
+    net/tcp.cc
+    net/udp.cc
+    cjson.c
+    http/header.cc
+    http/codec.cc
+    http/packet.cc
+    http/http_filter_factory.cc
+    http/filter.cc
+    http/http1/http_parser.c
+    http/http1/codec.cc
+    http/http2/codec.cc
+    http/url.cc
+    http/http_inspector.cc
+    http/connection.cc
+    http/extension/log.cc
+    admin/profile.cc
+    net-policy.cpp
+    rule-detail.cpp
+    waf/plugin.cc
+    waf/rule.cc
+    grpc/work_queue.cc
+    grpc/proto_json_bridge.cc
+    grpc/control_service.cc
+    grpc/event_bridge.cc
+    grpc/event_service.cc
+    grpc/grpc_server.cc
+    ${NET_POLICY_PROTO_GENERATED_SRCS}
+    tests/grpc_control_service_test.cc
+    tests/grpc_event_bridge_test.cc
+    tests/grpc_e2e_test.cc
+)
+target_include_directories(net_rule_grpc_test PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/ ${CMAKE_CURRENT_BINARY_DIR}/proto-gen)
+target_link_libraries(net_rule_grpc_test
+  libnfnetlink
+  libnetfilter_queue
+  libnetfilter_conntrack
+  libnghttp2.a
+  libpcre2-8.a
+  libpcre2-posix.a
+  fmt::fmt-header-only
+  llhttp::llhttp_static
+  glog.a
+  gflags.a
+  ${CMAKE_THREAD_LIBS_INIT}
+  libunwind.a
+  liblzma.a
+  libz.a
+  libtcmalloc_and_profiler.a
+  gRPC::grpc++
+  protobuf::libprotobuf
+  GTest::gtest_main)
+gtest_discover_tests(net_rule_grpc_test)
 
 
 

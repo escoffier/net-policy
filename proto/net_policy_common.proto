@@ -1,0 +1,45 @@
+syntax = "proto3";
+package netpolicy.v1;
+
+// mirrors FlowDir, net-policy.h:95-96
+enum FlowDirection {
+  FLOW_DIRECTION_UNSPECIFIED = 0;
+  FLOW_DIRECTION_INGRESS     = 1;
+  FLOW_DIRECTION_EGRESS      = 2;
+}
+
+// mirrors NetPolicyRule (Deny/Allow/Mark), net-policy.cpp:1373-1379 ("Allow"/"Log" -> allow, "Alert" -> mark)
+enum PolicyAction {
+  POLICY_ACTION_UNSPECIFIED = 0;
+  POLICY_ACTION_DENY        = 1;
+  POLICY_ACTION_ALLOW       = 2;
+  POLICY_ACTION_ALERT       = 3;
+}
+
+enum L4Protocol {
+  L4_PROTOCOL_UNSPECIFIED = 0;
+  L4_PROTOCOL_TCP         = 1;
+  L4_PROTOCOL_UDP         = 2;
+  L4_PROTOCOL_ICMP        = 3;
+}
+
+// mirrors RULE_PORT / RulePort, net-policy.h:194-200; end_port == 0 means "same as port"
+message PortRange {
+  uint32 port     = 1;
+  uint32 end_port = 2;
+}
+
+// mirrors HTTP_RULE_INFO's host/method/path fields, net-policy.h:209-216
+message HttpMatchRule {
+  string host   = 1;
+  string method = 2;
+  string path   = 3;
+}
+
+// mirrors one element of rules[].from_addresses[]/to_addresses[], net-policy.cpp:1519-1544, 1578-1602.
+// "ip" is kept as a raw string (not further modeled) since the existing parser, ParseIpString
+// (net-policy.cpp:83-136), already accepts single IPs, "a.b.c.d-e" ranges, and comma-separated lists.
+message AddressEndpoint {
+  string ip     = 1;
+  uint64 pod_id = 2;  // required on the "local" side for the rule's direction
+}

@@ -31,6 +31,11 @@
 #include <unistd.h>
 #include <gflags/gflags.h>
 #include "net-policy.h"
+#include "grpc/work_queue.h"
+#include "grpc/proto_json_bridge.h"
+#include "grpc/event_bridge.h"
+#include "grpc/grpc_server.h"
+#include "proto/net_policy_control.pb.h"
 
 using std::string;
 using std::vector;
@@ -373,6 +378,10 @@ int PostServer::SendMatchMsg(FiveTuple& tuple, NetPolicyRule action, FlowDir dir
   int ret, len;
   char buf[11] = {"#%% pre"};
   char data[1024];
+  /*publish to gRPC subscribers unconditionally -- this must run before the
+   *post_link_fd_ early-return below, since a gRPC-only deployment (no legacy
+   *listener connected) would otherwise never see these events*/
+  grpc_bridge::GetEventBridge().PublishPolicyMatch(tuple, action, dir, rule_key);
   if (post_link_fd_ <= 0)
     return 0;
   memset(data, 0, sizeof(data));
@@ -1941,6 +1950,139 @@ rsp:
   return 0;
 }
 
+/*Runs a gRPC control-service request through the exact same functions the
+ *raw-socket path above calls -- this is the only place gRPC requests ever
+ *touch g_microseg/RootContext/the policy trees, and it only ever runs on
+ *this (the epoll) thread, preserving the single-writer invariant those
+ *globals have always relied on. See grpc/work_queue.h for ControlWorkItem.*/
+void DispatchGrpcControlOp(int32_t epoll_fd, grpc_bridge::ControlWorkItem& item) {
+  using grpc_bridge::ControlOp;
+  int ret = 0;
+
+  switch (item.op) {
+  case ControlOp::kPodUp: {
+    const auto* req = static_cast<const netpolicy::v1::PodUpRequest*>(item.request);
+    auto* resp = static_cast<netpolicy::v1::StatusResponse*>(item.response);
+    NET_CTRL_INFO ctrl = {};
+    ctrl.pid_ = req->pid();
+    ctrl.pod_id_ = req->pod_id();
+    ret = SetNs(ctrl.pid_, const_cast<char*>(kBasePath.data()));
+    if (ret == 0) {
+      ret = InitNfqueue(epoll_fd, ctrl);
+      if (ret == 0)
+        WriteIptableRule(1, 1);
+    }
+    resp->set_status(ret);
+    break;
+  }
+  case ControlOp::kPodDown: {
+    const auto* req = static_cast<const netpolicy::v1::PodDownRequest*>(item.request);
+    auto* resp = static_cast<netpolicy::v1::StatusResponse*>(item.response);
+    ret = g_microseg.DeleteNfQueRes(epoll_fd, req->pod_id());
+    resp->set_status(ret);
+    break;
+  }
+  case ControlOp::kAddPolicyRule: {
+    const auto* req = static_cast<const netpolicy::v1::AddPolicyRuleRequest*>(item.request);
+    auto* resp = static_cast<netpolicy::v1::StatusResponse*>(item.response);
+    std::string json = grpc_bridge::BuildAddPolicyRuleJson(*req);
+    ret = ParseNetPolicy(const_cast<char*>(json.c_str()));
+    g_microseg.PrintPolicyLog();
+    resp->set_status(ret);
+    break;
+  }
+  case ControlOp::kDeletePolicyRule: {
+    const auto* req = static_cast<const netpolicy::v1::DeletePolicyRuleRequest*>(item.request);
+    auto* resp = static_cast<netpolicy::v1::StatusResponse*>(item.response);
+    std::string policy_name = req->policy_name();
+    ret = DeletePolicy(policy_name);
+    resp->set_status(ret);
+    break;
+  }
+  case ControlOp::kAddWafRule: {
+    const auto* req = static_cast<const netpolicy::v1::AddWafRuleRequest*>(item.request);
+    auto* resp = static_cast<netpolicy::v1::StatusResponse*>(item.response);
+    std::string json = grpc_bridge::BuildAddWafRuleJson(*req);
+    bool found = http::extension::RootContext.ParseConfiguration(const_cast<char*>(json.c_str()));
+    resp->set_status(found ? 0 : 1);
+    break;
+  }
+  case ControlOp::kDeleteWafRule: {
+    const auto* req = static_cast<const netpolicy::v1::DeleteWafRuleRequest*>(item.request);
+    auto* resp = static_cast<netpolicy::v1::StatusResponse*>(item.response);
+    std::string json = grpc_bridge::BuildDeleteWafRuleJson(*req);
+    bool found = http::extension::RootContext.RemoveWafRule(const_cast<char*>(json.c_str()));
+    resp->set_status(found ? 0 : 1);
+    break;
+  }
+  case ControlOp::kDumpHeapProfile: {
+    const auto* req = static_cast<const netpolicy::v1::DumpHeapProfileRequest*>(item.request);
+    auto* resp = static_cast<netpolicy::v1::StatusResponse*>(item.response);
+    std::string json = grpc_bridge::BuildDumpHeapProfileJson(*req);
+    admin::Status status = admin::Heap::handleHeapProfile(json);
+    resp->set_status((status == admin::Status::OK) ? 0 : 1);
+    break;
+  }
+  case ControlOp::kDumpConfig: {
+    const auto* req = static_cast<const netpolicy::v1::DumpConfigRequest*>(item.request);
+    auto* resp = static_cast<netpolicy::v1::DumpConfigResponse*>(item.response);
+    cJSON* config = g_microseg.GetAllConfig(req->policy_name());
+    grpc_bridge::ConvertConfigCJsonToProto(config, resp);
+    if (config)
+      cJSON_Delete(config);
+    break;
+  }
+  case ControlOp::kDumpConnections: {
+    const auto* req = static_cast<const netpolicy::v1::DumpConnectionsRequest*>(item.request);
+    auto* resp = static_cast<netpolicy::v1::DumpConnectionsResponse*>(item.response);
+    std::string json = grpc_bridge::BuildDumpConnectionsJson(*req);
+    cJSON* conns = dumpConnectons(json);
+    grpc_bridge::ConvertConnectionsCJsonToProto(conns, resp);
+    if (conns)
+      cJSON_Delete(conns);
+    break;
+  }
+  case ControlOp::kResetConfig: {
+    auto* resp = static_cast<netpolicy::v1::StatusResponse*>(item.response);
+    ret = g_microseg.ClearCfg();
+    resp->set_status(ret);
+    break;
+  }
+  case ControlOp::kUpdateNodeConfig: {
+    const auto* req = static_cast<const netpolicy::v1::UpdateNodeConfigRequest*>(item.request);
+    auto* resp = static_cast<netpolicy::v1::StatusResponse*>(item.response);
+    std::string json = grpc_bridge::BuildUpdateNodeConfigJson(*req);
+    ret = ParseNodeCfg(const_cast<char*>(json.c_str()));
+    resp->set_status(ret);
+    break;
+  }
+  case ControlOp::kSetLogLevel: {
+    const auto* req = static_cast<const netpolicy::v1::SetLogLevelRequest*>(item.request);
+    auto* resp = static_cast<netpolicy::v1::StatusResponse*>(item.response);
+    g_log_level = req->level();
+    LOG_I("set log level : %d", g_log_level);
+    resp->set_status(0);
+    break;
+  }
+  }
+}
+
+/*Epoll callback for the gRPC work-queue wake eventfd (registered by
+ *RunNetPolicyDaemon, textually parallel to how the listen socket and
+ *PostServer register themselves). Drains every item gRPC handler threads
+ *have queued since the last wakeup and runs each through
+ *DispatchGrpcControlOp on this (the epoll) thread.*/
+int32_t DispatchGrpcWorkQueueEvent(int32_t epoll_fd, int32_t fd, void* ptr) {
+  uint64_t drain;
+  while (read(fd, &drain, sizeof(drain)) > 0) {
+  }
+  for (auto* item : grpc_bridge::GetControlWorkQueue().DrainAll()) {
+    DispatchGrpcControlOp(epoll_fd, *item);
+    item->done.set_value();
+  }
+  return 0;
+}
+
 int ProcAcceptEvent(int32_t epoll_fd, int32_t fd, void* ptr) {
   int zClientFd;
   socklen_t cliAddrLen;
@@ -2051,7 +2193,7 @@ int GetIptablesVersion() {
   return 0;
 }
 
-int main(int argc, char* argv[]) {
+int RunNetPolicyDaemon(int argc, char* argv[]) {
   google::InitGoogleLogging(argv[0], &CustomPrefix);
   google::ParseCommandLineFlags(&argc, &argv, true);
   FLAGS_logtostderr = true;
@@ -2071,7 +2213,12 @@ int main(int argc, char* argv[]) {
   int zListenFd = 0, epfd = 0, zLinkFd;
   int ret, nfds, i, opt = 1;
   struct sockaddr_in address;
-  RCV_EPOLL_CB unixEvent, postEvent, *pstCbEv;
+  RCV_EPOLL_CB unixEvent, postEvent, grpcWakeEvent, *pstCbEv;
+  /*runs alongside the raw-socket servers above -- see grpc/grpc_server.h.
+   *Declared here (unconditionally constructed before any of the fallible
+   *setup below) so that none of the GOTO_ERROR jumps to err: below cross
+   *its initialization.*/
+  grpc_bridge::GrpcServer g_grpc_server;
   // print start log
   LOG_I("policy process start......");
   /*get log level env*/
@@ -2120,6 +2267,18 @@ int main(int argc, char* argv[]) {
     GOTO_ERROR(err, "listen the client connect request! err : %s.", strerror(errno));
   //
   g_microseg.SetEfd(epfd);
+  // start the gRPC control/event server (additive -- see grpc/grpc_server.h;
+  // raw-socket servers above are untouched)
+  ret = g_grpc_server.Start();
+  if (ret != 0)
+    GOTO_ERROR(err, "failed to start grpc control/event server.");
+  grpcWakeEvent.fd_ = g_grpc_server.WakeFd();
+  grpcWakeEvent.epoll_in_func_ = DispatchGrpcWorkQueueEvent;
+  ev.data.ptr = &grpcWakeEvent;
+  ev.events = EPOLLIN;
+  ret = epoll_ctl(epfd, EPOLL_CTL_ADD, grpcWakeEvent.fd_, &ev);
+  if (ret < 0)
+    GOTO_ERROR(err, "epoll ctl failed for grpc wake fd, %s.", strerror(errno));
   //
   unixEvent.fd_ = zListenFd;
   unixEvent.epoll_in_func_ = ProcAcceptEvent;
