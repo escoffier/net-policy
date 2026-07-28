@@ -65,7 +65,7 @@ NetStatus Tcp::receive(seastar::net::packet p, uint32_t from, uint32_t to) {
     if (tcp_hdr->syn == 1) {
       auto hashFunc = ConnectionIDHash();
       auto hash_key = hashFunc(id);
-      auto filter_manager = std::make_shared<http::HttpFilterManager>(hash_key, from, to);
+      auto filter_manager = std::make_shared<http::HttpFilterManager>(filter_factory_, hash_key, from, to);
 
       net::ConnectionInfo connInfo{net::ipv4ToString(from), net::ipv4ToString(to),
                                    ntohs(tcp_hdr->source), ntohs(tcp_hdr->dest)};

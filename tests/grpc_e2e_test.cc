@@ -26,8 +26,10 @@ protected:
     ASSERT_GT(epfd_, 0);
 
     ASSERT_EQ(server_.Start(/*port=*/0), 0);
+    daemon_.WireGrpc(&server_.GetControlWorkQueue(), &server_.GetEventBridge());
     wake_cb_.fd_ = server_.WakeFd();
     wake_cb_.epoll_in_func_ = DispatchGrpcWorkQueueEvent;
+    wake_cb_.daemon_ = &daemon_;
     struct epoll_event ev = {};
     ev.events = EPOLLIN;
     ev.data.ptr = &wake_cb_;
@@ -65,6 +67,7 @@ protected:
 
   int epfd_ = -1;
   RCV_EPOLL_CB wake_cb_ = {};
+  DaemonContext daemon_;
   grpc_bridge::GrpcServer server_;
   std::atomic<bool> stop_{false};
   std::thread loop_thread_;
@@ -122,8 +125,8 @@ TEST_F(GrpcEndToEndTest, SubscribeEventsStreamReceivesPublishedPolicyMatch) {
   tuple.dst_port_ = 443;
   tuple.src_addr_ = "172.16.0.1";
   tuple.dst_addr_ = "172.16.0.2";
-  grpc_bridge::GetEventBridge().PublishPolicyMatch(tuple, NetPolicyRule::kDeny, FlowDir::kEgress,
-                                                     "e2e-event-policy");
+  server_.GetEventBridge().PublishPolicyMatch(tuple, NetPolicyRule::kDeny, FlowDir::kEgress,
+                                               "e2e-event-policy");
 
   netpolicy::v1::PolicyEvent event;
   ASSERT_TRUE(reader->Read(&event));

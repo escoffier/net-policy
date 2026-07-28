@@ -43,8 +43,9 @@ struct ControlWorkItem {
 /*Thread-safe multi-producer/single-consumer queue: any number of gRPC handler
  *threads call Push(); exactly one consumer (the epoll loop, woken via the eventfd
  *passed at construction) calls DrainAll(). This is the only synchronization this
- *migration adds -- g_microseg/RootContext/the policy trees remain single-writer,
- *touched only from inside DispatchGrpcControlOp on the epoll thread.*/
+ *migration adds -- DaemonContext's microseg/waf_root/the policy trees remain
+ *single-writer, touched only from inside DispatchGrpcControlOp on the epoll
+ *thread.*/
 class ControlWorkQueue {
 public:
   explicit ControlWorkQueue(int wake_fd);
@@ -58,19 +59,16 @@ private:
   std::deque<ControlWorkItem*> queue_;
 };
 
-/*Process-wide singleton, constructed by GrpcServer::Start before the server
- *starts accepting RPCs.*/
-void InitControlWorkQueue(int wake_fd);
-ControlWorkQueue& GetControlWorkQueue();
-
 } // namespace grpc_bridge
 
-/*Implemented in net-policy.cpp, where it has direct access to g_microseg,
- *RootContext, and the legacy parsing/policy functions -- see the migration
- *plan for why this lives there instead of grpc/. Declared here (rather than
- *kept file-static) so tests can drive it directly without going through a
- *real gRPC transport.*/
-void DispatchGrpcControlOp(int32_t epoll_fd, grpc_bridge::ControlWorkItem& item);
+class DaemonContext; // forward declaration; full type defined in net-policy.h
+
+/*Implemented in net-policy.cpp, where it has direct access to DaemonContext
+ *and the legacy parsing/policy functions -- see the migration plan for why
+ *this lives there instead of grpc/. Declared here (rather than kept
+ *file-static) so tests can drive it directly without going through a real
+ *gRPC transport.*/
+void DispatchGrpcControlOp(int32_t epoll_fd, grpc_bridge::ControlWorkItem& item, DaemonContext& daemon);
 
 /*Epoll callback (RcvCbFunc-shaped) for the gRPC work-queue wake eventfd;
  *drains ControlWorkQueue and runs each item through DispatchGrpcControlOp.

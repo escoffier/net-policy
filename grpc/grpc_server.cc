@@ -2,15 +2,17 @@
 
 #include <sys/eventfd.h>
 
-#include "grpc/work_queue.h"
-
 namespace grpc_bridge {
 
+GrpcServer::GrpcServer()
+    : wake_fd_(eventfd(0, EFD_NONBLOCK)),
+      control_work_queue_(wake_fd_),
+      control_service_(control_work_queue_),
+      event_service_(event_bridge_) {}
+
 int GrpcServer::Start(int port) {
-  wake_fd_ = eventfd(0, EFD_NONBLOCK);
   if (wake_fd_ < 0)
     return -1;
-  InitControlWorkQueue(wake_fd_);
 
   std::string address = "0.0.0.0:" + std::to_string(port);
   grpc::ServerBuilder builder;

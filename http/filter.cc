@@ -13,17 +13,8 @@
 
 namespace http {
 
-HttpFilterManager::HttpFilterManager(size_t key) {
-  http::HttpFilterFactory::getInstance().traverse([this, key](http::FilterCB cb) {
-    auto filter = cb(key, 0, 0);
-    this->addFilter(filter);
-    // filterManager->addFilter(
-    //     std::make_shared<http::extension::LogFilter>(hashFunc(id)));
-  });
-}
-
-HttpFilterManager::HttpFilterManager(size_t key, uint32_t from, uint32_t to) {
-  http::HttpFilterFactory::getInstance().traverse([this, key, from, to](http::FilterCB cb) {
+HttpFilterManager::HttpFilterManager(HttpFilterFactory& factory, size_t key, uint32_t from, uint32_t to) {
+  factory.traverse([this, key, from, to](http::FilterCB cb) {
     auto filter = cb(key, from, to);
     this->addFilter(filter);
   });

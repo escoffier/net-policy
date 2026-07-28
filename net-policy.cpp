@@ -41,22 +41,13 @@ using std::string;
 using std::vector;
 using std::make_pair;
 
-int g_log_level = 0;
-bool g_waf_enable = false;
+std::atomic<int> g_log_level{0};
 const char* PREFIX = "#%% pre";
 
 struct u32_mask {
   uint32_t value;
   uint32_t mask;
 };
-
-/*static value*/
-static int g_local_net_ns_fd = 0;
-static PostServer g_post_server;
-static CtrlServer g_ctrl_server;
-static MicroSegEngine g_microseg;
-net::ConnectionManager g_connection_manager;
-static int g_ipt_ver = 0;
 
 int NetProtoConvert(std::string proto) {
   if (proto.length() == 0)
@@ -247,10 +238,10 @@ std::string PrintPortsData(std::vector<RULE_PORT>& ports) {
 int OpenLocalNetNs() {
   const char* path = "/proc/self/ns/net";
   // open net namespaces
-  g_local_net_ns_fd = open(path, O_RDONLY);
-  if (g_local_net_ns_fd <= 0)
+  int fd = open(path, O_RDONLY);
+  if (fd <= 0)
     RETURN_ERROR(-1, "open %s net namespaces failed! err : %s.", path, strerror(errno));
-  return 0;
+  return fd;
 }
 
 int SetLocalNetNs(int fd) {
@@ -339,18 +330,19 @@ int MicroSegEngine::AddHttpPolicy(FlowDir dir, const std::string& key, HTTP_RULE
 int ParseRcvData(int32_t epoll_fd, int32_t fd, void* ptr);
 
 /*CtrlServer implementation*/
-int CtrlServer::Accept(int epoll_fd, int client_fd) {
+int CtrlServer::Accept(int epoll_fd, int client_fd, DaemonContext* daemon) {
   struct epoll_event ev;
   if (client_fd_ > 0) {
     if (client_fd != client_fd_)
       close(client_fd_);
     LOG_W("close old globe fd, old fd : %d, new fd : %d.", client_fd_, client_fd);
   }
-  LOG_I("accept new unix socket link, fd : %d, log level : %d", client_fd, g_log_level);
+  LOG_I("accept new unix socket link, fd : %d, log level : %d", client_fd, g_log_level.load());
   client_fd_ = client_fd;
   fcntl(client_fd, F_SETFL, fcntl(client_fd, F_GETFL) | O_NONBLOCK);
   epoll_cb_.fd_ = client_fd_;
   epoll_cb_.epoll_in_func_ = ParseRcvData;
+  epoll_cb_.daemon_ = daemon;
   ev.data.ptr = &epoll_cb_;
   ev.events = EPOLLIN;
   int ret = epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &ev);
@@ -369,7 +361,6 @@ void PostServer::Accept(int client_fd) {
     LOG_W("close old globe post fd, old fd : %d, new fd : %d.", post_link_fd_, client_fd);
   }
   post_link_fd_ = client_fd;
-  http::extension::RootContext.SetPostFd(&post_link_fd_);
   fcntl(client_fd, F_SETFL, fcntl(client_fd, F_GETFL) | O_NONBLOCK);
 }
 
@@ -381,7 +372,8 @@ int PostServer::SendMatchMsg(FiveTuple& tuple, NetPolicyRule action, FlowDir dir
   /*publish to gRPC subscribers unconditionally -- this must run before the
    *post_link_fd_ early-return below, since a gRPC-only deployment (no legacy
    *listener connected) would otherwise never see these events*/
-  grpc_bridge::GetEventBridge().PublishPolicyMatch(tuple, action, dir, rule_key);
+  if (event_bridge_)
+    event_bridge_->PublishPolicyMatch(tuple, action, dir, rule_key);
   if (post_link_fd_ <= 0)
     return 0;
   memset(data, 0, sizeof(data));
@@ -421,13 +413,13 @@ static NET_POLICY_RULE MatchHttpPolicyRule(const std::vector<HTTP_RULE_INFO>& ht
 }
 
 /*match net policy rule — returns matched RuleDetail, or nullopt if no rule fired*/
-static std::optional<RuleDetail> MatchNetPolicyRule(FiveTuple& tuple, FLOW_DIR dir) {
-  if (g_microseg.IsNodeIp(tuple.src_addr_u32_))
+static std::optional<RuleDetail> MatchNetPolicyRule(FiveTuple& tuple, FLOW_DIR dir, DaemonContext& daemon) {
+  if (daemon.Microseg().IsNodeIp(tuple.src_addr_u32_))
     return std::nullopt;
-  auto rules = g_microseg.GetPolicyTree(dir);
+  auto rules = daemon.Microseg().GetPolicyTree(dir);
   if (rules->RuleSize() == 0)
     return std::nullopt;
-  auto rule_keys = g_microseg.CreateRuleKeyByTuple(tuple, dir);
+  auto rule_keys = daemon.Microseg().CreateRuleKeyByTuple(tuple, dir);
   for (auto& key : rule_keys) {
     if (auto matched = rules->MatchRuleGroup(key, tuple))
       return matched;
@@ -437,8 +429,8 @@ static std::optional<RuleDetail> MatchNetPolicyRule(FiveTuple& tuple, FLOW_DIR d
 
 /*match micro policy rule*/
 static NET_POLICY_RULE MatchMicroPolicyRule(FiveTuple& tuple, FLOW_DIR& dir,
-                                            std::string& rule_key) {
-  auto detail = MatchNetPolicyRule(tuple, dir);
+                                            std::string& rule_key, DaemonContext& daemon) {
+  auto detail = MatchNetPolicyRule(tuple, dir, daemon);
   if (!detail)
     return NetPolicyRule::kDefault;
   rule_key = detail->policy_key_;
@@ -448,7 +440,7 @@ static NET_POLICY_RULE MatchMicroPolicyRule(FiveTuple& tuple, FLOW_DIR& dir,
   FiveTuple data;
   tuple.ReverseTuple(data);
   FLOW_DIR fdir = (dir == FlowDir::kIngress) ? FlowDir::kEgress : FlowDir::kIngress;
-  auto revDetail = MatchNetPolicyRule(data, fdir);
+  auto revDetail = MatchNetPolicyRule(data, fdir, daemon);
   if (!revDetail)
     return detail->action_;
   if (detail->priority_ <= revDetail->priority_)
@@ -646,7 +638,7 @@ static int input_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct 
   unsigned char *pkg, *value = nullptr;
   std::map<TCP_FOUR_TUPLE_V4, http::ConnectionPtr>::iterator tcp_it;
   NFQ_RES_INFO* nfq_res = (NFQ_RES_INFO*)argv;
-  (void)nfq_res;
+  DaemonContext* daemon = nfq_res->daemon_;
 
   ph = nfq_get_msg_packet_hdr(nfa);
   if (!ph)
@@ -676,9 +668,9 @@ static int input_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct 
   // GetProtoString(tuple.proto_), mark, ntohl(tcphdr.seq), tuple.tot_len_, tuple.src_addr_.c_str(),
   // tuple.src_port_, tuple.dst_addr_.c_str(), tuple.dst_port_, argv); LOG_D("input receive data: %p",
   // pkg);
-  if (g_waf_enable && (tuple.proto_ == IPPROTO_TCP)) {
+  if (daemon->WafEnabled() && (tuple.proto_ == IPPROTO_TCP)) {
     auto status =
-        g_connection_manager.receive(seastar::net::packet::from_static_data((char*)pkg, data_len));
+        daemon->ConnMgr().receive(seastar::net::packet::from_static_data((char*)pkg, data_len));
     if (status == net::NetStatus::Drop) {
       return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllowReq), data_len, pkg);
     }
@@ -692,8 +684,8 @@ static int input_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct 
   switch (tuple.proto_) {
   case IPPROTO_TCP:
     /*query conntrack info*/
-    tcp_it = g_microseg.TcpCtInput().find(ct_key);
-    if (tcp_it == g_microseg.TcpCtInput().end()) {
+    tcp_it = daemon->Microseg().TcpCtInput().find(ct_key);
+    if (tcp_it == daemon->Microseg().TcpCtInput().end()) {
       /*tcp syn*/
       if (tcphdr.syn != 0)
         break;
@@ -707,7 +699,7 @@ static int input_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct 
     found = true;
     /*tcp fin*/
     if ((tcphdr.fin == 1) || (tcphdr.rst == 1)) {
-      g_microseg.TcpCtInput().erase(ct_key);
+      daemon->Microseg().TcpCtInput().erase(ct_key);
       /*print debug log*/
       LOG_D("microseg-dp input data, delete conntrack info, src: %s:%d, dest : %s:%d",
             tuple.src_addr_.c_str(), tuple.src_port_, tuple.dst_addr_.c_str(), tuple.dst_port_);
@@ -728,16 +720,16 @@ static int input_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct 
   /*query tcp conntrack result*/
   if (!found) {
     /*match rule*/
-    rule_ret = MatchMicroPolicyRule(tuple, dir, rule_key);
+    rule_ret = MatchMicroPolicyRule(tuple, dir, rule_key, *daemon);
     if (rule_ret == NetPolicyRule::kDefault)
       return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllow), 0, NULL);
     /*query http rule*/
-    auto http_rule = g_microseg.InputHttpPolicy().find(rule_key);
+    auto http_rule = daemon->Microseg().InputHttpPolicy().find(rule_key);
     /*check http rule*/
-    if ((http_rule == g_microseg.InputHttpPolicy().end()) || (tuple.proto_ == IPPROTO_UDP) ||
+    if ((http_rule == daemon->Microseg().InputHttpPolicy().end()) || (tuple.proto_ == IPPROTO_UDP) ||
         (tuple.proto_ == IPPROTO_ICMP) || (http_rule->second.empty())) {
       /*post match message*/
-      g_post_server.SendMatchMsg(tuple, rule_ret, dir, rule_key);
+      daemon->PostSrv().SendMatchMsg(tuple, rule_ret, dir, rule_key);
       // deny
       if (rule_ret == NetPolicyRule::kDeny) {
         LOG_D("input drop %s %s:%u -> %s:%u ", GetProtoString(tuple.proto_), tuple.src_addr_.c_str(),
@@ -757,7 +749,7 @@ static int input_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct 
           tuple.src_addr_.c_str(), tuple.dst_addr_.c_str(), offset, data_len);
     auto conn = std::make_unique<http::Connection>(rule_key);
     conn->setTcpSeq(tcp_seq + 1);
-    g_microseg.TcpCtInput().insert({ct_key, std::move(conn)});
+    daemon->Microseg().TcpCtInput().insert({ct_key, std::move(conn)});
     /*return*/
     return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllowReq), 0, NULL);
   }
@@ -765,11 +757,11 @@ static int input_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct 
   LOG_D("microseg-dp  input data, src: %s, dest : %s, offset : %d, data len : %d",
         tuple.src_addr_.c_str(), tuple.dst_addr_.c_str(), offset, data_len);
   /*can not find tcp conntrack*/
-  if (tcp_it == g_microseg.TcpCtInput().end()) {
+  if (tcp_it == daemon->Microseg().TcpCtInput().end()) {
     LOG_D(
         "microseg-dp input not sync, new conntrack, src: %s, dest : %s, offset : %d, data len : %d",
         tuple.src_addr_.c_str(), tuple.dst_addr_.c_str(), offset, data_len);
-    auto [it, success] = g_microseg.TcpCtInput().insert({ct_key, std::make_unique<http::Connection>(rule_key)});
+    auto [it, success] = daemon->Microseg().TcpCtInput().insert({ct_key, std::make_unique<http::Connection>(rule_key)});
     if (success) {
       tcp_it = it;
     }
@@ -797,8 +789,8 @@ static int input_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct 
   /*get rule key*/
   rule_key = tcp_it->second->getRuleKey();
   /*query http rule*/
-  auto http_rule = g_microseg.InputHttpPolicy().find(rule_key);
-  if (http_rule == g_microseg.InputHttpPolicy().end())
+  auto http_rule = daemon->Microseg().InputHttpPolicy().find(rule_key);
+  if (http_rule == daemon->Microseg().InputHttpPolicy().end())
     return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kDefault), 0, NULL);
   // process header
   rule_ret = MatchHttpPolicyRule(http_rule->second, header);
@@ -808,7 +800,7 @@ static int input_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct 
   if (rule_ret == NetPolicyRule::kDefault)
     return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllowReq), 0, NULL);
   /*post match message*/
-  g_post_server.SendMatchMsg(tuple, rule_ret, FlowDir::kIngress, rule_key);
+  daemon->PostSrv().SendMatchMsg(tuple, rule_ret, FlowDir::kIngress, rule_key);
   /*rst tcp link*/
   if (rule_ret == NetPolicyRule::kDeny)
     rst_tcp_link(pkg);
@@ -830,8 +822,8 @@ static int output_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct
   unsigned char *pkg, *value;
   NET_POLICY_RULE rule_ret;
   std::map<TCP_FOUR_TUPLE_V4, http::ConnectionPtr>::iterator tcp_it;
-  // NFQ_RES_INFO *nfq_res = (NFQ_RES_INFO *)argv;
-  // nfq_res = nfq_res;
+  NFQ_RES_INFO* nfq_res = (NFQ_RES_INFO*)argv;
+  DaemonContext* daemon = nfq_res->daemon_;
 
   ph = nfq_get_msg_packet_hdr(nfa);
   if (!ph)
@@ -861,9 +853,9 @@ static int output_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct
   // GetProtoString(tuple.proto_), mark, ntohl(tcphdr.seq), tuple.tot_len_, tuple.src_addr_.c_str(),
   // tuple.src_port_, tuple.dst_addr_.c_str(), tuple.dst_port_, argv); LOG_D("input receive data: %p",
   // pkg);
-  if (g_waf_enable && (tuple.proto_ == IPPROTO_TCP)) {
+  if (daemon->WafEnabled() && (tuple.proto_ == IPPROTO_TCP)) {
     auto status =
-        g_connection_manager.receive(seastar::net::packet::from_static_data((char*)pkg, data_len));
+        daemon->ConnMgr().receive(seastar::net::packet::from_static_data((char*)pkg, data_len));
     if (status == net::NetStatus::Drop) {
       // LOG_D("drop pkt: %p", pkg);
       return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllowRsp), data_len, pkg);
@@ -878,8 +870,8 @@ static int output_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct
   switch (tuple.proto_) {
   case IPPROTO_TCP:
     /*query conntrack info*/
-    tcp_it = g_microseg.TcpCtOutput().find(ct_key);
-    if (tcp_it == g_microseg.TcpCtOutput().end()) {
+    tcp_it = daemon->Microseg().TcpCtOutput().find(ct_key);
+    if (tcp_it == daemon->Microseg().TcpCtOutput().end()) {
       /*tcp syn*/
       if (tcphdr.syn != 0)
         break;
@@ -893,7 +885,7 @@ static int output_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct
     found = true;
     /*tcp fin*/
     if ((tcphdr.fin == 1) || (tcphdr.rst == 1)) {
-      g_microseg.TcpCtOutput().erase(ct_key);
+      daemon->Microseg().TcpCtOutput().erase(ct_key);
       /*print debug log*/
       LOG_D("microseg-dp out data, delete conntrack info, src: %s:%d, dest : %s:%d",
             tuple.src_addr_.c_str(), tuple.src_port_, tuple.dst_addr_.c_str(), tuple.dst_port_);
@@ -914,16 +906,16 @@ static int output_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct
   /*query tcp conntrack result*/
   if (!found) {
     /*match rule*/
-    rule_ret = MatchMicroPolicyRule(tuple, dir, rule_key);
+    rule_ret = MatchMicroPolicyRule(tuple, dir, rule_key, *daemon);
     if (rule_ret == NetPolicyRule::kDefault)
       return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllow), 0, NULL);
     /*query http rule*/
-    auto http_rule = g_microseg.OutputHttpPolicy().find(rule_key);
+    auto http_rule = daemon->Microseg().OutputHttpPolicy().find(rule_key);
     /*check http rule*/
-    if ((http_rule == g_microseg.OutputHttpPolicy().end()) || (tuple.proto_ == IPPROTO_UDP) ||
+    if ((http_rule == daemon->Microseg().OutputHttpPolicy().end()) || (tuple.proto_ == IPPROTO_UDP) ||
         (tuple.proto_ == IPPROTO_ICMP) || (http_rule->second.empty())) {
       /*post match message*/
-      g_post_server.SendMatchMsg(tuple, rule_ret, dir, rule_key);
+      daemon->PostSrv().SendMatchMsg(tuple, rule_ret, dir, rule_key);
       // deny
       if (rule_ret == NetPolicyRule::kDeny) {
         LOG_D("output drop %s %s:%u -> %s:%u ", GetProtoString(tuple.proto_), tuple.src_addr_.c_str(),
@@ -942,7 +934,7 @@ static int output_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct
           rule_key.c_str(), tuple.src_addr_.c_str(), tuple.dst_addr_.c_str(), offset, data_len);
     auto conn = std::make_unique<http::Connection>(rule_key);
     conn->setTcpSeq(tcp_seq + 1);
-    g_microseg.TcpCtOutput().insert({ct_key, std::move(conn)});
+    daemon->Microseg().TcpCtOutput().insert({ct_key, std::move(conn)});
     /*return*/
     return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllowRsp), 0, NULL);
   }
@@ -950,11 +942,11 @@ static int output_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct
   LOG_D("microseg-dp output data, src: %s, dest : %s, offset : %d, data len : %d",
         tuple.src_addr_.c_str(), tuple.dst_addr_.c_str(), offset, data_len);
   /*can not find tcp conntrack*/
-  if (tcp_it == g_microseg.TcpCtOutput().end()) {
+  if (tcp_it == daemon->Microseg().TcpCtOutput().end()) {
     LOG_D("microseg-dp output not sync, new conntrack, src: %s, dest : %s, offset : %d, data len : "
           "%d",
           tuple.src_addr_.c_str(), tuple.dst_addr_.c_str(), offset, data_len);
-    auto [it, success] = g_microseg.TcpCtOutput().insert({ct_key, std::make_unique<http::Connection>(rule_key)});
+    auto [it, success] = daemon->Microseg().TcpCtOutput().insert({ct_key, std::make_unique<http::Connection>(rule_key)});
     if (success) {
       tcp_it = it;
     }
@@ -982,8 +974,8 @@ static int output_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct
   if (header.parseState_ != ParseState::Done)
     return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllowRsp), 0, NULL);
   /*query http rule*/
-  auto http_rule = g_microseg.OutputHttpPolicy().find(rule_key);
-  if (http_rule == g_microseg.OutputHttpPolicy().end())
+  auto http_rule = daemon->Microseg().OutputHttpPolicy().find(rule_key);
+  if (http_rule == daemon->Microseg().OutputHttpPolicy().end())
     return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kDefault), 0, NULL);
   // process header
   rule_ret = MatchHttpPolicyRule(http_rule->second, header);
@@ -993,7 +985,7 @@ static int output_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct
   if (rule_ret == NetPolicyRule::kDefault)
     return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllowRsp), 0, NULL);
   /*post match message*/
-  g_post_server.SendMatchMsg(tuple, rule_ret, FlowDir::kEgress, rule_key);
+  daemon->PostSrv().SendMatchMsg(tuple, rule_ret, FlowDir::kEgress, rule_key);
   /*rst tcp link*/
   if (rule_ret == NetPolicyRule::kDeny)
     rst_tcp_link(pkg);
@@ -1158,10 +1150,10 @@ err:
   return 9;
 }
 
-int InitNfqueue(int epoll_fd, NET_CTRL_INFO& ctrl) {
+int InitNfqueue(int epoll_fd, NET_CTRL_INFO& ctrl, DaemonContext& daemon) {
   int ret;
   // check resource — duplicated resource is not an error
-  if (g_microseg.GetNfqRes(ctrl.pod_id_) != nullptr)
+  if (daemon.Microseg().GetNfqRes(ctrl.pod_id_) != nullptr)
     RETURN_WARN(0, "duplicated pod resource, pid : %d.", ctrl.pid_);
   // new memory
   auto nfq_res = std::make_unique<NFQ_RES_INFO>();
@@ -1171,6 +1163,7 @@ int InitNfqueue(int epoll_fd, NET_CTRL_INFO& ctrl) {
   nfq_res->pid_     = ctrl.pid_;
   nfq_res->pod_id_  = ctrl.pod_id_;
   nfq_res->poll_fd_ = epoll_fd;
+  nfq_res->daemon_  = &daemon;
   /*init input queue*/
   ret = OpenNfque(FlowDir::kIngress, nfq_res.get());
   if (ret != 0)
@@ -1188,7 +1181,7 @@ int InitNfqueue(int epoll_fd, NET_CTRL_INFO& ctrl) {
   if (ret != 0)
     GOTO_ERROR(err, "add %d epoll event failed.", ctrl.pid_);
   /*insert nfqueue — transfer ownership*/
-  ret = g_microseg.NewNfQueRes(ctrl.pod_id_, std::move(nfq_res));
+  ret = daemon.Microseg().NewNfQueRes(ctrl.pod_id_, std::move(nfq_res));
   if (ret != 0)
     GOTO_ERROR(err, "insert nfqueue resource failed, pid : %d.", ctrl.pid_);
   /*return*/
@@ -1201,37 +1194,37 @@ err:
 }
 
 /*delete policy*/
-int DeletePolicy(std::string& name) {
+int DeletePolicy(std::string& name, DaemonContext& daemon) {
   if (name.empty())
     RETURN_ERROR(0, "the policy name is empty.");
 
-  g_microseg.DeletePolicy(name);
+  daemon.Microseg().DeletePolicy(name);
   /*return*/
   return 0;
 }
 
-int AddNewHttpPolicy(FLOW_DIR dir, std::string& key, HTTP_RULE_INFO& http_rule) {
-  return g_microseg.AddHttpPolicy(dir, key, http_rule);
+int AddNewHttpPolicy(FLOW_DIR dir, std::string& key, HTTP_RULE_INFO& http_rule, DaemonContext& daemon) {
+  return daemon.Microseg().AddHttpPolicy(dir, key, http_rule);
 }
 
 /*add policy*/
-int AddNewPolicy(RuleDetail& policy, RULE_PORT& stPort) {
+int AddNewPolicy(RuleDetail& policy, RULE_PORT& stPort, DaemonContext& daemon) {
   // check
   if ((policy.priority_ <= 0) || (policy.priority_ >= 129))
     RETURN_ERROR(-1, "priority is error, need 0 < priority < 129, priority : %d", policy.priority_);
   /*print debug log*/
   // PrintPolicyData(policy, stPort);
   /*处理下发的规则*/
-  return g_microseg.AddPolicy(policy, stPort);
+  return daemon.Microseg().AddPolicy(policy, stPort);
 }
 
 /*update iptable rule*/
-void UpdateMark(std::unordered_map<uint64_t, string>& cgRes) {
+void UpdateMark(std::unordered_map<uint64_t, string>& cgRes, DaemonContext& daemon) {
   int mark = static_cast<int>(NetPolicyRule::kDeny);
   FiveTuple tuple = {};
 
   for (auto it = cgRes.begin(); it != cgRes.end(); it++) {
-    auto res = g_microseg.GetNfqRes(it->first);
+    auto res = daemon.Microseg().GetNfqRes(it->first);
     if (res == nullptr)
       CONTINUE_ERROR("can not find pod resource, pod id : %lu.", it->first);
     // set mark
@@ -1242,11 +1235,11 @@ void UpdateMark(std::unordered_map<uint64_t, string>& cgRes) {
 }
 
 /*check iptables rule*/
-bool CheckIptablesRule() {
+bool CheckIptablesRule(int ipt_ver) {
   int length;
   FILE* fp = NULL;
   char buf[1024];
-  const char* icheck = (g_ipt_ver == 0) ? "iptables -t mangle -S | grep TS_ZERO_PREROUTING"
+  const char* icheck = (ipt_ver == 0) ? "iptables -t mangle -S | grep TS_ZERO_PREROUTING"
                                       : "iptables-legacy -t mangle -S | grep TS_ZERO_PREROUTING";
   //
   fp = popen(icheck, "r");
@@ -1264,11 +1257,11 @@ bool CheckIptablesRule() {
   return true;
 }
 
-void ClearIptabelsRule() {
-  const char* clear = (g_ipt_ver == 0) ? "iptables -t mangle -F" : "iptables-legacy -t mangle -F";
-  const char* dichan = (g_ipt_ver == 0) ? "iptables -t mangle -X TS_ZERO_PREROUTING"
+void ClearIptabelsRule(int ipt_ver) {
+  const char* clear = (ipt_ver == 0) ? "iptables -t mangle -F" : "iptables-legacy -t mangle -F";
+  const char* dichan = (ipt_ver == 0) ? "iptables -t mangle -X TS_ZERO_PREROUTING"
                                       : "iptables-legacy -t mangle -X TS_ZERO_PREROUTING";
-  const char* dochan = (g_ipt_ver == 0) ? "iptables -t mangle -X TS_ZERO_OUTPUT"
+  const char* dochan = (ipt_ver == 0) ? "iptables -t mangle -X TS_ZERO_OUTPUT"
                                       : "iptables-legacy -t mangle -X TS_ZERO_OUTPUT";
   system(clear);
   system(dichan);
@@ -1276,7 +1269,7 @@ void ClearIptabelsRule() {
 }
 
 /*exec iptables*/
-void WriteIptableRule(int iMarkNum, int oMarkNum) {
+void WriteIptableRule(int iMarkNum, int oMarkNum, int ipt_ver, bool waf_enable) {
   int ret;
   FILE* fp = NULL;
   char buf[1024];
@@ -1284,57 +1277,57 @@ void WriteIptableRule(int iMarkNum, int oMarkNum) {
   const char* simark = nullptr;
   const char* somark = nullptr;
 
-  const char* pcheck = (g_ipt_ver == 0) ? "iptables -t mangle -S | grep TS_ZERO_PREROUTING"
+  const char* pcheck = (ipt_ver == 0) ? "iptables -t mangle -S | grep TS_ZERO_PREROUTING"
                                       : "iptables-legacy -t mangle -S | grep TS_ZERO_PREROUTING";
-  const char* ocheck = (g_ipt_ver == 0) ? "iptables -t mangle -S | grep TS_ZERO_OUTPUT"
+  const char* ocheck = (ipt_ver == 0) ? "iptables -t mangle -S | grep TS_ZERO_OUTPUT"
                                       : "iptables-legacy -t mangle -S | grep TS_ZERO_OUTPUT";
 
-  const char* icreate = (g_ipt_ver == 0)
+  const char* icreate = (ipt_ver == 0)
                             ? "iptables -t mangle -N TS_ZERO_PREROUTING 2>/dev/null && iptables -t "
                               "mangle -I PREROUTING -j TS_ZERO_PREROUTING"
                             : "iptables-legacy -t mangle -N TS_ZERO_PREROUTING 2>/dev/null && "
                               "iptables-legacy -t mangle -I PREROUTING -j TS_ZERO_PREROUTING";
-  const char* ocreate = (g_ipt_ver == 0) ? "iptables -t mangle -N TS_ZERO_OUTPUT 2>/dev/null && "
+  const char* ocreate = (ipt_ver == 0) ? "iptables -t mangle -N TS_ZERO_OUTPUT 2>/dev/null && "
                                          "iptables -t mangle -I OUTPUT -j TS_ZERO_OUTPUT"
                                        : "iptables-legacy -t mangle -N TS_ZERO_OUTPUT 2>/dev/null "
                                          "&& iptables-legacy -t mangle -I OUTPUT -j TS_ZERO_OUTPUT";
 
-  const char* imark = (g_ipt_ver == 0)
+  const char* imark = (ipt_ver == 0)
                           ? "iptables -t mangle -I PREROUTING -j CONNMARK --restore-mark"
                           : "iptables-legacy -t mangle -I PREROUTING -j CONNMARK --restore-mark";
-  const char* omark = (g_ipt_ver == 0)
+  const char* omark = (ipt_ver == 0)
                           ? "iptables -t mangle -I OUTPUT -j CONNMARK --restore-mark"
                           : "iptables-legacy -t mangle -I OUTPUT -j CONNMARK --restore-mark";
 
-  if (!g_waf_enable) {
-    simark = (g_ipt_ver == 0) ? "iptables -t mangle -A INPUT -j CONNMARK --save-mark"
+  if (!waf_enable) {
+    simark = (ipt_ver == 0) ? "iptables -t mangle -A INPUT -j CONNMARK --save-mark"
                             : "iptables-legacy -t mangle -A INPUT -j CONNMARK --save-mark";
-    somark = (g_ipt_ver == 0) ? "iptables -t mangle -A POSTROUTING -j CONNMARK --save-mark"
+    somark = (ipt_ver == 0) ? "iptables -t mangle -A POSTROUTING -j CONNMARK --save-mark"
                             : "iptables-legacy -t mangle -A POSTROUTING -j CONNMARK --save-mark";
   }
 
   const char* ipass =
-      (g_ipt_ver == 0)
+      (ipt_ver == 0)
           ? "iptables -t mangle -A TS_ZERO_PREROUTING -m mark --mark %d -j ACCEPT"
           : "iptables-legacy -t mangle -A TS_ZERO_PREROUTING -m mark --mark %d -j ACCEPT";
   const char* infque =
-      (g_ipt_ver == 0)
+      (ipt_ver == 0)
           ? "iptables -t mangle -A TS_ZERO_PREROUTING -j NFQUEUE --queue-num 0 --queue-bypass"
           : "iptables-legacy -t mangle -A TS_ZERO_PREROUTING -j NFQUEUE --queue-num 0 "
             "--queue-bypass";
 
   const char* opass =
-      (g_ipt_ver == 0) ? "iptables -t mangle -A TS_ZERO_OUTPUT -m mark --mark %d -j ACCEPT"
+      (ipt_ver == 0) ? "iptables -t mangle -A TS_ZERO_OUTPUT -m mark --mark %d -j ACCEPT"
                      : "iptables-legacy -t mangle -A TS_ZERO_OUTPUT -m mark --mark %d -j ACCEPT";
   const char* onfque =
-      (g_ipt_ver == 0)
+      (ipt_ver == 0)
           ? "iptables -t mangle -A TS_ZERO_OUTPUT -j NFQUEUE --queue-num 1 --queue-bypass"
           : "iptables-legacy -t mangle -A TS_ZERO_OUTPUT -j NFQUEUE --queue-num 1 --queue-bypass";
 
   // check iptables rule
-  // if(CheckIptablesRule()) return;
-  if (CheckIptablesRule()) {
-    ClearIptabelsRule();
+  // if(CheckIptablesRule(ipt_ver)) return;
+  if (CheckIptablesRule(ipt_ver)) {
+    ClearIptabelsRule(ipt_ver);
   }
   //
   fp = popen(pcheck, "r");
@@ -1388,7 +1381,7 @@ NET_POLICY_RULE ConvertRuleAction(std::string& str) {
   return NetPolicyRule::kDeny;
 }
 
-int ParseNodeCfg(char* buf) {
+int ParseNodeCfg(char* buf, DaemonContext& daemon) {
   uint32_t uzIp;
   int i, size, action;
   std::string value, ip;
@@ -1422,9 +1415,9 @@ int ParseNodeCfg(char* buf) {
     uzIp = ipv4StringToInt(ip);
     // add or delete node ip
     if (action == 0) {
-      g_microseg.RemoveNodeIp(uzIp);
+      daemon.Microseg().RemoveNodeIp(uzIp);
     } else {
-      g_microseg.AddNodeIp(uzIp);
+      daemon.Microseg().AddNodeIp(uzIp);
     }
   }
   // free resource
@@ -1438,7 +1431,7 @@ err:
   return -1;
 }
 
-int ParseNetPolicy(char* buf) {
+int ParseNetPolicy(char* buf, DaemonContext& daemon) {
   uint64_t podId;
   int i, size, num, ret;
   cJSON *root = NULL, *item, *array, *ipaddr, *ports, *rules, *param, *httparr;
@@ -1466,7 +1459,7 @@ int ParseNetPolicy(char* buf) {
   rule.policy_key_ = item->valuestring;
   ctrl.policy_key_ = rule.policy_key_;
   // clear old policy
-  DeletePolicy(rule.policy_key_);
+  DeletePolicy(rule.policy_key_, daemon);
   // create new policy
   rules = cJSON_GetObjectItem(root, "rules");
   if (!rules)
@@ -1521,7 +1514,7 @@ int ParseNetPolicy(char* buf) {
           BREAK_ERROR("get http path failed.");
         http.path_ = cJSON_GetStringValue(param);
         /*save http rule*/
-        AddNewHttpPolicy(rule.direction_, rule.policy_key_, http);
+        AddNewHttpPolicy(rule.direction_, rule.policy_key_, http, daemon);
       }
     }
     // source address
@@ -1617,13 +1610,13 @@ int ParseNetPolicy(char* buf) {
         if (rulePorts.size() == 0) {
           RULE_PORT rPort = {};
           // add new policy
-          ret = AddNewPolicy(rule, rPort);
+          ret = AddNewPolicy(rule, rPort, daemon);
           if (ret != 0)
             LOG_E("create new policy failed.");
         } else {
           for (int p = 0; p < (int)rulePorts.size(); p++) {
             // add new policy
-            ret = AddNewPolicy(rule, rulePorts.at(p));
+            ret = AddNewPolicy(rule, rulePorts.at(p), daemon);
             if (ret != 0)
               LOG_E("create new policy failed.");
           }
@@ -1638,7 +1631,7 @@ int ParseNetPolicy(char* buf) {
   // free resource
   cJSON_Delete(root);
   // update iptables rule
-  UpdateMark(cgRes);
+  UpdateMark(cgRes, daemon);
   // return
   return 0;
 
@@ -1707,16 +1700,16 @@ err:
   return -1;
 }
 
-cJSON* dumpConnectons(std::string_view req) {
+cJSON* dumpConnectons(std::string_view req, net::ConnectionManager& conn_mgr) {
   cJSON* root = cJSON_Parse(req.data());
   auto limitItem = cJSON_GetObjectItem(root, "limit");
   int limit = (int)limitItem->valuedouble;
 
   cJSON* connections = cJSON_CreateObject();
-  cJSON_AddNumberToObject(connections, "total", g_connection_manager.stat().tcp_conn_);
+  cJSON_AddNumberToObject(connections, "total", conn_mgr.stat().tcp_conn_);
 
   auto items = cJSON_CreateArray();
-  auto conns = g_connection_manager.connections();
+  auto conns = conn_mgr.connections();
   for (int i = 0; i < limit; i++) {
     auto item = cJSON_CreateString(conns[i].c_str());
     cJSON_AddItemToArray(items, item);
@@ -1801,6 +1794,8 @@ int ParseRcvData(int32_t epoll_fd, int32_t fd, void* ptr) {
   NET_CTRL_INFO ctrl = {};
   if ((fd <= 0) || (!ptr))
     RETURN_ERROR(-2, "[net] parse failed by argumnet is error!");
+  RcvEpollCb* cb = (RcvEpollCb*)ptr;
+  DaemonContext* daemon = cb->daemon_;
   /*read data*/
   data_buf = ReadData(epoll_fd, fd);
   if (data_buf == nullptr)
@@ -1819,37 +1814,37 @@ int ParseRcvData(int32_t epoll_fd, int32_t fd, void* ptr) {
     if (ret < 0)
       GOTO_ERROR(rsp, "setns to %d failed.", ctrl.pid_);
     // init nfqueue
-    ret = InitNfqueue(epoll_fd, ctrl);
+    ret = InitNfqueue(epoll_fd, ctrl, *daemon);
     /*print error info*/
     if (ret != 0)
       GOTO_ERROR(rsp, "init %d nfqueue failed, ret : %d.", ctrl.pid_, ret);
     // write iptables rule
-    WriteIptableRule(1, 1);
+    WriteIptableRule(1, 1, daemon->IptablesVersion(), daemon->WafEnabled());
     /*goto*/
     goto rsp;
 
   case NetDataType::kPodDie:
-    ret = g_microseg.DeleteNfQueRes(epoll_fd, ctrl.pod_id_);
+    ret = daemon->Microseg().DeleteNfQueRes(epoll_fd, ctrl.pod_id_);
     goto rsp;
 
   case NetDataType::kAddRule:
-    ret = ParseNetPolicy(data_buf);
+    ret = ParseNetPolicy(data_buf, *daemon);
     /*print rule size*/
-    g_microseg.PrintPolicyLog();
+    daemon->Microseg().PrintPolicyLog();
     goto rsp;
 
   case NetDataType::kDelRule:
-    ret = DeletePolicy(ctrl.policy_key_);
+    ret = DeletePolicy(ctrl.policy_key_, *daemon);
     goto rsp;
 
   case NetDataType::kAddWafRule:
-    found = http::extension::RootContext.ParseConfiguration(data_buf);
+    found = daemon->WafRoot().ParseConfiguration(data_buf);
     ret = (found == true) ? 0 : 1;
     goto rsp;
 
   case NetDataType::kDelWafRule:
     // delete waf config
-    found = http::extension::RootContext.RemoveWafRule(data_buf);
+    found = daemon->WafRoot().RemoveWafRule(data_buf);
     ret = (found == true) ? 0 : 1;
     goto rsp;
 
@@ -1859,25 +1854,25 @@ int ParseRcvData(int32_t epoll_fd, int32_t fd, void* ptr) {
     goto rsp;
 
   case NetDataType::kConfDump:
-    respBody = g_microseg.GetAllConfig(ctrl.policy_key_);
+    respBody = daemon->Microseg().GetAllConfig(ctrl.policy_key_, daemon->ConnMgr());
     goto rsp;
 
   case NetDataType::kConnDump:
-    respBody = dumpConnectons(std::string_view{data_buf, strlen(data_buf)});
+    respBody = dumpConnectons(std::string_view{data_buf, strlen(data_buf)}, daemon->ConnMgr());
     goto rsp;
 
   case NetDataType::kReset:
-    ret = g_microseg.ClearCfg();
+    ret = daemon->Microseg().ClearCfg();
     ;
     goto rsp;
 
   case NetDataType::kNodeCfg:
-    ret = ParseNodeCfg(data_buf);
+    ret = ParseNodeCfg(data_buf, *daemon);
     goto rsp;
 
   case NetDataType::kLogLevel:
     g_log_level = ctrl.level_;
-    LOG_I("set log level : %d", g_log_level);
+    LOG_I("set log level : %d", g_log_level.load());
     goto rsp;
 
   default:
@@ -1890,7 +1885,7 @@ rsp:
   if (data_buf != nullptr)
     free(data_buf);
   /*切换network namespace*/
-  SetLocalNetNs(g_local_net_ns_fd);
+  SetLocalNetNs(daemon->LocalNetNsFd());
   /*response data*/
   cJSON* response = cJSON_CreateObject();
   if (response == nullptr) {
@@ -1952,10 +1947,16 @@ rsp:
 
 /*Runs a gRPC control-service request through the exact same functions the
  *raw-socket path above calls -- this is the only place gRPC requests ever
- *touch g_microseg/RootContext/the policy trees, and it only ever runs on
- *this (the epoll) thread, preserving the single-writer invariant those
- *globals have always relied on. See grpc/work_queue.h for ControlWorkItem.*/
-void DispatchGrpcControlOp(int32_t epoll_fd, grpc_bridge::ControlWorkItem& item) {
+ *touch DaemonContext's microseg/waf_root/the policy trees, and it only ever
+ *runs on this (the epoll) thread, preserving the single-writer invariant
+ *those globals have always relied on. See grpc/work_queue.h for
+ *ControlWorkItem.
+ *
+ *Note: unlike ParseRcvData's rsp: cleanup label, kPodUp here never restores
+ *the net namespace via SetLocalNetNs afterward -- a pre-existing asymmetry
+ *between the two paths, not something introduced by this refactor. Flagged
+ *rather than silently fixed as a side effect.*/
+void DispatchGrpcControlOp(int32_t epoll_fd, grpc_bridge::ControlWorkItem& item, DaemonContext& daemon) {
   using grpc_bridge::ControlOp;
   int ret = 0;
 
@@ -1968,9 +1969,9 @@ void DispatchGrpcControlOp(int32_t epoll_fd, grpc_bridge::ControlWorkItem& item)
     ctrl.pod_id_ = req->pod_id();
     ret = SetNs(ctrl.pid_, const_cast<char*>(kBasePath.data()));
     if (ret == 0) {
-      ret = InitNfqueue(epoll_fd, ctrl);
+      ret = InitNfqueue(epoll_fd, ctrl, daemon);
       if (ret == 0)
-        WriteIptableRule(1, 1);
+        WriteIptableRule(1, 1, daemon.IptablesVersion(), daemon.WafEnabled());
     }
     resp->set_status(ret);
     break;
@@ -1978,7 +1979,7 @@ void DispatchGrpcControlOp(int32_t epoll_fd, grpc_bridge::ControlWorkItem& item)
   case ControlOp::kPodDown: {
     const auto* req = static_cast<const netpolicy::v1::PodDownRequest*>(item.request);
     auto* resp = static_cast<netpolicy::v1::StatusResponse*>(item.response);
-    ret = g_microseg.DeleteNfQueRes(epoll_fd, req->pod_id());
+    ret = daemon.Microseg().DeleteNfQueRes(epoll_fd, req->pod_id());
     resp->set_status(ret);
     break;
   }
@@ -1986,8 +1987,8 @@ void DispatchGrpcControlOp(int32_t epoll_fd, grpc_bridge::ControlWorkItem& item)
     const auto* req = static_cast<const netpolicy::v1::AddPolicyRuleRequest*>(item.request);
     auto* resp = static_cast<netpolicy::v1::StatusResponse*>(item.response);
     std::string json = grpc_bridge::BuildAddPolicyRuleJson(*req);
-    ret = ParseNetPolicy(const_cast<char*>(json.c_str()));
-    g_microseg.PrintPolicyLog();
+    ret = ParseNetPolicy(const_cast<char*>(json.c_str()), daemon);
+    daemon.Microseg().PrintPolicyLog();
     resp->set_status(ret);
     break;
   }
@@ -1995,7 +1996,7 @@ void DispatchGrpcControlOp(int32_t epoll_fd, grpc_bridge::ControlWorkItem& item)
     const auto* req = static_cast<const netpolicy::v1::DeletePolicyRuleRequest*>(item.request);
     auto* resp = static_cast<netpolicy::v1::StatusResponse*>(item.response);
     std::string policy_name = req->policy_name();
-    ret = DeletePolicy(policy_name);
+    ret = DeletePolicy(policy_name, daemon);
     resp->set_status(ret);
     break;
   }
@@ -2003,7 +2004,7 @@ void DispatchGrpcControlOp(int32_t epoll_fd, grpc_bridge::ControlWorkItem& item)
     const auto* req = static_cast<const netpolicy::v1::AddWafRuleRequest*>(item.request);
     auto* resp = static_cast<netpolicy::v1::StatusResponse*>(item.response);
     std::string json = grpc_bridge::BuildAddWafRuleJson(*req);
-    bool found = http::extension::RootContext.ParseConfiguration(const_cast<char*>(json.c_str()));
+    bool found = daemon.WafRoot().ParseConfiguration(const_cast<char*>(json.c_str()));
     resp->set_status(found ? 0 : 1);
     break;
   }
@@ -2011,7 +2012,7 @@ void DispatchGrpcControlOp(int32_t epoll_fd, grpc_bridge::ControlWorkItem& item)
     const auto* req = static_cast<const netpolicy::v1::DeleteWafRuleRequest*>(item.request);
     auto* resp = static_cast<netpolicy::v1::StatusResponse*>(item.response);
     std::string json = grpc_bridge::BuildDeleteWafRuleJson(*req);
-    bool found = http::extension::RootContext.RemoveWafRule(const_cast<char*>(json.c_str()));
+    bool found = daemon.WafRoot().RemoveWafRule(const_cast<char*>(json.c_str()));
     resp->set_status(found ? 0 : 1);
     break;
   }
@@ -2026,7 +2027,7 @@ void DispatchGrpcControlOp(int32_t epoll_fd, grpc_bridge::ControlWorkItem& item)
   case ControlOp::kDumpConfig: {
     const auto* req = static_cast<const netpolicy::v1::DumpConfigRequest*>(item.request);
     auto* resp = static_cast<netpolicy::v1::DumpConfigResponse*>(item.response);
-    cJSON* config = g_microseg.GetAllConfig(req->policy_name());
+    cJSON* config = daemon.Microseg().GetAllConfig(req->policy_name(), daemon.ConnMgr());
     grpc_bridge::ConvertConfigCJsonToProto(config, resp);
     if (config)
       cJSON_Delete(config);
@@ -2036,7 +2037,7 @@ void DispatchGrpcControlOp(int32_t epoll_fd, grpc_bridge::ControlWorkItem& item)
     const auto* req = static_cast<const netpolicy::v1::DumpConnectionsRequest*>(item.request);
     auto* resp = static_cast<netpolicy::v1::DumpConnectionsResponse*>(item.response);
     std::string json = grpc_bridge::BuildDumpConnectionsJson(*req);
-    cJSON* conns = dumpConnectons(json);
+    cJSON* conns = dumpConnectons(json, daemon.ConnMgr());
     grpc_bridge::ConvertConnectionsCJsonToProto(conns, resp);
     if (conns)
       cJSON_Delete(conns);
@@ -2044,7 +2045,7 @@ void DispatchGrpcControlOp(int32_t epoll_fd, grpc_bridge::ControlWorkItem& item)
   }
   case ControlOp::kResetConfig: {
     auto* resp = static_cast<netpolicy::v1::StatusResponse*>(item.response);
-    ret = g_microseg.ClearCfg();
+    ret = daemon.Microseg().ClearCfg();
     resp->set_status(ret);
     break;
   }
@@ -2052,7 +2053,7 @@ void DispatchGrpcControlOp(int32_t epoll_fd, grpc_bridge::ControlWorkItem& item)
     const auto* req = static_cast<const netpolicy::v1::UpdateNodeConfigRequest*>(item.request);
     auto* resp = static_cast<netpolicy::v1::StatusResponse*>(item.response);
     std::string json = grpc_bridge::BuildUpdateNodeConfigJson(*req);
-    ret = ParseNodeCfg(const_cast<char*>(json.c_str()));
+    ret = ParseNodeCfg(const_cast<char*>(json.c_str()), daemon);
     resp->set_status(ret);
     break;
   }
@@ -2060,7 +2061,7 @@ void DispatchGrpcControlOp(int32_t epoll_fd, grpc_bridge::ControlWorkItem& item)
     const auto* req = static_cast<const netpolicy::v1::SetLogLevelRequest*>(item.request);
     auto* resp = static_cast<netpolicy::v1::StatusResponse*>(item.response);
     g_log_level = req->level();
-    LOG_I("set log level : %d", g_log_level);
+    LOG_I("set log level : %d", g_log_level.load());
     resp->set_status(0);
     break;
   }
@@ -2073,11 +2074,13 @@ void DispatchGrpcControlOp(int32_t epoll_fd, grpc_bridge::ControlWorkItem& item)
  *have queued since the last wakeup and runs each through
  *DispatchGrpcControlOp on this (the epoll) thread.*/
 int32_t DispatchGrpcWorkQueueEvent(int32_t epoll_fd, int32_t fd, void* ptr) {
+  RcvEpollCb* cb = (RcvEpollCb*)ptr;
+  DaemonContext* daemon = cb->daemon_;
   uint64_t drain;
   while (read(fd, &drain, sizeof(drain)) > 0) {
   }
-  for (auto* item : grpc_bridge::GetControlWorkQueue().DrainAll()) {
-    DispatchGrpcControlOp(epoll_fd, *item);
+  for (auto* item : daemon->ControlWorkQueue()->DrainAll()) {
+    DispatchGrpcControlOp(epoll_fd, *item, *daemon);
     item->done.set_value();
   }
   return 0;
@@ -2087,28 +2090,30 @@ int ProcAcceptEvent(int32_t epoll_fd, int32_t fd, void* ptr) {
   int zClientFd;
   socklen_t cliAddrLen;
   struct sockaddr_in address;
+  RcvEpollCb* cb = (RcvEpollCb*)ptr;
   cliAddrLen = sizeof(struct sockaddr_in);
   zClientFd = accept(fd, (struct sockaddr*)&address, &cliAddrLen);
   if (zClientFd <= 0)
     RETURN_ERROR(0, "accept a new client failed, %s.", strerror(errno));
-  return g_ctrl_server.Accept(epoll_fd, zClientFd);
+  return cb->daemon_->CtrlSrv().Accept(epoll_fd, zClientFd, cb->daemon_);
 }
 
 int ProcAcceptPostLinkEvent(int32_t epoll_fd, int32_t fd, void* ptr) {
   int zClientFd;
   socklen_t cliAddrLen;
   struct sockaddr_in address;
+  RcvEpollCb* cb = (RcvEpollCb*)ptr;
   // client address length
   cliAddrLen = sizeof(struct sockaddr_in);
   zClientFd = accept(fd, (struct sockaddr*)&address, &cliAddrLen);
   if (zClientFd <= 0)
     RETURN_ERROR(0, "accept a new client failed, %s.", strerror(errno));
-  g_post_server.Accept(zClientFd);
+  cb->daemon_->PostSrv().Accept(zClientFd);
   // return
   return 0;
 }
 
-int CreatePostServer(int efd, RCV_EPOLL_CB* pstPostEv) {
+int CreatePostServer(int efd, RCV_EPOLL_CB* pstPostEv, DaemonContext* daemon) {
   int fd = 0, ret, opt = 1;
   struct epoll_event ev;
   struct sockaddr_in address;
@@ -2140,6 +2145,7 @@ int CreatePostServer(int efd, RCV_EPOLL_CB* pstPostEv) {
   //
   pstPostEv->fd_ = fd;
   pstPostEv->epoll_in_func_ = ProcAcceptPostLinkEvent;
+  pstPostEv->daemon_ = daemon;
   // register epoll event
   ev.data.ptr = pstPostEv;
   ev.events = EPOLLIN;
@@ -2164,6 +2170,10 @@ void CustomPrefix(std::ostream& s, const google::LogMessageInfo& l, void*) {
     << l.line_number;
 }
 
+/*returns the detected iptables "version" (0 == modern iptables, 1 == legacy);
+ *on any command-execution failure, returns 0 -- matching the previous
+ *behavior of leaving g_ipt_ver at its zero-initialized default when this
+ *function couldn't determine anything.*/
 int GetIptablesVersion() {
   int ret;
   FILE* fp = NULL;
@@ -2172,7 +2182,7 @@ int GetIptablesVersion() {
   /*exec command*/
   fp = popen("iptables -t nat -S PREROUTING", "r");
   if (!fp)
-    RETURN_ERROR(-1, "popen iptables command failed, %s.", strerror(errno));
+    RETURN_ERROR(0, "popen iptables command failed, %s.", strerror(errno));
   /*init memory*/
   memset(buf, 0, sizeof(buf));
   /*read data*/
@@ -2181,31 +2191,39 @@ int GetIptablesVersion() {
   pclose(fp);
   /*check result*/
   if (ret < 0)
-    RETURN_ERROR(-1, "fread iptables command's ret failed, %s.", strerror(errno));
+    RETURN_ERROR(0, "fread iptables command's ret failed, %s.", strerror(errno));
   /*to string*/
   value = buf;
   auto pos = value.find("-A PREROUTING");
   if (pos != std::string::npos)
     return 0;
   /*use new iptables*/
-  g_ipt_ver = 1;
-  /*return*/
-  return 0;
+  return 1;
 }
 
 int RunNetPolicyDaemon(int argc, char* argv[]) {
+  /*single aggregate owner of everything that used to be a free-standing
+   *global (see net-policy.h's DaemonContext); runs alongside the raw-socket
+   *servers below -- see grpc/grpc_server.h. Both declared here
+   *(unconditionally constructed before any of the fallible setup below, and
+   *before the registerFilter calls that need daemon) so that none of the
+   *GOTO_ERROR jumps to err: below cross either object's initialization.*/
+  DaemonContext daemon;
+  grpc_bridge::GrpcServer g_grpc_server;
+
   google::InitGoogleLogging(argv[0], &CustomPrefix);
   google::ParseCommandLineFlags(&argc, &argv, true);
   FLAGS_logtostderr = true;
 
-  http::HttpFilterFactory::getInstance().registerFilter(
+  daemon.HttpFilters().registerFilter(
       [](size_t id, uint32_t from, uint32_t to) -> std::shared_ptr<http::HttpFilterBase> {
         return std::make_shared<http::extension::LogFilter>(id, from, to);
       });
 
-  http::HttpFilterFactory::getInstance().registerFilter(
-      [](size_t id, uint32_t from, uint32_t to) -> std::shared_ptr<http::HttpFilterBase> {
-        return std::make_shared<http::extension::PluginContext>(id, from, to);
+  daemon.HttpFilters().registerFilter(
+      [root = &daemon.WafRoot()](size_t id, uint32_t from,
+                                  uint32_t to) -> std::shared_ptr<http::HttpFilterBase> {
+        return std::make_shared<http::extension::PluginContext>(id, from, to, root);
       });
 
   char* log_level_env = NULL;
@@ -2214,11 +2232,6 @@ int RunNetPolicyDaemon(int argc, char* argv[]) {
   int ret, nfds, i, opt = 1;
   struct sockaddr_in address;
   RCV_EPOLL_CB unixEvent, postEvent, grpcWakeEvent, *pstCbEv;
-  /*runs alongside the raw-socket servers above -- see grpc/grpc_server.h.
-   *Declared here (unconditionally constructed before any of the fallible
-   *setup below) so that none of the GOTO_ERROR jumps to err: below cross
-   *its initialization.*/
-  grpc_bridge::GrpcServer g_grpc_server;
   // print start log
   LOG_I("policy process start......");
   /*get log level env*/
@@ -2228,19 +2241,19 @@ int RunNetPolicyDaemon(int argc, char* argv[]) {
   /*get waf env*/
   log_level_env = getenv(POLICY_WAF_ENABLE);
   if (log_level_env)
-    g_waf_enable = (strcmp(log_level_env, "true") == 0) ? true : false;
+    daemon.SetWafEnabled(strcmp(log_level_env, "true") == 0);
   // open local net ns
-  OpenLocalNetNs();
+  daemon.SetLocalNetNsFd(OpenLocalNetNs());
   /*get iptables version*/
-  GetIptablesVersion();
+  daemon.SetIptablesVersion(GetIptablesVersion());
   /*print debug log*/
-  LOG_I("choose iptables version : %d", g_ipt_ver);
+  LOG_I("choose iptables version : %d", daemon.IptablesVersion());
   // epoll fd
   epfd = epoll_create(32000);
   if (epfd <= 0)
     GOTO_ERROR(err, "create epoll fd failed, %s.", strerror(errno));
   // create post socket server
-  ret = CreatePostServer(epfd, &postEvent);
+  ret = CreatePostServer(epfd, &postEvent, &daemon);
   if (ret != 0)
     GOTO_ERROR(err, "create post server failed.");
   // create socket
@@ -2266,14 +2279,16 @@ int RunNetPolicyDaemon(int argc, char* argv[]) {
   if (ret < 0)
     GOTO_ERROR(err, "listen the client connect request! err : %s.", strerror(errno));
   //
-  g_microseg.SetEfd(epfd);
+  daemon.Microseg().SetEfd(epfd);
   // start the gRPC control/event server (additive -- see grpc/grpc_server.h;
   // raw-socket servers above are untouched)
   ret = g_grpc_server.Start();
   if (ret != 0)
     GOTO_ERROR(err, "failed to start grpc control/event server.");
+  daemon.WireGrpc(&g_grpc_server.GetControlWorkQueue(), &g_grpc_server.GetEventBridge());
   grpcWakeEvent.fd_ = g_grpc_server.WakeFd();
   grpcWakeEvent.epoll_in_func_ = DispatchGrpcWorkQueueEvent;
+  grpcWakeEvent.daemon_ = &daemon;
   ev.data.ptr = &grpcWakeEvent;
   ev.events = EPOLLIN;
   ret = epoll_ctl(epfd, EPOLL_CTL_ADD, grpcWakeEvent.fd_, &ev);
@@ -2282,6 +2297,7 @@ int RunNetPolicyDaemon(int argc, char* argv[]) {
   //
   unixEvent.fd_ = zListenFd;
   unixEvent.epoll_in_func_ = ProcAcceptEvent;
+  unixEvent.daemon_ = &daemon;
   // register epoll event
   ev.data.ptr = &unixEvent;
   ev.events = EPOLLIN;

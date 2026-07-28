@@ -6,6 +6,7 @@
 #include <unordered_map>
 
 #include "http/connection.h"
+#include "http/http_filter_factory.h"
 #include "http/packet.hh"
 #include "ip_protocol.h"
 #include "net/stream.h"
@@ -47,6 +48,8 @@ public:
     std::shared_ptr<http::Connection> http_;
   };
 
+  explicit Tcp(http::HttpFilterFactory& filter_factory) : filter_factory_(filter_factory) {}
+
   // void receive(seastar::net::packet packet) override;
   NetStatus receive(seastar::net::packet p, uint32_t from, uint32_t to) override;
 
@@ -55,6 +58,7 @@ public:
   std::vector<std::string> connections() override;
 
 private:
+  http::HttpFilterFactory& filter_factory_;
   std::unordered_map<ConnectionID, std::shared_ptr<Tcb>, ConnectionIDHash> tcbs_;
 };
 } // namespace net

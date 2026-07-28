@@ -1,12 +1,8 @@
 #include "grpc/event_bridge.h"
 
-#include <memory>
-
 namespace grpc_bridge {
 
 namespace {
-
-std::unique_ptr<EventBridge> g_event_bridge = std::make_unique<EventBridge>();
 
 /*mirrors GetProtoString's IPPROTO_* mapping, net-policy.cpp:68-79*/
 netpolicy::v1::L4Protocol ProtoToL4Protocol(uint8_t proto) {
@@ -91,7 +87,5 @@ bool EventBridge::WaitAndPop(netpolicy::v1::PolicyEvent* out, std::chrono::milli
   queue_.pop_front();
   return true;
 }
-
-EventBridge& GetEventBridge() { return *g_event_bridge; }
 
 } // namespace grpc_bridge

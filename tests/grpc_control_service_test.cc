@@ -2,12 +2,18 @@
 
 #include "grpc/proto_json_bridge.h"
 #include "grpc/work_queue.h"
+#include "net-policy.h"
 #include "waf/plugin.h"
 
 namespace {
 
 using grpc_bridge::ControlOp;
 using grpc_bridge::ControlWorkItem;
+
+/*Shared across every TEST() in this file, mirroring how the removed globals
+ *(g_microseg, RootContext, etc.) used to be implicitly shared -- see
+ *net-policy.h's DaemonContext.*/
+DaemonContext daemon;
 
 /*Drives DispatchGrpcControlOp directly, bypassing gRPC transport entirely --
  *this exercises exactly the same code path a real RPC would reach after
@@ -21,7 +27,7 @@ grpc::Status Dispatch(ControlOp op, const google::protobuf::Message& request,
   item.op = op;
   item.request = &request;
   item.response = response;
-  DispatchGrpcControlOp(/*epoll_fd=*/-1, item);
+  DispatchGrpcControlOp(/*epoll_fd=*/-1, item, daemon);
   return item.status;
 }
 
@@ -81,7 +87,7 @@ TEST(ControlDispatch, AddWafRuleThenReadBackViaGetWafRule) {
   EXPECT_EQ(resp.status(), 0);
 
   Rules waf_rule;
-  ASSERT_TRUE(http::extension::RootContext.GetWafRule("10.1.1.1", waf_rule));
+  ASSERT_TRUE(daemon.WafRoot().GetWafRule("10.1.1.1", waf_rule));
   EXPECT_EQ(waf_rule.GetAppName(), "grpc-test-app");
 
   netpolicy::v1::DeleteWafRuleRequest del_req;
@@ -89,7 +95,7 @@ TEST(ControlDispatch, AddWafRuleThenReadBackViaGetWafRule) {
   netpolicy::v1::StatusResponse del_resp;
   Dispatch(ControlOp::kDeleteWafRule, del_req, &del_resp);
   EXPECT_EQ(del_resp.status(), 0);
-  EXPECT_FALSE(http::extension::RootContext.GetWafRule("10.1.1.1", waf_rule));
+  EXPECT_FALSE(daemon.WafRoot().GetWafRule("10.1.1.1", waf_rule));
 }
 
 TEST(ControlDispatch, SetLogLevelUpdatesGlobal) {

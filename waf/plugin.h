@@ -3,17 +3,19 @@
 #include <cstddef>
 
 #include "http/filter.h"
-#include "net-policy.h"
 #include "rule.h"
 
+namespace grpc_bridge { class EventBridge; }
 
 namespace http {
 namespace extension {
+
+class PluginRootContext;
+
 class PluginContext : public HttpFilter {
 public:
-  // PluginContext() {}
-
-  PluginContext(size_t id, uint32_t from, uint32_t to) : HttpFilter(id, from, to) {}
+  PluginContext(size_t id, uint32_t from, uint32_t to, PluginRootContext* root_ctx)
+      : HttpFilter(id, from, to), root_ctx_(root_ctx) {}
 
   FilterStatus onRequestHeaders(RequestHeaderMap &headers, bool end_of_stream) override;
 
@@ -36,6 +38,7 @@ public:
                                    std::string key);
 
 private:
+  PluginRootContext* root_ctx_;
   Rules ruleArr;
   std::string forwardIp_;
   AttackedLog atlog = {};
@@ -44,6 +47,7 @@ private:
 class PluginRootContext {
 private:
   int *post_fd_;
+  grpc_bridge::EventBridge* event_bridge_ = nullptr;
   std::unordered_map<std::string, Rules> waf_rules_;
 
 public:
@@ -51,6 +55,10 @@ public:
   ~PluginRootContext();
 
   void SetPostFd(int *fd) { post_fd_ = fd; }
+
+  /*non-owning; wired once at startup after the gRPC server exists*/
+  void SetEventBridge(grpc_bridge::EventBridge* eb) { event_bridge_ = eb; }
+  grpc_bridge::EventBridge* GetEventBridge() const { return event_bridge_; }
 
   int HttpPost(std::string value);
 
@@ -75,8 +83,6 @@ public:
   /*insert waf rule*/
   bool InsertWafRule(std::string ip, Rules &rule);
 };
-
-extern PluginRootContext RootContext;
 
 } // namespace extension
 } // namespace http

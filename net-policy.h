@@ -51,10 +51,8 @@ typedef struct nf_conntrack NF_CONNTRACK;
 /*epoll call function*/
 using RcvCbFunc = int32_t(*)(int32_t epoll_fd, int32_t fd, void* ptr);
 /*清除iptables配置*/
-extern void ClearIptabelsRule();
+extern void ClearIptabelsRule(int ipt_ver);
 extern int SetNs(int pid, char *basePath);
-/*connection manager*/
-extern net::ConnectionManager g_connection_manager;
 /*daemon entrypoint; defined in net-policy.cpp, called from main.cpp*/
 extern int RunNetPolicyDaemon(int argc, char* argv[]);
 
@@ -146,6 +144,8 @@ public:
 };
 
 struct RcvEpollCb; // forward declaration — full definition follows NFQ_RES_INFO
+class DaemonContext; // forward declaration — full definition follows PostServer
+namespace grpc_bridge { class ControlWorkQueue; class EventBridge; }
 
 class NFQ_RES_INFO
 {
@@ -164,6 +164,7 @@ public:
     struct nfct_handle*  nfct_hd_    = nullptr;
     struct nfct_handle*  nfct_cb_hd_ = nullptr;
     uint64_t pod_id_;
+    DaemonContext*       daemon_     = nullptr; // non-owning; set once in InitNfqueue
 
 public:
     NFQ_RES_INFO();
@@ -179,6 +180,7 @@ struct RcvEpollCb
     int32_t fd_;
     RcvCbFunc epoll_in_func_; // epoll EPOLLIN
     NFQ_RES_INFO *nfq_res_;
+    DaemonContext* daemon_ = nullptr; // non-owning; set wherever this cb is wired up
 };
 using RCV_EPOLL_CB = RcvEpollCb; // legacy alias
 
@@ -233,7 +235,7 @@ public:
     /**/
     NFQ_RES_INFO *GetNfqRes(uint64_t pid);
     /**/
-    void ClearNfQueResource(int efd);
+    void ClearNfQueResource(int efd, int ipt_ver);
 };
 
 /*策略详情*/
@@ -363,7 +365,7 @@ public:
     /*获取策略map*/
     PolicyTree *GetPolicyTree(FlowDir dir);
     /*获取所有规则配置*/
-    cJSON *GetAllConfig(std::string name);
+    cJSON *GetAllConfig(std::string name, net::ConnectionManager& conn_mgr);
     /*打印日志*/
     void PrintPolicyLog();
 };
@@ -389,7 +391,8 @@ public:
     void DeletePolicy(const std::string& name);    /*erases HTTP rules AND net policy for both directions*/
     int  ClearCfg()                                { return policy_rule_.ClearCfg(); }
     void PrintPolicyLog()                          { policy_rule_.PrintPolicyLog(); }
-    cJSON* GetAllConfig(const std::string& name)   { return policy_rule_.GetAllConfig(name); }
+    cJSON* GetAllConfig(const std::string& name, net::ConnectionManager& conn_mgr)
+                                                    { return policy_rule_.GetAllConfig(name, conn_mgr); }
 
     /*---- HTTP L7 policy ----*/
     int  AddHttpPolicy(FlowDir dir, const std::string& key, HTTP_RULE_INFO& rule);
@@ -420,7 +423,7 @@ class CtrlServer
 public:
     ~CtrlServer() { if (client_fd_ > 0) close(client_fd_); }
     /*accept a new client; closes any previously connected fd, registers new fd with epoll*/
-    int Accept(int epoll_fd, int client_fd);
+    int Accept(int epoll_fd, int client_fd, DaemonContext* daemon);
 
 private:
     int client_fd_ = 0;
@@ -439,7 +442,66 @@ public:
                       const std::string& rule_key);
     /*return pointer to the fd so the WAF plugin can write directly*/
     int* FdPtr() { return &post_link_fd_; }
+    /*non-owning; wired once at startup after the gRPC server exists*/
+    void SetEventBridge(grpc_bridge::EventBridge* eb) { event_bridge_ = eb; }
 
 private:
     int post_link_fd_ = 0;
+    grpc_bridge::EventBridge* event_bridge_ = nullptr;
+};
+
+/*single aggregate owner of everything that used to be a free-standing global
+ *in net-policy.cpp/waf/plugin.cc. One instance is constructed on the stack of
+ *RunNetPolicyDaemon (exactly like grpc_bridge::GrpcServer g_grpc_server) and
+ *threaded through every epoll callback via RcvEpollCb::daemon_ /
+ *NFQ_RES_INFO::daemon_. Not copyable — there is exactly one instance for the
+ *life of the process (or of a test).*/
+class DaemonContext
+{
+public:
+    DaemonContext() : connection_manager_(http_filter_factory_) {
+        waf_root_.SetPostFd(post_server_.FdPtr());
+    }
+    DaemonContext(const DaemonContext&) = delete;
+    DaemonContext& operator=(const DaemonContext&) = delete;
+
+    /*---- already-encapsulated instances ----*/
+    MicroSegEngine&                     Microseg()   { return microseg_; }
+    net::ConnectionManager&             ConnMgr()    { return connection_manager_; }
+    PostServer&                         PostSrv()    { return post_server_; }
+    CtrlServer&                         CtrlSrv()    { return ctrl_server_; }
+    http::extension::PluginRootContext& WafRoot()    { return waf_root_; }
+    http::HttpFilterFactory&            HttpFilters(){ return http_filter_factory_; }
+
+    /*---- former raw-scalar globals (g_log_level stays a separate atomic global) ----*/
+    bool WafEnabled() const           { return waf_enable_; }
+    void SetWafEnabled(bool v)        { waf_enable_ = v; }
+    int  LocalNetNsFd() const         { return local_net_ns_fd_; }
+    void SetLocalNetNsFd(int fd)      { local_net_ns_fd_ = fd; }
+    int  IptablesVersion() const      { return ipt_ver_; }
+    void SetIptablesVersion(int v)    { ipt_ver_ = v; }
+
+    /*---- gRPC wiring: GrpcServer is a sibling object, constructed separately
+     *in RunNetPolicyDaemon; this stores non-owning pointers into it, set once
+     *at startup after both objects exist ----*/
+    void WireGrpc(grpc_bridge::ControlWorkQueue* q, grpc_bridge::EventBridge* eb) {
+        control_work_queue_ = q;
+        post_server_.SetEventBridge(eb);
+        waf_root_.SetEventBridge(eb);
+    }
+    grpc_bridge::ControlWorkQueue* ControlWorkQueue() { return control_work_queue_; }
+
+private:
+    bool waf_enable_      = false;
+    int  local_net_ns_fd_ = 0;
+    int  ipt_ver_         = 0;
+
+    http::HttpFilterFactory              http_filter_factory_;      // must precede connection_manager_
+    net::ConnectionManager               connection_manager_;
+    MicroSegEngine                       microseg_;
+    CtrlServer                           ctrl_server_;
+    PostServer                           post_server_;
+    http::extension::PluginRootContext   waf_root_;
+
+    grpc_bridge::ControlWorkQueue* control_work_queue_ = nullptr; // non-owning
 };

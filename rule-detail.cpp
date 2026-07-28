@@ -567,7 +567,7 @@ int PolicyRule::DeletePolicy(FlowDir dir, std::string name) {
 }
 
 /*获取所有规则配置*/
-cJSON* PolicyRule::GetAllConfig(std::string name) {
+cJSON* PolicyRule::GetAllConfig(std::string name, net::ConnectionManager& conn_mgr) {
   NFQ_RES_INFO* res;
   cJSON *containers = nullptr, *tcp = nullptr, *r = nullptr, *item;
   cJSON *config = nullptr, *inrule = nullptr, *outrule = nullptr;
@@ -577,7 +577,7 @@ cJSON* PolicyRule::GetAllConfig(std::string name) {
   inrule = cJSON_CreateArray();
   outrule = cJSON_CreateArray();
   containers = cJSON_CreateArray();
-  auto stat = g_connection_manager.stat();
+  auto stat = conn_mgr.stat();
   if (!config || !outrule || !inrule || !tcp || !containers)
     GOTO_ERROR(err, "create json object failed.");
 
@@ -697,7 +697,7 @@ NFQ_RES_INFO* NfQueData::GetNfqRes(uint64_t pid) {
 }
 
 /*clear nfqueue resource*/
-void NfQueData::ClearNfQueResource(int efd) {
+void NfQueData::ClearNfQueResource(int efd, int ipt_ver) {
   int ret;
   for (auto& [pid, res] : this->res_data_) {
     if (res == nullptr)
@@ -709,7 +709,7 @@ void NfQueData::ClearNfQueResource(int efd) {
     /*print debug log*/
     LOG_D("destroy nfqueue, pid : %d.", res->pid_);
     /*clear iptables rule*/
-    ClearIptabelsRule();
+    ClearIptabelsRule(ipt_ver);
     /*free nfque resource — unique_ptr handles delete*/
     res->FreeResource(efd);
   }

@@ -18,10 +18,7 @@
 namespace http {
 namespace extension {
 
-const char *PREFIX = "#%% pre";
 const size_t HEADER_LEN = 11;
-
-PluginRootContext RootContext;
 
 /* Checksum a block of data */
 static uint16_t csum(uint16_t *packet, int packlen)
@@ -86,9 +83,9 @@ FilterStatus PluginContext::ModifyNetPackets()
 FilterStatus PluginContext::onNewConnection(const net::ConnectionInfo &streamInfo)
 {
   //print debug log
-  LOG_T("new connection, dst ip : %s, waf rule size : %ld", streamInfo.to_.c_str(), RootContext.GetWafRuleSize());
+  LOG_T("new connection, dst ip : %s, waf rule size : %ld", streamInfo.to_.c_str(), root_ctx_->GetWafRuleSize());
   //get waf rule
-  auto ret = RootContext.GetWafRule(streamInfo.to_, ruleArr);
+  auto ret = root_ctx_->GetWafRule(streamInfo.to_, ruleArr);
   if(!ret) return FilterStatus::StopIteration;
   /*source address*/
   forwardIp_ = streamInfo.from_;
@@ -140,9 +137,10 @@ FilterStatus PluginContext::onClose()
   str = cJSON_PrintUnformatted(root);
   if(!str) GOTO_ERROR(err, "json format failed.");
   /*http post*/
-  RootContext.HttpPost(str);
+  root_ctx_->HttpPost(str);
   /*publish to gRPC subscribers too -- see grpc/event_bridge.h*/
-  grpc_bridge::GetEventBridge().PublishWafAttack(ruleArr, atlog);
+  if (auto* eb = root_ctx_->GetEventBridge())
+    eb->PublishWafAttack(ruleArr, atlog);
 
 err:
   if(root) cJSON_Delete(root);

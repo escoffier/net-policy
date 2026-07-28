@@ -15,8 +15,8 @@ enum class l4_protocol : uint8_t { ICMP = 1, TCP = 6, UDP = 17, UNUSED = 255 };
 
 class ipv4 {
 public:
-  ipv4();
-  
+  explicit ipv4(http::HttpFilterFactory& filter_factory);
+
   NetStatus receive(seastar::net::packet p);
 
   NetworkStat tcpStat();

@@ -1,16 +1,20 @@
 #pragma once
 
+#include "grpc/work_queue.h"
 #include "proto/net_policy_control.grpc.pb.h"
 
 namespace grpc_bridge {
 
 /*Implements the NetPolicyControl RPCs by handing each request to the epoll
- *thread (via ControlWorkQueue, see work_queue.h) and blocking this gRPC
- *handler thread until DispatchGrpcControlOp (net-policy.cpp) has run it
- *through the same legacy functions the raw-socket control channel calls
- *today. No policy/WAF state is touched from this class directly.*/
+ *thread (via the ControlWorkQueue reference passed in at construction, owned
+ *by GrpcServer -- see grpc_server.h) and blocking this gRPC handler thread
+ *until DispatchGrpcControlOp (net-policy.cpp) has run it through the same
+ *legacy functions the raw-socket control channel calls today. No policy/WAF
+ *state is touched from this class directly.*/
 class ControlServiceImpl final : public netpolicy::v1::NetPolicyControl::Service {
 public:
+  explicit ControlServiceImpl(ControlWorkQueue& queue) : queue_(queue) {}
+
   grpc::Status PodUp(grpc::ServerContext* context, const netpolicy::v1::PodUpRequest* request,
                       netpolicy::v1::StatusResponse* response) override;
   grpc::Status PodDown(grpc::ServerContext* context, const netpolicy::v1::PodDownRequest* request,
@@ -35,6 +39,12 @@ public:
                                  netpolicy::v1::StatusResponse* response) override;
   grpc::Status SetLogLevel(grpc::ServerContext* context, const netpolicy::v1::SetLogLevelRequest* request,
                             netpolicy::v1::StatusResponse* response) override;
+
+private:
+  grpc::Status EnqueueAndWait(ControlOp op, const google::protobuf::Message& request,
+                               google::protobuf::Message* response);
+
+  ControlWorkQueue& queue_;
 };
 
 } // namespace grpc_bridge

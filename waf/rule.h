@@ -12,9 +12,6 @@
 #include <unordered_map>
 #include <condition_variable>
 
-
-extern std::vector<std::string> MatchFunc;
-
 typedef enum {
     ACTION_BYPASS  = 0,
     ATCION_ALERT   = 1,
@@ -127,8 +124,6 @@ public:
     void AddAppUri(std::string uri) { app_uri_ = uri; }
     /*get app name*/
     std::string GetAppName() { return app_name_; }
-    /*match mode function*/
-    int MatchModeFunc(std::string str);
     /*get header rule*/
     std::vector<Rule> GetHeaderRule() { return header_rules_; }
     /*get body rule*/

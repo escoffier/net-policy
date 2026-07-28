@@ -75,13 +75,13 @@ private:
   TCPSegment tcpSegment_;
 };
 
+class HttpFilterFactory;
+
 class HttpFilterManager {
 public:
   HttpFilterManager() = default;
 
-  HttpFilterManager(size_t key);
-
-  HttpFilterManager(size_t key, uint32_t from, uint32_t to);
+  HttpFilterManager(HttpFilterFactory& factory, size_t key, uint32_t from, uint32_t to);
 
   FilterStatus decodeHeaders(RequestHeaderMap& headers, bool serverSide);
 

@@ -9,6 +9,7 @@
 
 #include "http/filter.h"
 #include "http/http1/codec.h"
+#include "http/http_filter_factory.h"
 #include "http/utility.h"
 
 namespace http {
@@ -16,7 +17,10 @@ class Http1CodecTest : public ::testing::Test {
 protected:
   void SetUp() override {}
 
-  http1::ConnectionImpl codec_{true, std::make_shared<HttpFilterManager>(1)};
+  // empty factory -- no filters registered, matching this test's previous
+  // behavior (it never registered any either)
+  HttpFilterFactory factory_;
+  http1::ConnectionImpl codec_{true, std::make_shared<HttpFilterManager>(factory_, 1, 0, 0)};
 };
 
 TEST_F(Http1CodecTest, Dispatch) {

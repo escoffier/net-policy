@@ -41,6 +41,4 @@ private:
   std::deque<netpolicy::v1::PolicyEvent> queue_;
 };
 
-EventBridge& GetEventBridge();
-
 } // namespace grpc_bridge

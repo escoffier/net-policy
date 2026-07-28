@@ -11,22 +11,13 @@ using FilterCB = std::function<std::shared_ptr<HttpFilterBase>(size_t id, uint32
 
 class HttpFilterFactory {
 public:
-  static HttpFilterFactory &getInstance() {
-    static HttpFilterFactory instance; // Guaranteed to be destroyed.
-    // Instantiated on first use.
-    return instance;
-  }
-
-public:
+  HttpFilterFactory() = default;
   HttpFilterFactory(HttpFilterFactory const &) = delete;
   void operator=(HttpFilterFactory const &) = delete;
 
   void registerFilter(FilterCB cb);
 
   void traverse(std::function<void(FilterCB)>);
-
-private:
-  HttpFilterFactory() {}
 
 private:
   std::list<FilterCB> filterCbs_;

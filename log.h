@@ -1,6 +1,13 @@
 #pragma once
 
-extern int g_log_level;
+#include <atomic>
+
+/*process-wide log-level threshold; the one deliberate exception to "no
+ *global state" in this codebase -- LOG_D/LOG_V/LOG_T are used at hundreds of
+ *call sites across every file, so threading a context object through all of
+ *them is disproportionate for a single cross-cutting flag. atomic<int>
+ *rather than plain int since it may now be read from multiple threads.*/
+extern std::atomic<int> g_log_level;
 
 #define POLICY_LOG_LEVEL  "POLICY_LOG_LEVEL"
 #define POLICY_WAF_ENABLE "POLICY_WAF_ENABLE"

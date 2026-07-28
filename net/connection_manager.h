@@ -4,6 +4,7 @@
 #include <memory>
 #include <utility>
 
+#include "http/http_filter_factory.h"
 #include "http/packet.hh"
 #include "ip.h"
 #include "net/utility.h"
@@ -11,7 +12,8 @@
 namespace net {
 class ConnectionManager {
 public:
-  ConnectionManager() : ipv4_(std::make_unique<ipv4>()) {}
+  explicit ConnectionManager(http::HttpFilterFactory& filter_factory)
+      : ipv4_(std::make_unique<ipv4>(filter_factory)) {}
 
   NetStatus receive(seastar::net::packet p) { return ipv4_->receive(std::move(p)); };
 

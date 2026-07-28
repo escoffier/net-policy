@@ -12,8 +12,8 @@
 
 namespace net {
 
-ipv4::ipv4()
-    : tcp_(), l4_{{uint8_t(l4_protocol::ICMP), nullptr},
+ipv4::ipv4(http::HttpFilterFactory& filter_factory)
+    : tcp_(filter_factory), l4_{{uint8_t(l4_protocol::ICMP), nullptr},
                   {uint8_t(l4_protocol::TCP), &tcp_},
                   {uint8_t(l4_protocol::UDP), nullptr}} {}
 

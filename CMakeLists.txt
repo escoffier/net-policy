@@ -39,7 +39,6 @@ add_compile_definitions(GLOG_CUSTOM_PREFIX_SUPPORT)
 set(SOURCES
     net/utility.cc
     net/filter.cc
-    net/filter_factory.cc
     http/header.cc
     http/http_filter_factory.cc
     http/codec.cc
@@ -119,7 +118,6 @@ add_executable(net-rule ${SOURCES})
 add_executable(net_rule_test
     net/utility.cc
     net/filter.cc
-    net/filter_factory.cc
     cjson.c
     http/header.cc
     http/codec.cc
@@ -212,7 +210,6 @@ gtest_discover_tests(net_rule_test)
 add_executable(net_rule_grpc_test
     net/utility.cc
     net/filter.cc
-    net/filter_factory.cc
     net/ip.cc
     net/tcp.cc
     net/udp.cc

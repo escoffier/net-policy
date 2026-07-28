@@ -2,13 +2,7 @@
 
 #include <unistd.h>
 
-#include <memory>
-
 namespace grpc_bridge {
-
-namespace {
-std::unique_ptr<ControlWorkQueue> g_control_work_queue;
-}
 
 ControlWorkQueue::ControlWorkQueue(int wake_fd) : wake_fd_(wake_fd) {}
 
@@ -29,11 +23,5 @@ std::vector<ControlWorkItem*> ControlWorkQueue::DrainAll() {
   queue_.clear();
   return items;
 }
-
-void InitControlWorkQueue(int wake_fd) {
-  g_control_work_queue = std::make_unique<ControlWorkQueue>(wake_fd);
-}
-
-ControlWorkQueue& GetControlWorkQueue() { return *g_control_work_queue; }
 
 } // namespace grpc_bridge

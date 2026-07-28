@@ -11,8 +11,6 @@
 #include "net-policy.h"
 #include "log.h"
 
-std::vector<std::string> MatchFunc = {"urlDecode", "substr", "iterator"};
-
 /*
 std::string GetNowTime()
 {
@@ -609,18 +607,6 @@ void Rules::AddRule(Rule rule)
         body_rules_.push_back(rule);
         LOG_D("add body rule id : %ld, mode : %s, keys size : %d", rule.id_, rule.mode_.c_str(), (int)rule.keys_.size());
     }
-}
-
-/*match mode function*/
-int Rules::MatchModeFunc(std::string str)
-{
-    int i = 0;
-    for(i = 0; i < (int)MatchFunc.size(); i++)
-    {
-        auto flag = str.find(MatchFunc.at(i));
-        if(flag != std::string::npos) break;
-    }
-    return i;
 }
 
 /*add ignore type*/
