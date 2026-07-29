@@ -51,15 +51,15 @@ established in Phase 0 before any behavior moves.
 | Phase | Subsystem (current files) | Rust target | Notes |
 |---|---|---|---|
 | **0. Foundations** | — | Cargo workspace scaffold, `cxx` bridge skeleton, CMake↔Cargo build integration, CI updated to build both | No behavior change; proves the toolchain before any logic moves. |
-| **1. WAF rule/regex engine** | `waf/rule.{h,cc}` (`Rules`, `Pcre2Regex`, `MatchIgnoreType`, `MatchDomain`, `Match{Force,}{White,Black}List`) | Rust crate using the `regex` crate | Requires a PCRE-feature audit of existing rules (backreferences, lookaround, possessive quantifiers are not supported by `regex`); any incompatible rules are rewritten as part of this phase. `waf/plugin.{h,cc}` (`PluginRootContext`/`PluginContext`) stays C++ for now and calls into the Rust rule engine via `cxx`. |
+| **1. WAF rule/regex engine** | `waf/rule.{h,cc}` (`Rules`, `Pcre2Regex`, `MatchIgnoreType`, `MatchDomain`, `MatchForceWhiteList`, `MatchBlackWhiteList`) | Rust crate using the `regex` crate | Requires a PCRE-feature audit of existing rules (backreferences, lookaround, possessive quantifiers are not supported by `regex`); any incompatible rules are rewritten as part of this phase. `waf/plugin.{h,cc}` (`PluginRootContext`/`PluginContext`) stays C++ for now and calls into the Rust rule engine via `cxx`. |
 | **2. gRPC control plane** | `grpc/*` (`control_service`, `event_service`, `event_bridge`, `grpc_server`, `proto_json_bridge`, `work_queue`) | Rust crate using `tonic` + `prost` | The legacy raw-socket protocol (port 9999, `NetDataType` enum: `POD_PID`/`ADD_RULE`/`ADD_WAF_RULE`/etc.) is retired in this phase — gRPC becomes the only control plane. Talks to the still-C++ core (`MicroSegEngine`, `PolicyRule`) via `cxx` to apply rule/WAF-rule mutations. |
 | **3a. HTTP/1.1 codec** | `http/http1/*` (llhttp-based) | `httparse` + hand-rolled incremental/streaming state | Must replicate llhttp's edge-case handling (chunked bodies, pipelining, request-smuggling defenses). Highest behavioral-parity risk in the migration. |
 | **3b. HTTP/2 codec** | `http/http2/*` (nghttp2-based) | `h2` crate | `h2` is client/server-shaped; needs an adapter since the inspector observes traffic between two other parties rather than terminating a connection itself. |
 | **3c. HTTP inspection orchestration** | `http/http_inspector.*`, `http/filter.*`, `http/http_filter_factory.*`, `http/connection.*`, `http/header.*`, `http/url.*` | Rust, built on 3a/3b | Wires codecs into the per-connection filter chain; depends on both codecs being done. |
-| **4. Policy engine** | `policy/engine.{h,cc}`, `rule-detail.cpp`, `RuleChain`/`RuleGroup`/`PolicyTree`/`PolicyRule`/`MicroSegEngine` matching logic | Rust crate, pure logic | CIDR-aware five-tuple matching, no kernel interaction — well-isolated port. `MicroSegEngine` becomes the seam other phases call through via `cxx`. |
+| **4. Policy engine** | `rule-detail.cpp` + the `RuleDetail`/`RuleGroup`/`RuleChain`/`PolicyTree`/`PolicyRule`/`MicroSegEngine` classes declared in `net-policy.h` | Rust crate, pure logic | CIDR-aware five-tuple matching, no kernel interaction — well-isolated port. `MicroSegEngine` becomes the seam other phases call through via `cxx`. Note: `policy/engine.{h,cc}` (a separate `PolicyEngine` class) is **dead code** — it is not in `CMakeLists.txt`'s `SOURCES` and nothing else references it — so it is deleted rather than migrated; it is not the live policy engine. |
 | **5. Network filters** | `net/filter.*`, `net/ip.*`, `net/tcp.*`, `net/udp.*`, `net/utility.*`, `net/connection_manager.h` | Rust crate | Operates on packet buffers already handed up from NFQ; no direct netlink dependency, so it can move before Phase 6. |
 | **6. NFQ/netlink core** | `net-policy.cpp`/`.h` main loop, `NFQ_RES_INFO`, epoll wiring, `admin/profile.cc` (netns), vendored `libmnl`/`libnetfilter_queue`/`libnetfilter_conntrack`/`libnfnetlink` | Rust using pure-Rust netlink crates (e.g. `neli`, `nfq`) | Replaces the vendored C netlink libs entirely. Highest risk and effort; done last, after everything that calls into it already speaks Rust. |
-| **7. Decommission** | — | — | Remove the C++ build target, `cxx` bridge, legacy Makefile, and vendored C deps (`cjson`, llhttp, nghttp2, libmnl family). Rust-only build going forward. |
+| **7. Decommission** | — | — | Remove the C++ build target, `cxx` bridge, legacy Makefile, and all remaining C/C++ dependencies (`cjson`, llhttp, nghttp2, pcre2, libmnl family, `gflags`, `fmt`, gperftools/`libunwind`, `glog`). Rust-only build going forward. |
 
 ## Validation Strategy (per phase)
 
@@ -94,6 +94,13 @@ the C++ one in production:
 - **Build**: CMake stays the top-level driver throughout (per Phase 0) so
   `./build/net-rule` keeps working the same way at every phase; only in
   Phase 7 does the build become pure Cargo.
+- **CLI/config**: `gflags`-based argument parsing → `clap`, converted in
+  whichever phase first needs to add or change a flag (no dedicated phase,
+  since it's a small surface).
+- **Profiling/backtraces**: `gperftools`/`libunwind` → standard Rust panic
+  backtraces (`RUST_BACKTRACE`) and, if heap profiling is still needed,
+  `dhat` or an equivalent Rust profiler; addressed in Phase 6 since that's
+  when the last C++ binary using them goes away.
 
 ## Key Risks
 
