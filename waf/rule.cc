@@ -631,6 +631,12 @@ bool Rules::MatchIgnoreType(std::string &src)
     if (!IsValidUtf8(src)) return false;
     rust::Vec<rust::String> suffixes;
     for (auto &entry : this->ignore_) {
+        // entry.first is an admin-configured ignored file-extension string.
+        // rust::String's constructor throws std::invalid_argument on
+        // invalid UTF-8, same as rust::Str. Skip just this bad config
+        // entry rather than crash the daemon -- other entries should
+        // still be checked.
+        if (!IsValidUtf8(entry.first)) continue;
         suffixes.push_back(rust::String(entry.first));
     }
     return waf_rules::match_ignore_type(src, suffixes);
@@ -644,6 +650,11 @@ bool Rules::MatchDomain(std::string &src)
     if (!IsValidUtf8(src)) return false;
     rust::Vec<rust::String> domains;
     for (auto &entry : this->domain_) {
+        // entry is an admin-configured domain string. rust::String's
+        // constructor throws std::invalid_argument on invalid UTF-8, same
+        // as rust::Str. Skip just this bad config entry rather than crash
+        // the daemon -- other domains should still be checked.
+        if (!IsValidUtf8(entry)) continue;
         domains.push_back(rust::String(entry));
     }
     return waf_rules::match_domain(src, domains);
@@ -682,6 +693,13 @@ bool Rules::MatchForceWhiteList(std::vector<std::string> &ips, std::string &path
 
             case AUTO_RULE_IP_CIDR:
             {
+                // wRule.at(j) is the rule's own configured CIDR string
+                // (admin config, not attacker input); guard against invalid
+                // UTF-8 so a bad config entry can't crash the daemon via
+                // the FFI boundary. Skip just this rule entry (break out of
+                // the switch, continuing the outer for(j...) loop) rather
+                // than aborting the whole match.
+                if (!IsValidUtf8(wRule.at(j))) break;
                 auto cidr = waf_rules::ipv4_cidr_to_network(wRule.at(j));
                 sip = std::string(cidr.network_ip);
                 mask = cidr.mask;
@@ -767,22 +785,33 @@ bool Rules::MatchBlackWhiteList(std::vector<std::string> &ips, std::string &path
 
             case AUTO_RULE_IP_CIDR:
             {
-                auto cidr = waf_rules::ipv4_cidr_to_network(bwRule.at(j));
-                sip = std::string(cidr.network_ip);
-                mask = cidr.mask;
-                for(n = 0; n < (int)ips.size(); n++)
-                {
-                    ip = ips.at(n);
-                    // ip is derived from X-Forwarded-For and may be invalid
-                    // UTF-8; skip this candidate rather than crash (there may
-                    // be other, valid IPs later in the list to check).
-                    if (!IsValidUtf8(ip)) continue;
-                    rip = std::string(waf_rules::ipv4_network_address(ip, mask));
-                    if(rip != sip) continue;
-                    sMathRet = "true";
-                    sMode = ip;
-                    sDesc = (policy.action_ == ATCTION_DROP) ? "IP黑名单" : "IP白名单";
-                    break;
+                // bwRule.at(j) is the rule's own configured CIDR string
+                // (admin config, not attacker input); guard against invalid
+                // UTF-8 so a bad config entry can't crash the daemon via
+                // the FFI boundary. Treat it as a non-match for this rule
+                // entry (leaving sMathRet/sMode/sDesc at their "false"/
+                // "default" values) rather than skipping the push_backs
+                // below outright -- mode_/desc_/bRet must stay aligned
+                // with bwRule's indexing for the boolean-expression
+                // evaluation further down.
+                if (IsValidUtf8(bwRule.at(j))) {
+                    auto cidr = waf_rules::ipv4_cidr_to_network(bwRule.at(j));
+                    sip = std::string(cidr.network_ip);
+                    mask = cidr.mask;
+                    for(n = 0; n < (int)ips.size(); n++)
+                    {
+                        ip = ips.at(n);
+                        // ip is derived from X-Forwarded-For and may be invalid
+                        // UTF-8; skip this candidate rather than crash (there may
+                        // be other, valid IPs later in the list to check).
+                        if (!IsValidUtf8(ip)) continue;
+                        rip = std::string(waf_rules::ipv4_network_address(ip, mask));
+                        if(rip != sip) continue;
+                        sMathRet = "true";
+                        sMode = ip;
+                        sDesc = (policy.action_ == ATCTION_DROP) ? "IP黑名单" : "IP白名单";
+                        break;
+                    }
                 }
                 mode.push_back(ip);
                 desc.push_back(sDesc);

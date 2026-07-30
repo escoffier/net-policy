@@ -41,6 +41,27 @@ TEST(WafRulesTest, IsIPAddressReturnsFalseOnInvalidUtf8InsteadOfCrashing) {
   EXPECT_FALSE(isIPAddress(src));
 }
 
+// Regression test for the final-review fix: MatchDomain builds a
+// rust::Vec<rust::String> from this->domain_ (admin-configured domain list,
+// pushed over the control plane) before crossing into
+// waf_rules::match_domain. rust::String's constructor throws
+// std::invalid_argument on invalid UTF-8, same as rust::Str -- previously
+// unguarded here, so a single bad config entry would crash the daemon on
+// every subsequent request. That one entry must now be skipped instead,
+// while other, valid domains in the list still get checked.
+TEST(WafRulesTest, MatchDomainSkipsInvalidUtf8ConfigEntryInsteadOfCrashing) {
+  Rules rules;
+  rules.InitRule();
+  std::string bad_domain = "evil";
+  bad_domain += '\xFF';
+  std::string good_domain = "example.org";
+  rules.AddDomain(bad_domain);
+  rules.AddDomain(good_domain);
+
+  std::string target = "example.org";
+  EXPECT_TRUE(rules.MatchDomain(target));
+}
+
 TEST(WafRulesTest, MatchIgnoreTypeChecksSuffixBeforeQueryString) {
   Rules rules;
   rules.InitRule();
@@ -71,6 +92,27 @@ TEST(WafRulesTest, MatchIgnoreTypeReturnsFalseOnInvalidUtf8SrcInsteadOfCrashing)
   std::string src = "/static/logo";
   src += '\xFF';
   EXPECT_FALSE(rules.MatchIgnoreType(src));
+}
+
+// Regression test for the final-review fix: MatchIgnoreType builds a
+// rust::Vec<rust::String> from this->ignore_ (admin-configured ignored
+// file-extension list, pushed over the control plane) before crossing into
+// waf_rules::match_ignore_type. rust::String's constructor throws
+// std::invalid_argument on invalid UTF-8, same as rust::Str -- previously
+// unguarded here, so a single bad config entry would crash the daemon on
+// every subsequent request. That one entry must now be skipped instead,
+// while other, valid suffixes in the list still get checked.
+TEST(WafRulesTest, MatchIgnoreTypeSkipsInvalidUtf8ConfigEntryInsteadOfCrashing) {
+  Rules rules;
+  rules.InitRule();
+  std::string bad_suffix = ".j";
+  bad_suffix += '\xFF';
+  std::string jpg = ".jpg";
+  rules.AddIgnoreType(bad_suffix);
+  rules.AddIgnoreType(jpg);
+
+  std::string image = "/static/logo.jpg?v=2";
+  EXPECT_TRUE(rules.MatchIgnoreType(image));
 }
 
 TEST(WafRulesTest, Pcre2RegexFindsSubstring) {
