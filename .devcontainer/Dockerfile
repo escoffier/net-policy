@@ -30,6 +30,10 @@ RUN wget https://codeload.github.com/gperftools/gperftools/tar.gz/refs/tags/gper
 RUN wget https://github.com/google/googletest/archive/refs/tags/v1.14.0.tar.gz && tar -zxvf v1.14.0.tar.gz \
   && cd googletest-1.14.0 && mkdir build && cd build && cmake .. && make && make install
 
+RUN wget -qO- https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable \
+  && echo 'export PATH="/root/.cargo/bin:$PATH"' >> /etc/bash.bashrc
+ENV PATH="/root/.cargo/bin:${PATH}"
+
 RUN wget https://github.com/nodejs/llhttp/archive/refs/tags/release/v9.0.1.tar.gz --no-check-certificate && tar -zxvf v9.0.1.tar.gz \
   && cd llhttp-release-v9.0.1 && mkdir build && cd build && cmake -DBUILD_SHARED_LIBS=OFF -DBUILD_STATIC_LIBS=ON .. && make && make install
 
