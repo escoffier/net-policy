@@ -3,3 +3,4 @@ net-rule
 include/
 .cache
 build*
+.worktrees/
