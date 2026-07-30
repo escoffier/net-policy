@@ -22,9 +22,11 @@ mod ffi {
 }
 
 fn is_ip_address(s: &str) -> bool {
-    let re = regex::Regex::new(
+    let re = regex::RegexBuilder::new(
         r"^([01]?\d\d?|2[0-4]\d|25[0-5])\.([01]?\d\d?|2[0-4]\d|25[0-5])\.([01]?\d\d?|2[0-4]\d|25[0-5])\.([01]?\d\d?|2[0-4]\d|25[0-5])$"
     )
+    .unicode(false)
+    .build()
     .expect("static IP regex is valid");
     re.is_match(s)
 }
@@ -71,5 +73,11 @@ mod tests {
         assert!(!is_ip_address("1.2.3"));
         assert!(!is_ip_address("1.2.3.4.5"));
         assert!(!is_ip_address(""));
+    }
+
+    #[test]
+    fn rejects_fullwidth_digits() {
+        // Fullwidth digit "１" (U+FF11) should be rejected, matching C++ original ASCII-only semantics
+        assert!(!is_ip_address("192.168.1.\u{FF11}"));
     }
 }
