@@ -108,8 +108,64 @@ fn match_ignore_type(path: &str, ignored_suffixes: Vec<String>) -> bool {
     }
 }
 
-fn eval_bool_expr(_expr: &str) -> bool {
-    unimplemented!()
+fn eval_bool_expr(expr: &str) -> bool {
+    let chars: Vec<char> = expr.chars().collect();
+    let mut operators: Vec<char> = Vec::new();
+    let mut operands: Vec<bool> = Vec::new();
+
+    fn reduce_one(operators: &mut Vec<char>, operands: &mut Vec<bool>) {
+        let op = operators.pop().expect("reduce_one called with empty operator stack");
+        let rhs = operands.pop().expect("missing rhs operand");
+        let lhs = operands.pop().expect("missing lhs operand");
+        operands.push(if op == '&' { lhs && rhs } else { lhs || rhs });
+    }
+
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == ' ' {
+            i += 1;
+            continue;
+        }
+        if c == '(' {
+            operators.push(c);
+        } else if c == ')' {
+            while !operators.is_empty() && *operators.last().unwrap() != '(' {
+                reduce_one(&mut operators, &mut operands);
+            }
+            if !operators.is_empty() {
+                operators.pop();
+            }
+        } else if c == '&' && chars.get(i + 1) == Some(&'&') {
+            i += 1;
+            while !operators.is_empty()
+                && *operators.last().unwrap() != '('
+                && *operators.last().unwrap() != '|'
+            {
+                reduce_one(&mut operators, &mut operands);
+            }
+            operators.push('&');
+        } else if c == '|' && chars.get(i + 1) == Some(&'|') {
+            i += 1;
+            while !operators.is_empty() && *operators.last().unwrap() != '(' {
+                reduce_one(&mut operators, &mut operands);
+            }
+            operators.push('|');
+        } else if chars[i..].starts_with(&['t', 'r', 'u', 'e']) {
+            operands.push(true);
+            i += 3;
+        } else if chars[i..].starts_with(&['f', 'a', 'l', 's', 'e']) {
+            operands.push(false);
+            i += 4;
+        }
+        i += 1;
+    }
+
+    while !operators.is_empty() {
+        reduce_one(&mut operators, &mut operands);
+    }
+
+    operands.pop().unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -246,5 +302,36 @@ mod tests {
     fn no_match_when_path_has_no_dot() {
         let ignored = vec![".jpg".to_string()];
         assert!(!match_ignore_type("/api/users", ignored));
+    }
+
+    use super::eval_bool_expr;
+
+    #[test]
+    fn evaluates_simple_and() {
+        assert!(eval_bool_expr("true&&true"));
+        assert!(!eval_bool_expr("true&&false"));
+    }
+
+    #[test]
+    fn evaluates_simple_or() {
+        assert!(eval_bool_expr("false||true"));
+        assert!(!eval_bool_expr("false||false"));
+    }
+
+    #[test]
+    fn and_binds_tighter_than_or() {
+        // true || (false && false) -> true
+        assert!(eval_bool_expr("true||false&&false"));
+    }
+
+    #[test]
+    fn respects_parentheses() {
+        // (true || false) && false -> false
+        assert!(!eval_bool_expr("(true||false)&&false"));
+    }
+
+    #[test]
+    fn tolerates_surrounding_spaces() {
+        assert!(eval_bool_expr("true && true"));
     }
 }
