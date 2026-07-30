@@ -148,6 +148,7 @@ add_executable(net_rule_test
     tests/codec_test.cc
     tests/connection_manager_test.cc
     tests/http2/codec_tests.cc
+    tests/ffi_smoke_test.cc
 )
 
 set (PRIVATE_CXX_FLAGS
@@ -211,6 +212,7 @@ ${CMAKE_THREAD_LIBS_INIT}
 libunwind.a
 liblzma.a
 libz.a
+ffi_smoke_cxxbridge
 GTest::gtest_main)
 
 include(GoogleTest)
