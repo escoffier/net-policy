@@ -34,6 +34,20 @@ include(FetchContent)
 # set(BUILD_STATIC_LIBS ON CACHE INTERNAL "")
 # FetchContent_MakeAvailable(llhttp)
 
+FetchContent_Declare(
+  Corrosion
+  GIT_REPOSITORY https://github.com/corrosion-rs/corrosion.git
+  GIT_TAG v0.5
+)
+FetchContent_MakeAvailable(Corrosion)
+
+corrosion_import_crate(MANIFEST_PATH ${CMAKE_CURRENT_SOURCE_DIR}/Cargo.toml)
+
+corrosion_add_cxxbridge(ffi_smoke_cxxbridge
+  CRATE ffi_smoke
+  FILES lib.rs
+)
+
 add_compile_definitions(GLOG_CUSTOM_PREFIX_SUPPORT)
 
 set(SOURCES
