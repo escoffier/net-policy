@@ -93,8 +93,8 @@ fn regex_first_match(pattern: &str, haystack: &str) -> ffi::RegexMatch {
     }
 }
 
-fn match_domain(_host: &str, _domains: Vec<String>) -> bool {
-    unimplemented!()
+fn match_domain(host: &str, domains: Vec<String>) -> bool {
+    domains.iter().any(|d| d == host)
 }
 
 fn match_ignore_type(_path: &str, _ignored_suffixes: Vec<String>) -> bool {
@@ -200,5 +200,24 @@ mod tests {
         let result = regex_first_match(r"\d+", "\u{FF11}");
         assert!(!result.matched);
         assert_eq!(result.value, "");
+    }
+
+    use super::match_domain;
+
+    #[test]
+    fn matches_exact_domain_in_list() {
+        let domains = vec!["example.com".to_string(), "example.org".to_string()];
+        assert!(match_domain("example.org", domains));
+    }
+
+    #[test]
+    fn does_not_match_absent_domain() {
+        let domains = vec!["example.com".to_string()];
+        assert!(!match_domain("evil.com", domains));
+    }
+
+    #[test]
+    fn empty_domain_list_never_matches() {
+        assert!(!match_domain("example.com", vec![]));
     }
 }
