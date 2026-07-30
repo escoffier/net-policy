@@ -60,8 +60,18 @@ fn ipv4_cidr_to_network(cidr: &str) -> ffi::CidrNetwork {
     }
 }
 
-fn regex_first_match(_pattern: &str, _haystack: &str) -> ffi::RegexMatch {
-    unimplemented!()
+fn regex_first_match(pattern: &str, haystack: &str) -> ffi::RegexMatch {
+    let re = match regex::Regex::new(pattern) {
+        Ok(re) => re,
+        Err(e) => {
+            eprintln!("waf_rules_core: pattern failed to compile, treating as no-match: {pattern:?}: {e}");
+            return ffi::RegexMatch { matched: false, value: String::new() };
+        }
+    };
+    match re.find(haystack) {
+        Some(m) => ffi::RegexMatch { matched: true, value: m.as_str().to_string() },
+        None => ffi::RegexMatch { matched: false, value: String::new() },
+    }
 }
 
 fn match_domain(_host: &str, _domains: Vec<String>) -> bool {
@@ -134,5 +144,30 @@ mod tests {
         let result = ipv4_cidr_to_network("10.1.2.3");
         assert_eq!(result.network_ip, "10.1.2.3");
         assert_eq!(result.mask, 32);
+    }
+
+    use super::regex_first_match;
+
+    #[test]
+    fn finds_first_match() {
+        let result = regex_first_match(r"\d+", "abc123def456");
+        assert!(result.matched);
+        assert_eq!(result.value, "123");
+    }
+
+    #[test]
+    fn reports_no_match() {
+        let result = regex_first_match(r"\d+", "no digits here");
+        assert!(!result.matched);
+        assert_eq!(result.value, "");
+    }
+
+    #[test]
+    fn invalid_pattern_fails_closed_instead_of_panicking() {
+        // Backreferences aren't supported by the `regex` crate — this is
+        // exactly the PCRE-incompatible case flagged in the Phase 1 preamble.
+        let result = regex_first_match(r"(a)\1", "aa");
+        assert!(!result.matched);
+        assert_eq!(result.value, "");
     }
 }
