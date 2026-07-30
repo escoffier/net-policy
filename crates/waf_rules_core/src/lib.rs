@@ -97,8 +97,15 @@ fn match_domain(host: &str, domains: Vec<String>) -> bool {
     domains.iter().any(|d| d == host)
 }
 
-fn match_ignore_type(_path: &str, _ignored_suffixes: Vec<String>) -> bool {
-    unimplemented!()
+fn match_ignore_type(path: &str, ignored_suffixes: Vec<String>) -> bool {
+    let before_query = path.split('?').next().unwrap_or("");
+    match before_query.rfind('.') {
+        None => false,
+        Some(pos) => {
+            let suffix = &before_query[pos..];
+            ignored_suffixes.iter().any(|s| s == suffix)
+        }
+    }
 }
 
 fn eval_bool_expr(_expr: &str) -> bool {
@@ -219,5 +226,25 @@ mod tests {
     #[test]
     fn empty_domain_list_never_matches() {
         assert!(!match_domain("example.com", vec![]));
+    }
+
+    use super::match_ignore_type;
+
+    #[test]
+    fn matches_ignored_suffix_before_query_string() {
+        let ignored = vec![".jpg".to_string(), ".png".to_string()];
+        assert!(match_ignore_type("/static/logo.jpg?v=2", ignored));
+    }
+
+    #[test]
+    fn no_match_when_suffix_not_ignored() {
+        let ignored = vec![".jpg".to_string()];
+        assert!(!match_ignore_type("/api/users.json", ignored));
+    }
+
+    #[test]
+    fn no_match_when_path_has_no_dot() {
+        let ignored = vec![".jpg".to_string()];
+        assert!(!match_ignore_type("/api/users", ignored));
     }
 }
