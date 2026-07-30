@@ -2,5 +2,5 @@
 net-rule
 include/
 .cache
-build*
+/build*
 .worktrees/
