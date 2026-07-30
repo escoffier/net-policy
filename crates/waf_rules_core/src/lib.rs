@@ -38,6 +38,20 @@ fn ipv4_network_address(ip: &str, mask: u8) -> String {
         return String::new();
     }
     let ip_bits = (octets[0] << 24) | (octets[1] << 16) | (octets[2] << 8) | octets[3];
+    // NOTE on /0 semantics (behavior change from the old C++, intentional):
+    // for mask == 0 this yields mask_bits == 0, so the "network address" is
+    // always 0.0.0.0 -- i.e. a /0 CIDR entry matches every IP. That is the
+    // semantically correct interpretation of /0. The OLD C++ code computed
+    // `0xFFFFFFFFU << (32 - 0)`, a shift-by-32, which is undefined behavior
+    // in C++: on some platforms/compilers the shift silently no-ops (mask
+    // stays 0xFFFFFFFF, so a "/0" entry only ever matched the single literal
+    // IP), on others it produces 0 (matching everyone, same as here). So this
+    // Rust behavior is more correct, but for a whitelist/force-white-list
+    // "/0" entry specifically, it is a real, deliberate behavior change: on
+    // platforms where the old UB happened to leave the mask at 0xFFFFFFFF,
+    // this widens the match from "one IP" to "everyone" (the bypass-widening
+    // direction). Tracked as a documented, accepted deviation -- see
+    // progress.md's ledger entry for the final-review fix wave.
     let mask_bits: u32 = if mask == 0 { 0 } else { 0xFFFF_FFFFu32 << (32 - mask as u32) };
     let network = ip_bits & mask_bits;
     format!(
@@ -76,9 +90,19 @@ fn ipv4_cidr_to_network(cidr: &str) -> ffi::CidrNetwork {
 //
 // Separately, note this function takes `&str`, which requires valid UTF-8;
 // attacker-controlled HTTP bytes are not guaranteed to be valid UTF-8. That
-// byte-vs-UTF8-validity boundary problem is intentionally left unaddressed
-// here — it belongs to the FFI call-site design in Task 12/13, not to this
-// function's internal matching semantics.
+// byte-vs-UTF8-validity boundary problem is handled at the C++ call sites
+// (waf/rule.cc's `IsValidUtf8` guard, added in the final-review fix wave),
+// not in this function's internal matching semantics.
+//
+// Also note an intentional behavior difference from the old PCRE2 call:
+// PCRE2 was invoked with `PCRE2_ZERO_TERMINATED`, so it treated the pattern
+// as a C string and stopped at the first embedded NUL byte -- a known WAF
+// evasion technique (payload after a NUL was invisible to the old matcher).
+// `haystack`/`pattern` here are Rust `&str`/String, which carry an explicit
+// length and have no special meaning for embedded NULs, so this version
+// scans the full string including any embedded NUL bytes. This is a
+// security improvement (it closes that evasion path), not a regression, but
+// it is a real, deliberate change in observable matching behavior.
 fn regex_first_match(pattern: &str, haystack: &str) -> ffi::RegexMatch {
     let re = match regex::RegexBuilder::new(pattern).unicode(false).build() {
         Ok(re) => re,

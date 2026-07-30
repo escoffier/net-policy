@@ -11,6 +11,22 @@
 #include "log.h"
 #include "waf_rules_core_cxxbridge/lib.h"
 
+namespace {
+// rust::Str requires valid UTF-8 and throws std::invalid_argument otherwise.
+// Attacker-controlled HTTP bytes (path, Host, X-Forwarded-For, request
+// body) carry no such guarantee, so every FFI call taking one must fail
+// closed (treat as no-match) rather than let the exception escape
+// uncaught and crash the daemon via std::terminate.
+inline bool IsValidUtf8(const std::string &s) {
+    try {
+        (void)rust::Str(s);
+        return true;
+    } catch (const std::invalid_argument &) {
+        return false;
+    }
+}
+}  // namespace
+
 /*
 std::string GetNowTime()
 {
@@ -131,6 +147,7 @@ int64_t GetNowTime()
 
 bool isIPAddress(const std::string& str)
 {
+    if (!IsValidUtf8(str)) return false;
     return waf_rules::is_ip_address(str);
 }
 
@@ -589,25 +606,29 @@ void Rules::AddBlackWhiteList(BWList &bw)
     }
 }
 
-/*pcre2 match — returns matched substring, or nullopt on no match*/
+/*regex match — name kept for API stability; no longer backed by PCRE2, now
+  dispatches to waf_rules_core (Rust, via regex_first_match). Returns matched
+  substring, or nullopt on no match.*/
 std::optional<std::string> Rules::Pcre2Regex(std::uint64_t id, std::string &expr, std::string &src)
 {
-    try {
-        auto result = waf_rules::regex_first_match(expr, src);
-        if (!result.matched) {
-            return std::nullopt;
-        }
-        return std::string(result.value);
-    } catch (const std::invalid_argument &) {
-        // expr or src contains invalid UTF-8 (e.g. a raw non-UTF8 byte in an
-        // HTTP header/body); rust::Str's UTF-8 validation throws here.
-        // Treat as no-match rather than crashing the daemon.
+    // expr or src may contain invalid UTF-8 (e.g. a raw non-UTF8 byte in an
+    // HTTP header/body); rust::Str's UTF-8 validation would throw here.
+    // Treat as no-match rather than crashing the daemon.
+    if (!IsValidUtf8(expr) || !IsValidUtf8(src)) {
         return std::nullopt;
     }
+    auto result = waf_rules::regex_first_match(expr, src);
+    if (!result.matched) {
+        return std::nullopt;
+    }
+    return std::string(result.value);
 }
 
 bool Rules::MatchIgnoreType(std::string &src)
 {
+    // src is the (attacker-controlled) request path; guard against invalid
+    // UTF-8 before crossing the FFI boundary. See IsValidUtf8's comment.
+    if (!IsValidUtf8(src)) return false;
     rust::Vec<rust::String> suffixes;
     for (auto &entry : this->ignore_) {
         suffixes.push_back(rust::String(entry.first));
@@ -618,6 +639,9 @@ bool Rules::MatchIgnoreType(std::string &src)
 /*match ignore type*/
 bool Rules::MatchDomain(std::string &src)
 {
+    // src is the (attacker-controlled) Host/authority header; guard against
+    // invalid UTF-8 before crossing the FFI boundary. See IsValidUtf8's comment.
+    if (!IsValidUtf8(src)) return false;
     rust::Vec<rust::String> domains;
     for (auto &entry : this->domain_) {
         domains.push_back(rust::String(entry));
@@ -664,6 +688,10 @@ bool Rules::MatchForceWhiteList(std::vector<std::string> &ips, std::string &path
                 for(n = 0; n < (int)ips.size(); n++)
                 {
                     ip = ips.at(n);
+                    // ip is derived from X-Forwarded-For and may be invalid
+                    // UTF-8; skip this candidate rather than crash (there may
+                    // be other, valid IPs later in the list to check).
+                    if (!IsValidUtf8(ip)) continue;
                     rip = std::string(waf_rules::ipv4_network_address(ip, mask));
                     if(rip != sip) continue;
                     policy = this->force_white_list_.at(i);
@@ -745,6 +773,10 @@ bool Rules::MatchBlackWhiteList(std::vector<std::string> &ips, std::string &path
                 for(n = 0; n < (int)ips.size(); n++)
                 {
                     ip = ips.at(n);
+                    // ip is derived from X-Forwarded-For and may be invalid
+                    // UTF-8; skip this candidate rather than crash (there may
+                    // be other, valid IPs later in the list to check).
+                    if (!IsValidUtf8(ip)) continue;
                     rip = std::string(waf_rules::ipv4_network_address(ip, mask));
                     if(rip != sip) continue;
                     sMathRet = "true";
@@ -779,15 +811,11 @@ bool Rules::MatchBlackWhiteList(std::vector<std::string> &ips, std::string &path
                 {
                     if(path.length() == 0) break;
                     data = split(path, "?");
-                    try {
-                        if (!waf_rules::regex_first_match(bwRule.at(j), data.at(0)).matched) break;
-                    } catch (const std::invalid_argument &) {
-                        // bwRule.at(j) or data.at(0) contains invalid UTF-8
-                        // (e.g. a raw non-UTF8 byte in the HTTP request
-                        // path); rust::Str's UTF-8 validation throws here.
-                        // Treat as no-match rather than crashing the daemon.
-                        break;
-                    }
+                    // bwRule.at(j) or data.at(0) may contain invalid UTF-8
+                    // (e.g. a raw non-UTF8 byte in the HTTP request path);
+                    // treat as no-match rather than crashing the daemon.
+                    if (!IsValidUtf8(bwRule.at(j)) || !IsValidUtf8(data.at(0))) break;
+                    if (!waf_rules::regex_first_match(bwRule.at(j), data.at(0)).matched) break;
                     sMathRet = "true";
                     sMode = path;
                     sDesc = (policy.action_ == ATCTION_DROP) ? "路径黑名单" : "路径白名单";
@@ -867,7 +895,14 @@ bool Rules::MatchBlackWhiteList(std::vector<std::string> &ips, std::string &path
             }
         }
         /*eval*/
-        if(waf_rules::eval_bool_expr(expr)) return true;
+        // expr is built from policy.oprexpr_ (admin-config-derived, not
+        // directly attacker-controlled) plus "true"/"false" tokens; still
+        // guard for defense-in-depth so a malformed config can't crash the
+        // daemon via the FFI UTF-8 check. This only covers the UTF-8 case --
+        // eval_bool_expr's separate internal panic risk on unbalanced
+        // &&/|| structure is a tracked, deliberately deferred follow-up
+        // (see progress.md), out of scope here.
+        if(IsValidUtf8(expr) && waf_rules::eval_bool_expr(expr)) return true;
     }
     /*return*/
     return false;

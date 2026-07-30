@@ -132,7 +132,10 @@ public:
     std::vector<std::string> GetDetectHeaders() { return detect_header_; }
     /*get default action*/
     uint8_t GetDefAction() { return def_action_; }
-    /*pcre2 match — returns matched substring, or nullopt on no match*/
+    /*regex match — name kept for API stability; no longer backed by PCRE2,
+      now dispatches to waf_rules_core (Rust, via regex_first_match).
+      Returns matched substring, or nullopt on no match (including when
+      expr/src is not valid UTF-8).*/
     std::optional<std::string> Pcre2Regex(std::uint64_t id, std::string &expr, std::string &src);
     /*match ignore type*/
     bool MatchIgnoreType(std::string &src);
