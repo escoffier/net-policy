@@ -1,4 +1,3 @@
-#define PCRE2_CODE_UNIT_WIDTH 8
 #include <regex>
 #include <sstream>
 #include <iomanip>
@@ -6,10 +5,10 @@
 #include <iostream>
 #include <chrono>
 #include <stack>
-#include <pcre2.h>
 #include "rule.h"
 #include "net-policy.h"
 #include "log.h"
+#include "waf_rules_core_cxxbridge/lib.h"
 
 /*
 std::string GetNowTime()
@@ -246,11 +245,7 @@ int64_t GetNowTime()
 
 bool isIPAddress(const std::string& str)
 {
-    std::regex pattern("^([01]?\\d\\d?|2[0-4]\\d|25[0-5])\\."
-                      "([01]?\\d\\d?|2[0-4]\\d|25[0-5])\\."
-                      "([01]?\\d\\d?|2[0-4]\\d|25[0-5])\\."
-                      "([01]?\\d\\d?|2[0-4]\\d|25[0-5])$");
-    return std::regex_match(str, pattern);
+    return waf_rules::is_ip_address(str);
 }
 
 std::string calculateNetworkAddress(std::string ipAddress, int subnetMask) {
@@ -752,70 +747,30 @@ void Rules::AddBlackWhiteList(BWList &bw)
 /*pcre2 match — returns matched substring, or nullopt on no match*/
 std::optional<std::string> Rules::Pcre2Regex(std::uint64_t id, std::string &expr, std::string &src)
 {
-    std::optional<std::string> result;
-    pcre2_code *re = nullptr;
-    PCRE2_UCHAR buffer[256];
-    int errorcode, rc;
-    PCRE2_SIZE erroroffset;
-    PCRE2_SPTR substring_start = nullptr;
-    PCRE2_SIZE substring_length = 0, *ovector;
-    PCRE2_SPTR pattern = (PCRE2_SPTR)expr.c_str();
-    PCRE2_SPTR input   = (PCRE2_SPTR)src.c_str();
-    // 编译正则表达式
-    re = pcre2_compile(pattern, PCRE2_ZERO_TERMINATED, 0, &errorcode, &erroroffset, NULL);
-    if(!re)
-    {
-        pcre2_get_error_message(errorcode, buffer, sizeof(buffer));
-        LOG_E("PCRE2 compilation failed, id : %lu, erroroffset : %d, error : %s, number : %d",
-              id, (int)erroroffset, (char *)buffer, errorcode);
+    auto result = waf_rules::regex_first_match(expr, src);
+    if (!result.matched) {
         return std::nullopt;
     }
-    // 匹配正则表达式
-    pcre2_match_data *match_data = pcre2_match_data_create_from_pattern(re, NULL);
-    if(!match_data)
-    {
-        LOG_E("PCRE2 match data create from pattern failed, id : %lu", id);
-        goto end;
-    }
-    ovector = pcre2_get_ovector_pointer(match_data);
-    rc = pcre2_match(re, input, PCRE2_ZERO_TERMINATED, 0, 0, match_data, NULL);
-    while (rc > 0)
-    {
-        for (int i = 0; i < rc; i++)
-        {
-            substring_start  = input + ovector[2 * i];
-            substring_length = ovector[2 * i + 1] - ovector[2 * i];
-            result = std::string(reinterpret_cast<const char*>(substring_start), substring_length);
-            goto end;
-        }
-        input = substring_start + substring_length;
-        rc = pcre2_match(re, input, PCRE2_ZERO_TERMINATED, 0, 0, match_data, NULL);
-        ovector = pcre2_get_ovector_pointer(match_data);
-    }
-end:
-    if(match_data) pcre2_match_data_free(match_data);
-    if(re) pcre2_code_free(re);
-    return result;
+    return std::string(result.value);
 }
 
 bool Rules::MatchIgnoreType(std::string &src)
 {
-    auto value = split(src, "?");
-    auto pos = value.at(0).rfind(".");
-    if(pos == std::string::npos) return false;
-    auto data = value.at(0).substr(pos);
-    auto it = this->ignore_.find(data);
-    return (it == this->ignore_.end()) ? false : true;
+    rust::Vec<rust::String> suffixes;
+    for (auto &entry : this->ignore_) {
+        suffixes.push_back(rust::String(entry.first));
+    }
+    return waf_rules::match_ignore_type(src, suffixes);
 }
 
 /*match ignore type*/
 bool Rules::MatchDomain(std::string &src)
 {
-    for(int i = 0; i < (int)this->domain_.size(); i++)
-    {
-        if(src == this->domain_.at(i)) return true;
+    rust::Vec<rust::String> domains;
+    for (auto &entry : this->domain_) {
+        domains.push_back(rust::String(entry));
     }
-    return false;
+    return waf_rules::match_domain(src, domains);
 }
 
 /*match force white list*/
