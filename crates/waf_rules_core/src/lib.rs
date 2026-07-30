@@ -32,6 +32,7 @@ fn is_ip_address(s: &str) -> bool {
 }
 
 fn ipv4_network_address(ip: &str, mask: u8) -> String {
+    let mask = mask.min(32);
     let octets: Vec<u32> = ip.split('.').map(|s| s.parse().unwrap_or(0)).collect();
     if octets.len() != 4 {
         return String::new();
@@ -106,6 +107,19 @@ mod tests {
         assert_eq!(ipv4_network_address("192.168.1.55", 24), "192.168.1.0");
         assert_eq!(ipv4_network_address("10.0.5.9", 8), "10.0.0.0");
         assert_eq!(ipv4_network_address("172.16.0.1", 32), "172.16.0.1");
+    }
+
+    #[test]
+    fn network_address_handles_zero_mask() {
+        // mask=0 should zero out all bits
+        assert_eq!(ipv4_network_address("192.168.1.55", 0), "0.0.0.0");
+    }
+
+    #[test]
+    fn network_address_clamps_out_of_range_masks() {
+        // mask > 32 should be clamped to 32 (full address match)
+        assert_eq!(ipv4_network_address("192.168.1.55", 33), "192.168.1.55");
+        assert_eq!(ipv4_network_address("192.168.1.55", 255), "192.168.1.55");
     }
 
     #[test]
