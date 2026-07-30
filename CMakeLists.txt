@@ -48,6 +48,11 @@ corrosion_add_cxxbridge(ffi_smoke_cxxbridge
   FILES lib.rs
 )
 
+corrosion_add_cxxbridge(waf_rules_core_cxxbridge
+  CRATE waf_rules_core
+  FILES lib.rs
+)
+
 add_compile_definitions(GLOG_CUSTOM_PREFIX_SUPPORT)
 
 set(SOURCES
@@ -181,6 +186,7 @@ target_link_libraries(net-rule
   libtcmalloc_and_profiler.a
   gRPC::grpc++
   protobuf::libprotobuf
+  waf_rules_core_cxxbridge
 )
 
 # target_link_libraries(net-rule 
@@ -277,6 +283,7 @@ target_link_libraries(net_rule_grpc_test
   libtcmalloc_and_profiler.a
   gRPC::grpc++
   protobuf::libprotobuf
+  waf_rules_core_cxxbridge
   GTest::gtest_main)
 gtest_discover_tests(net_rule_grpc_test)
 
