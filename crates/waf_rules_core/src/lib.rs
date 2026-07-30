@@ -60,8 +60,27 @@ fn ipv4_cidr_to_network(cidr: &str) -> ffi::CidrNetwork {
     }
 }
 
+// The C++ original (`Rules::Pcre2Regex`, waf/rule.cc:765) compiles patterns
+// via `pcre2_compile(pattern, PCRE2_ZERO_TERMINATED, 0, ...)` — the options
+// argument is 0, so neither PCRE2_UTF nor PCRE2_UCP is set. Without those,
+// PCRE2 runs in ASCII-only byte mode: `\d`/`\w`/`\s` match ASCII characters
+// only, not the broader set of Unicode codepoints Rust's `regex` crate
+// treats as digits/word-chars/whitespace by default. `.unicode(false)`
+// reproduces that ASCII-only behavior so a WAF pattern (blacklist or
+// whitelist) matches the same bytes here as it would have under the real
+// PCRE2 call site. This function backs both `MatchBlackWhiteList`'s deny
+// list and its whitelist/bypass path (Task 13) — for a whitelist,
+// over-matching under Unicode-aware defaults would let a crafted non-ASCII
+// payload (e.g. a fullwidth digit) satisfy a pattern that wouldn't have
+// matched under real PCRE2, silently widening what bypasses WAF inspection.
+//
+// Separately, note this function takes `&str`, which requires valid UTF-8;
+// attacker-controlled HTTP bytes are not guaranteed to be valid UTF-8. That
+// byte-vs-UTF8-validity boundary problem is intentionally left unaddressed
+// here — it belongs to the FFI call-site design in Task 12/13, not to this
+// function's internal matching semantics.
 fn regex_first_match(pattern: &str, haystack: &str) -> ffi::RegexMatch {
-    let re = match regex::Regex::new(pattern) {
+    let re = match regex::RegexBuilder::new(pattern).unicode(false).build() {
         Ok(re) => re,
         Err(e) => {
             eprintln!("waf_rules_core: pattern failed to compile, treating as no-match: {pattern:?}: {e}");
@@ -167,6 +186,18 @@ mod tests {
         // Backreferences aren't supported by the `regex` crate — this is
         // exactly the PCRE-incompatible case flagged in the Phase 1 preamble.
         let result = regex_first_match(r"(a)\1", "aa");
+        assert!(!result.matched);
+        assert_eq!(result.value, "");
+    }
+
+    #[test]
+    fn rejects_fullwidth_digit_as_ascii_only_digit_class() {
+        // Fullwidth digit "１" (U+FF11) must NOT satisfy `\d`, matching the
+        // real PCRE2 call site's ASCII-only byte-mode semantics (no
+        // PCRE2_UTF/PCRE2_UCP set). A Unicode-aware `\d` would wrongly match
+        // this, which for a WAF whitelist pattern would let a crafted
+        // non-ASCII payload bypass inspection that real PCRE2 would reject.
+        let result = regex_first_match(r"\d+", "\u{FF11}");
         assert!(!result.matched);
         assert_eq!(result.value, "");
     }
