@@ -147,8 +147,27 @@ fn eval_bool_expr(expr: &str) -> bool {
             operators.push('&');
         } else if c == '|' && chars.get(i + 1) == Some(&'|') {
             i += 1;
+            // Intentionally replicates a real bug in the C++ original's `||`
+            // branch (waf/rule.cc:130-142): its drain loop doesn't check which
+            // operator character it actually popped off the stack before
+            // combining — it always applies `||`, even when the popped
+            // operator was `&`. That means an unparenthesized `A && B || C`
+            // shape gets the pending `&&` group combined with `||` semantics
+            // instead of `&&`, breaking normal boolean operator precedence
+            // (e.g. `eval("true&&false||false")` returns `true` in production
+            // C++, not the mathematically correct `false`). We deliberately
+            // reproduce that here — via an inlined drain that always does
+            // `lhs || rhs` instead of calling `reduce_one` (which would
+            // correctly dispatch on the popped operator) — to preserve
+            // bug-for-bug behavioral parity during this migration. A fix to
+            // the underlying bug is intentionally deferred to a separate,
+            // deliberate, reviewed follow-up change, not folded in silently
+            // here.
             while !operators.is_empty() && *operators.last().unwrap() != '(' {
-                reduce_one(&mut operators, &mut operands);
+                operators.pop();
+                let rhs = operands.pop().expect("missing rhs operand");
+                let lhs = operands.pop().expect("missing lhs operand");
+                operands.push(lhs || rhs);
             }
             operators.push('|');
         } else if chars[i..].starts_with(&['t', 'r', 'u', 'e']) {
@@ -333,5 +352,16 @@ mod tests {
     #[test]
     fn tolerates_surrounding_spaces() {
         assert!(eval_bool_expr("true && true"));
+    }
+
+    #[test]
+    fn replicates_cpp_precedence_bug_for_and_before_or() {
+        // C++'s eval() has a real bug here: an unparenthesized "A && B || C"
+        // combines the pending && group with || semantics instead of &&,
+        // because the || branch's drain loop doesn't check which operator
+        // it popped. This is intentionally replicated for migration parity
+        // — see waf/rule.cc:130-142 for the buggy original and the tracked
+        // follow-up to fix it in a separate, deliberate change.
+        assert!(eval_bool_expr("true&&false||false")); // buggy C++ gives true; correct would be false
     }
 }
