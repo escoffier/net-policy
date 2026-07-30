@@ -5,6 +5,7 @@
 #include <iostream>
 #include <chrono>
 #include <stack>
+#include <stdexcept>
 #include "rule.h"
 #include "net-policy.h"
 #include "log.h"
@@ -591,11 +592,18 @@ void Rules::AddBlackWhiteList(BWList &bw)
 /*pcre2 match — returns matched substring, or nullopt on no match*/
 std::optional<std::string> Rules::Pcre2Regex(std::uint64_t id, std::string &expr, std::string &src)
 {
-    auto result = waf_rules::regex_first_match(expr, src);
-    if (!result.matched) {
+    try {
+        auto result = waf_rules::regex_first_match(expr, src);
+        if (!result.matched) {
+            return std::nullopt;
+        }
+        return std::string(result.value);
+    } catch (const std::invalid_argument &) {
+        // expr or src contains invalid UTF-8 (e.g. a raw non-UTF8 byte in an
+        // HTTP header/body); rust::Str's UTF-8 validation throws here.
+        // Treat as no-match rather than crashing the daemon.
         return std::nullopt;
     }
-    return std::string(result.value);
 }
 
 bool Rules::MatchIgnoreType(std::string &src)
@@ -771,7 +779,15 @@ bool Rules::MatchBlackWhiteList(std::vector<std::string> &ips, std::string &path
                 {
                     if(path.length() == 0) break;
                     data = split(path, "?");
-                    if (!waf_rules::regex_first_match(bwRule.at(j), data.at(0)).matched) break;
+                    try {
+                        if (!waf_rules::regex_first_match(bwRule.at(j), data.at(0)).matched) break;
+                    } catch (const std::invalid_argument &) {
+                        // bwRule.at(j) or data.at(0) contains invalid UTF-8
+                        // (e.g. a raw non-UTF8 byte in the HTTP request
+                        // path); rust::Str's UTF-8 validation throws here.
+                        // Treat as no-match rather than crashing the daemon.
+                        break;
+                    }
                     sMathRet = "true";
                     sMode = path;
                     sDesc = (policy.action_ == ATCTION_DROP) ? "路径黑名单" : "路径白名单";
