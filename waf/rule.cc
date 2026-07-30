@@ -63,121 +63,6 @@ std::string getRuleVaule(std::string str)
 	return value;
 }
 
-/*eval*/
-bool eval(const std::string& expression) {
-    char op;
-    std::stack<char> operators;
-    std::stack<bool> operands;
-
-    for (size_t i = 0; i < expression.length(); i++)
-    {
-        char c = expression[i];
-
-        if (c == ' ') continue;
-
-        if (c == '(')
-        {
-            operators.push(c);
-        }
-        else if (c == ')')
-        {
-            while (!operators.empty() && operators.top() != '(')
-            {
-                op = operators.top();
-                operators.pop();
-
-                bool op2 = operands.top();
-                operands.pop();
-
-                bool op1 = operands.top();
-                operands.pop();
-
-                bool result;
-                if (op == '&')
-                    result = op1 && op2;
-                else if (op == '|')
-                    result = op1 || op2;
-
-                operands.push(result);
-            }
-
-            if (!operators.empty()) operators.pop();
-        }
-        else if (c == '&' && i + 1 < expression.length() && expression[i + 1] == '&')
-        {
-            i++;
-            while (!operators.empty() && operators.top() != '(' && operators.top() != '|')
-            {
-                operators.pop();
-
-                bool op2 = operands.top();
-                operands.pop();
-
-                bool op1 = operands.top();
-                operands.pop();
-
-                bool result = op1 && op2;
-
-                operands.push(result);
-            }
-
-            operators.push('&');
-        }
-        else if (c == '|' && i + 1 < expression.length() && expression[i + 1] == '|')
-        {
-            i++;
-            while (!operators.empty() && operators.top() != '(')
-            {
-                operators.pop();
-
-                bool op2 = operands.top();
-                operands.pop();
-
-                bool op1 = operands.top();
-                operands.pop();
-
-                bool result = op1 || op2;
-
-                operands.push(result);
-            }
-
-            operators.push('|');
-        }
-        else if (c == 't' && i + 3 < expression.length() && expression.substr(i, 4) == "true")
-        {
-            operands.push(true);
-            i += 3;
-        }
-        else if (c == 'f' && i + 4 < expression.length() && expression.substr(i, 5) == "false")
-        {
-            operands.push(false);
-            i += 4;
-        }
-    }
-
-    while (!operators.empty())
-    {
-        op = operators.top();
-        operators.pop();
-
-        bool op2 = operands.top();
-        operands.pop();
-
-        bool op1 = operands.top();
-        operands.pop();
-
-        bool result;
-        if (op == '&')
-            result = op1 && op2;
-        else if (op == '|')
-            result = op1 || op2;
-
-        operands.push(result);
-    }
-
-    return operands.top();
-}
-
 int CountSubstr(const std::string& str, const std::string subStr)
 {
     int count = 0;
@@ -246,47 +131,6 @@ int64_t GetNowTime()
 bool isIPAddress(const std::string& str)
 {
     return waf_rules::is_ip_address(str);
-}
-
-std::string calculateNetworkAddress(std::string ipAddress, int subnetMask) {
-    // 将IP地址字符串拆分为四个部分
-    std::stringstream ss(ipAddress);
-    std::string segment;
-    int octets[4] = {0};
-    int i = 0;
-    while (std::getline(ss, segment, '.')) {
-        octets[i++] = std::stoi(segment);
-    }
-    
-    // 计算网络地址
-    uint32_t ip = (octets[0] << 24) | (octets[1] << 16) | (octets[2] << 8) | octets[3];
-    uint32_t subnetMaskBits = (0xFFFFFFFFU << (32 - subnetMask));
-    uint32_t networkAddress = ip & subnetMaskBits;
-    
-    // 将网络地址转换回字符串形式
-    std::stringstream networkAddressSS;
-    networkAddressSS << ((networkAddress >> 24) & 0xFF) << "." 
-                     << ((networkAddress >> 16) & 0xFF) << "." 
-                     << ((networkAddress >> 8) & 0xFF) << "." 
-                     << (networkAddress & 0xFF);
-    
-    return networkAddressSS.str();
-}
-
-std::string ipv4CidrToIp(std::string cidr, int &mask)
-{
-    size_t index;
-    std::string sip, smask;
-    smask = "32";
-    sip = cidr;
-    index = cidr.find("/");
-    if(index != std::string::npos)
-    {
-        sip = cidr.substr(0, index);
-        smask = cidr.substr(index + 1);
-    }
-    mask = atoi(smask.c_str());
-    return calculateNetworkAddress(sip, mask);   
 }
 
 std::string SaveHeadersInfo(AttackedLog &r, std::unordered_map<std::string, std::string> &pairs)
@@ -805,17 +649,21 @@ bool Rules::MatchForceWhiteList(std::vector<std::string> &ips, std::string &path
                 break;
 
             case AUTO_RULE_IP_CIDR:
-                sip = ipv4CidrToIp(wRule.at(j), mask);
+            {
+                auto cidr = waf_rules::ipv4_cidr_to_network(wRule.at(j));
+                sip = std::string(cidr.network_ip);
+                mask = cidr.mask;
                 for(n = 0; n < (int)ips.size(); n++)
                 {
                     ip = ips.at(n);
-                    rip = calculateNetworkAddress(ip, mask);
+                    rip = std::string(waf_rules::ipv4_network_address(ip, mask));
                     if(rip != sip) continue;
                     policy = this->force_white_list_.at(i);
                     policy.mode_ = ip;
                     return true;
                 }
                 break;
+            }
 
             default:
                 break;
@@ -882,11 +730,14 @@ bool Rules::MatchBlackWhiteList(std::vector<std::string> &ips, std::string &path
                 break;
 
             case AUTO_RULE_IP_CIDR:
-                sip = ipv4CidrToIp(bwRule.at(j), mask);
+            {
+                auto cidr = waf_rules::ipv4_cidr_to_network(bwRule.at(j));
+                sip = std::string(cidr.network_ip);
+                mask = cidr.mask;
                 for(n = 0; n < (int)ips.size(); n++)
                 {
                     ip = ips.at(n);
-                    rip = calculateNetworkAddress(ip, mask);
+                    rip = std::string(waf_rules::ipv4_network_address(ip, mask));
                     if(rip != sip) continue;
                     sMathRet = "true";
                     sMode = ip;
@@ -897,6 +748,7 @@ bool Rules::MatchBlackWhiteList(std::vector<std::string> &ips, std::string &path
                 desc.push_back(sDesc);
                 bRet.push_back(sMathRet);
                 break;
+            }
 
             case AUTO_RULE_PATH_EQUAL:
                 for(n = 0; n < 1; n++)
@@ -919,7 +771,7 @@ bool Rules::MatchBlackWhiteList(std::vector<std::string> &ips, std::string &path
                 {
                     if(path.length() == 0) break;
                     data = split(path, "?");
-                    if (!std::regex_search(data.at(0), std::regex(bwRule.at(j)))) break;
+                    if (!waf_rules::regex_first_match(bwRule.at(j), data.at(0)).matched) break;
                     sMathRet = "true";
                     sMode = path;
                     sDesc = (policy.action_ == ATCTION_DROP) ? "路径黑名单" : "路径白名单";
@@ -999,7 +851,7 @@ bool Rules::MatchBlackWhiteList(std::vector<std::string> &ips, std::string &path
             }
         }
         /*eval*/
-        if(eval(expr)) return true;
+        if(waf_rules::eval_bool_expr(expr)) return true;
     }
     /*return*/
     return false;
