@@ -54,6 +54,12 @@ mod ffi {
             queue: *mut GrpcDispatchQueue,
             pod_ips: Vec<String>,
         ) -> bool;
+
+        unsafe fn GrpcDispatchDumpHeapProfile(
+            daemon: *mut DaemonContext,
+            queue: *mut GrpcDispatchQueue,
+            enable: bool,
+        ) -> i32;
     }
 
     extern "Rust" {
@@ -169,9 +175,15 @@ impl NetPolicyControl for ControlServiceImpl {
 
     async fn dump_heap_profile(
         &self,
-        _request: Request<DumpHeapProfileRequest>,
+        request: Request<DumpHeapProfileRequest>,
     ) -> Result<Response<StatusResponse>, Status> {
-        Err(Status::unimplemented("DumpHeapProfile not yet implemented"))
+        let req = request.into_inner();
+        let status = tokio::task::spawn_blocking(move || unsafe {
+            ffi::GrpcDispatchDumpHeapProfile(daemon_ptr(), queue_ptr(), req.enable)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("dispatch task panicked: {e}")))?;
+        Ok(Response::new(StatusResponse { status, uuid: String::new() }))
     }
 
     async fn dump_config(

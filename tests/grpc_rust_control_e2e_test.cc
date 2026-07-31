@@ -169,4 +169,14 @@ TEST_F(GrpcRustControlEndToEndTest, DeleteWafRuleForUnknownPodReturnsZeroStatus)
   EXPECT_EQ(resp.status(), 0);
 }
 
+TEST_F(GrpcRustControlEndToEndTest, DumpHeapProfileDisableReturnsOkStatus) {
+  grpc::ClientContext ctx;
+  netpolicy::v1::DumpHeapProfileRequest req;
+  req.set_enable(false);
+  netpolicy::v1::StatusResponse resp;
+  grpc::Status status = stub_->DumpHeapProfile(&ctx, req, &resp);
+  ASSERT_TRUE(status.ok()) << status.error_message();
+  EXPECT_EQ(resp.status(), 0);
+}
+
 } // namespace

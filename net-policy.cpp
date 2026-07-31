@@ -2182,6 +2182,21 @@ bool GrpcDispatchDeleteWafRule(DaemonContext* daemon, GrpcDispatchQueue* queue,
   return result;
 }
 
+int32_t GrpcDispatchDumpHeapProfile(DaemonContext* daemon, GrpcDispatchQueue* queue,
+                                    bool enable) {
+  std::string json = std::string("{\"enable\":\"") + (enable ? "y" : "n") + "\"}";
+  GrpcDispatchItem item;
+  int32_t result = 1;
+  item.work = [&]() {
+    admin::Status status = admin::Heap::handleHeapProfile(json);
+    result = (status == admin::Status::OK) ? 0 : 1;
+  };
+  std::future<void> future = item.done.get_future();
+  queue->Push(&item);
+  future.wait();
+  return result;
+}
+
 int32_t DispatchGrpcRustQueueEvent(int32_t epoll_fd, int32_t fd, void* ptr) {
   (void)epoll_fd;
   auto* cb = static_cast<RcvEpollCb*>(ptr);
