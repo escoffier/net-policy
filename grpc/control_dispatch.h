@@ -47,6 +47,9 @@ private:
 // mirrors where DispatchGrpcControlOp lives today.
 int32_t GrpcDispatchResetConfig(DaemonContext* daemon, GrpcDispatchQueue* queue);
 
+int32_t GrpcDispatchPodUp(DaemonContext* daemon, GrpcDispatchQueue* queue, int32_t epoll_fd,
+                           int32_t pid, uint64_t pod_id);
+
 // Epoll callback (RcvCbFunc-shaped: int32_t(int32_t epoll_fd, int32_t fd,
 // void* ptr)) for the Rust dispatch queue's wake eventfd. Drains `queue`
 // (read from the registering RcvEpollCb, threaded through via `ptr`) and

@@ -2109,6 +2109,28 @@ int32_t GrpcDispatchResetConfig(DaemonContext* daemon, GrpcDispatchQueue* queue)
   return result;
 }
 
+int32_t GrpcDispatchPodUp(DaemonContext* daemon, GrpcDispatchQueue* queue, int32_t epoll_fd,
+                           int32_t pid, uint64_t pod_id) {
+  GrpcDispatchItem item;
+  int32_t result = 1;
+  item.work = [&]() {
+    NET_CTRL_INFO ctrl = {};
+    ctrl.pid_ = pid;
+    ctrl.pod_id_ = pod_id;
+    int ret = SetNs(ctrl.pid_, const_cast<char*>(kBasePath.data()));
+    if (ret == 0) {
+      ret = InitNfqueue(epoll_fd, ctrl, *daemon);
+      if (ret == 0)
+        WriteIptableRule(1, 1, daemon->IptablesVersion(), daemon->WafEnabled());
+    }
+    result = ret;
+  };
+  std::future<void> future = item.done.get_future();
+  queue->Push(&item);
+  future.wait();
+  return result;
+}
+
 int32_t DispatchGrpcRustQueueEvent(int32_t epoll_fd, int32_t fd, void* ptr) {
   (void)epoll_fd;
   auto* cb = static_cast<RcvEpollCb*>(ptr);

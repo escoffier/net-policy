@@ -27,6 +27,14 @@ mod ffi {
         type GrpcDispatchQueue;
 
         unsafe fn GrpcDispatchResetConfig(daemon: *mut DaemonContext, queue: *mut GrpcDispatchQueue) -> i32;
+
+        unsafe fn GrpcDispatchPodUp(
+            daemon: *mut DaemonContext,
+            queue: *mut GrpcDispatchQueue,
+            epoll_fd: i32,
+            pid: i32,
+            pod_id: u64,
+        ) -> i32;
     }
 
     extern "Rust" {
@@ -49,7 +57,6 @@ mod ffi {
 struct ServerState {
     daemon: usize, // DaemonContext* as usize; see with_daemon()/with_queue() below
     queue: usize,
-    #[allow(dead_code)]
     epoll_fd: i32,
 }
 unsafe impl Send for ServerState {}
@@ -75,9 +82,16 @@ struct ControlServiceImpl;
 impl NetPolicyControl for ControlServiceImpl {
     async fn pod_up(
         &self,
-        _request: Request<PodUpRequest>,
+        request: Request<PodUpRequest>,
     ) -> Result<Response<StatusResponse>, Status> {
-        Err(Status::unimplemented("PodUp not yet implemented"))
+        let req = request.into_inner();
+        let epoll_fd = STATE.get().expect("server state not initialized").epoll_fd;
+        let status = tokio::task::spawn_blocking(move || unsafe {
+            ffi::GrpcDispatchPodUp(daemon_ptr(), queue_ptr(), epoll_fd, req.pid, req.pod_id)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("dispatch task panicked: {e}")))?;
+        Ok(Response::new(StatusResponse { status, uuid: String::new() }))
     }
 
     async fn pod_down(
