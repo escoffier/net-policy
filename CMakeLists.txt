@@ -89,10 +89,7 @@ set(SOURCES
     rule-detail.cpp
     waf/plugin.cc
     waf/rule.cc
-    grpc/work_queue.cc
     grpc/control_dispatch.cc
-    grpc/proto_json_bridge.cc
-    grpc/control_service.cc
     grpc/event_bridge.cc
     grpc/event_service.cc
     grpc/grpc_server.cc
@@ -272,15 +269,11 @@ add_executable(net_rule_grpc_test
     rule-detail.cpp
     waf/plugin.cc
     waf/rule.cc
-    grpc/work_queue.cc
     grpc/control_dispatch.cc
-    grpc/proto_json_bridge.cc
-    grpc/control_service.cc
     grpc/event_bridge.cc
     grpc/event_service.cc
     grpc/grpc_server.cc
     ${NET_POLICY_PROTO_GENERATED_SRCS}
-    tests/grpc_control_service_test.cc
     tests/grpc_event_bridge_test.cc
     tests/grpc_e2e_test.cc
     tests/grpc_rust_control_e2e_test.cc

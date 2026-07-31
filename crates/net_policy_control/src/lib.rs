@@ -201,7 +201,7 @@ mod ffi {
             daemon: *mut DaemonContext,
             queue: *mut GrpcDispatchQueue,
             epoll_fd: i32,
-            dev_port: u16,
+            port: u16,
         ) -> u16;
     }
 }
@@ -509,7 +509,7 @@ unsafe fn start_control_server(
     daemon: *mut ffi::DaemonContext,
     queue: *mut ffi::GrpcDispatchQueue,
     epoll_fd: i32,
-    dev_port: u16,
+    port: u16,
 ) -> u16 {
     STATE
         .set(ServerState { daemon: daemon as usize, queue: queue as usize, epoll_fd })
@@ -520,7 +520,7 @@ unsafe fn start_control_server(
         let rt = tokio::runtime::Runtime::new().expect("failed to build tokio runtime");
         rt.block_on(async move {
             let addr: std::net::SocketAddr =
-                format!("0.0.0.0:{dev_port}").parse().expect("invalid bind address");
+                format!("0.0.0.0:{port}").parse().expect("invalid bind address");
             let listener = match tokio::net::TcpListener::bind(addr).await {
                 Ok(l) => l,
                 Err(_) => {

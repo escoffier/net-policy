@@ -45,7 +45,7 @@ protected:
     stop_ = false;
     loop_thread_ = new std::thread([] { RunEpollLoop(); });
 
-    port_ = grpc_bridge::start_control_server(daemon_, queue_, epfd_, /*dev_port=*/0);
+    port_ = grpc_bridge::start_control_server(daemon_, queue_, epfd_, /*port=*/0);
     ASSERT_NE(port_, 0) << "rust control server failed to bind";
 
     // Give the C++ epoll loop, the Rust tokio runtime, and the gRPC
@@ -155,10 +155,10 @@ TEST_F(GrpcRustControlEndToEndTest, DeletePolicyRuleForUnknownNameReturnsZeroSta
 // each pod IP in the "pod_ips" array does waf_rules_.erase(ip) -- a no-op on
 // std::map when the key isn't present -- and unconditionally returns true as
 // long as the "pod_ips" key itself was present. So an unknown pod IP is
-// still a "success" from RemoveWafRule's perspective, and the dispatch case
-// (net-policy.cpp's DispatchGrpcControlOp, kDeleteWafRule) maps that to
-// status 0, not an error, matching the pattern already seen in
-// DeletePolicyRule/PodDown for other "not found" inputs.
+// still a "success" from RemoveWafRule's perspective, and
+// GrpcDispatchDeleteWafRule (net-policy.cpp) maps that to status 0, not an
+// error, matching the pattern already seen in DeletePolicyRule/PodDown for
+// other "not found" inputs.
 TEST_F(GrpcRustControlEndToEndTest, DeleteWafRuleForUnknownPodReturnsZeroStatus) {
   grpc::ClientContext ctx;
   netpolicy::v1::DeleteWafRuleRequest req;

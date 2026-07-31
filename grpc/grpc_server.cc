@@ -1,23 +1,13 @@
 #include "grpc/grpc_server.h"
 
-#include <sys/eventfd.h>
-
 namespace grpc_bridge {
 
-GrpcServer::GrpcServer()
-    : wake_fd_(eventfd(0, EFD_NONBLOCK)),
-      control_work_queue_(wake_fd_),
-      control_service_(control_work_queue_),
-      event_service_(event_bridge_) {}
+GrpcServer::GrpcServer() : event_service_(event_bridge_) {}
 
 int GrpcServer::Start(int port) {
-  if (wake_fd_ < 0)
-    return -1;
-
   std::string address = "0.0.0.0:" + std::to_string(port);
   grpc::ServerBuilder builder;
   builder.AddListeningPort(address, grpc::InsecureServerCredentials(), &bound_port_);
-  builder.RegisterService(&control_service_);
   builder.RegisterService(&event_service_);
   server_ = builder.BuildAndStart();
   if (!server_)
