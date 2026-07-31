@@ -6,11 +6,13 @@ use proto::net_policy_control_server::{NetPolicyControl, NetPolicyControlServer}
 use proto::update_node_config_request::Action;
 use proto::{
     AddPolicyRuleRequest, AddWafRuleRequest, AddressEndpoint as ProtoAddressEndpoint,
-    ContainerInfo as ProtoContainerInfo, DeletePolicyRuleRequest, DeleteWafRuleRequest,
-    DumpConfigRequest, DumpConfigResponse, DumpConnectionsRequest, DumpConnectionsResponse,
-    DumpHeapProfileRequest, HttpMatchRule as ProtoHttpRule, PodDownRequest, PodUpRequest,
+    BlackWhiteListEntry as ProtoBwEntry, ContainerInfo as ProtoContainerInfo,
+    DeletePolicyRuleRequest, DeleteWafRuleRequest, DumpConfigRequest, DumpConfigResponse,
+    DumpConnectionsRequest, DumpConnectionsResponse, DumpHeapProfileRequest,
+    HttpMatchRule as ProtoHttpRule, PodDownRequest, PodUpRequest,
     PolicyRuleConfigEntry as ProtoConfigEntry, PolicyRuleSpec as ProtoRuleSpec, PortRange as ProtoPortRange,
     ResetConfigRequest, SetLogLevelRequest, StatusResponse, UpdateNodeConfigRequest,
+    WafRule as ProtoWafRule,
 };
 use std::sync::OnceLock;
 use tonic::{transport::Server, Request, Response, Status};
@@ -65,6 +67,34 @@ mod ffi {
         to_addresses: Vec<AddressEndpoint>,
         ports: Vec<PortRange>,
         priority: i32,
+    }
+
+    struct WafRule {
+        id: i64,
+        level: i64,
+        // `type` is a Rust reserved keyword, so the Rust-side field must be
+        // written as the raw identifier `r#type`. Without an explicit
+        // #[cxx_name], cxx's C++ codegen emits the Rust field's `to_string()`
+        // verbatim -- "r#type" -- as the generated C++ struct member name,
+        // which is not a valid C++ identifier and fails to compile.
+        // #[cxx_name = "type"] is required to get the (valid, and
+        // conventional -- see the `r.type` usage in net-policy.cpp's
+        // GrpcDispatchAddWafRule) plain `type` member on the C++ side.
+        // Verified empirically against this repo's pinned cxx 1.0.198 by
+        // building a standalone throwaway crate and inspecting the generated
+        // header.
+        #[cxx_name = "type"]
+        r#type: String,
+        name: String,
+        expr: String,
+        mode: String,
+        description: String,
+    }
+    struct BlackWhiteListEntry {
+        id: u64,
+        name: String,
+        expr: String,
+        mode: String,
     }
 
     unsafe extern "C++" {
@@ -145,6 +175,25 @@ mod ffi {
             policy_name: &str,
             rules: Vec<PolicyRuleSpec>,
         ) -> i32;
+
+        unsafe fn GrpcDispatchAddWafRule(
+            daemon: *mut DaemonContext,
+            queue: *mut GrpcDispatchQueue,
+            pod_ips: Vec<String>,
+            rules: Vec<WafRule>,
+            domains: Vec<String>,
+            excluded_file_types: Vec<String>,
+            detect_headers: Vec<String>,
+            black_white_lists: Vec<BlackWhiteListEntry>,
+            uri: &str,
+            mode: &str,
+            name: &str,
+            cluster_key: &str,
+            k8s_namespace: &str,
+            kind: &str,
+            workload_name: &str,
+            service_id: u64,
+        ) -> bool;
     }
 
     extern "Rust" {
@@ -281,9 +330,67 @@ impl NetPolicyControl for ControlServiceImpl {
 
     async fn add_waf_rule(
         &self,
-        _request: Request<AddWafRuleRequest>,
+        request: Request<AddWafRuleRequest>,
     ) -> Result<Response<StatusResponse>, Status> {
-        Err(Status::unimplemented("AddWafRule not yet implemented"))
+        let req = request.into_inner();
+        let rules: Vec<ffi::WafRule> = req
+            .rules
+            .into_iter()
+            .map(|r: ProtoWafRule| ffi::WafRule {
+                id: r.id,
+                level: r.level,
+                r#type: r.r#type,
+                name: r.name,
+                expr: r.expr,
+                mode: r.mode,
+                description: r.description,
+            })
+            .collect();
+        let black_white_lists: Vec<ffi::BlackWhiteListEntry> = req
+            .black_white_lists
+            .into_iter()
+            .map(|b: ProtoBwEntry| ffi::BlackWhiteListEntry {
+                id: b.id,
+                name: b.name,
+                expr: b.expr,
+                mode: b.mode,
+            })
+            .collect();
+        let (pod_ips, domains, excluded_file_types, detect_headers) =
+            (req.pod_ips, req.domains, req.excluded_file_types, req.detect_headers);
+        let (uri, mode, name, cluster_key, k8s_namespace, kind, workload_name, service_id) = (
+            req.uri,
+            req.mode,
+            req.name,
+            req.cluster_key,
+            req.k8s_namespace,
+            req.kind,
+            req.workload_name,
+            req.service_id,
+        );
+        let found = tokio::task::spawn_blocking(move || unsafe {
+            ffi::GrpcDispatchAddWafRule(
+                daemon_ptr(),
+                queue_ptr(),
+                pod_ips,
+                rules,
+                domains,
+                excluded_file_types,
+                detect_headers,
+                black_white_lists,
+                &uri,
+                &mode,
+                &name,
+                &cluster_key,
+                &k8s_namespace,
+                &kind,
+                &workload_name,
+                service_id,
+            )
+        })
+        .await
+        .map_err(|e| Status::internal(format!("dispatch task panicked: {e}")))?;
+        Ok(Response::new(StatusResponse { status: if found { 0 } else { 1 }, uuid: String::new() }))
     }
 
     async fn delete_waf_rule(

@@ -272,4 +272,16 @@ TEST_F(GrpcRustControlEndToEndTest, AddPolicyRuleThenReadBackViaDumpConfig) {
   EXPECT_EQ(del_resp.status(), 0);
 }
 
+TEST_F(GrpcRustControlEndToEndTest, AddWafRuleWithMinimalFieldsReturnsOkStatus) {
+  grpc::ClientContext ctx;
+  netpolicy::v1::AddWafRuleRequest req;
+  req.add_pod_ips("10.0.0.7");
+  req.set_mode("passthrough");
+  req.set_name("rust-e2e-waf-test");
+  netpolicy::v1::StatusResponse resp;
+  grpc::Status status = stub_->AddWafRule(&ctx, req, &resp);
+  ASSERT_TRUE(status.ok()) << status.error_message();
+  EXPECT_EQ(resp.status(), 0);
+}
+
 } // namespace
