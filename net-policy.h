@@ -145,7 +145,7 @@ public:
 
 struct RcvEpollCb; // forward declaration — full definition follows NFQ_RES_INFO
 class DaemonContext; // forward declaration — full definition follows PostServer
-namespace grpc_bridge { class ControlWorkQueue; class EventBridge; }
+namespace grpc_bridge { class EventBridge; class GrpcDispatchQueue; }
 
 class NFQ_RES_INFO
 {
@@ -482,14 +482,17 @@ public:
     void SetIptablesVersion(int v)    { ipt_ver_ = v; }
 
     /*---- gRPC wiring: GrpcServer is a sibling object, constructed separately
-     *in RunNetPolicyDaemon; this stores non-owning pointers into it, set once
+     *in RunNetPolicyDaemon; this stores a non-owning pointer into it, set once
      *at startup after both objects exist ----*/
-    void WireGrpc(grpc_bridge::ControlWorkQueue* q, grpc_bridge::EventBridge* eb) {
-        control_work_queue_ = q;
+    void WireEventBridge(grpc_bridge::EventBridge* eb) {
         post_server_.SetEventBridge(eb);
         waf_root_.SetEventBridge(eb);
     }
-    grpc_bridge::ControlWorkQueue* ControlWorkQueue() { return control_work_queue_; }
+
+    /*non-owning; wired once at startup, mirrors WireEventBridge's existing pattern
+     *exactly -- see grpc/control_dispatch.h for GrpcDispatchQueue.*/
+    void WireRustControlDispatch(grpc_bridge::GrpcDispatchQueue* q) { rust_dispatch_queue_ = q; }
+    grpc_bridge::GrpcDispatchQueue* RustControlDispatchQueue() { return rust_dispatch_queue_; }
 
 private:
     bool waf_enable_      = false;
@@ -503,5 +506,5 @@ private:
     PostServer                           post_server_;
     http::extension::PluginRootContext   waf_root_;
 
-    grpc_bridge::ControlWorkQueue* control_work_queue_ = nullptr; // non-owning
+    grpc_bridge::GrpcDispatchQueue* rust_dispatch_queue_ = nullptr; // non-owning
 };

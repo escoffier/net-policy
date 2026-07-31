@@ -24,6 +24,7 @@
 #include <netinet/in.h>
 #include <sched.h>
 #include <sys/epoll.h>
+#include <sys/eventfd.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -31,10 +32,10 @@
 #include <unistd.h>
 #include <gflags/gflags.h>
 #include "net-policy.h"
-#include "grpc/work_queue.h"
-#include "grpc/proto_json_bridge.h"
+#include "grpc/control_dispatch.h"
 #include "grpc/event_bridge.h"
 #include "grpc/grpc_server.h"
+#include "net_policy_control_cxxbridge/lib.h"
 #include "proto/net_policy_control.pb.h"
 
 using std::string;
@@ -1945,146 +1946,428 @@ rsp:
   return 0;
 }
 
-/*Runs a gRPC control-service request through the exact same functions the
- *raw-socket path above calls -- this is the only place gRPC requests ever
- *touch DaemonContext's microseg/waf_root/the policy trees, and it only ever
- *runs on this (the epoll) thread, preserving the single-writer invariant
- *those globals have always relied on. See grpc/work_queue.h for
- *ControlWorkItem.
- *
- *Note: unlike ParseRcvData's rsp: cleanup label, kPodUp here never restores
- *the net namespace via SetLocalNetNs afterward -- a pre-existing asymmetry
- *between the two paths, not something introduced by this refactor. Flagged
- *rather than silently fixed as a side effect.*/
-void DispatchGrpcControlOp(int32_t epoll_fd, grpc_bridge::ControlWorkItem& item, DaemonContext& daemon) {
-  using grpc_bridge::ControlOp;
-  int ret = 0;
+/*Rust-facing dispatch functions -- see grpc/control_dispatch.h. The Rust
+ *tonic handler pushes a GrpcDispatchItem carrying a closure, blocks on its
+ *future, and the epoll thread runs the closure exactly once
+ *DispatchGrpcRustQueueEvent wakes.*/
+namespace grpc_bridge {
 
-  switch (item.op) {
-  case ControlOp::kPodUp: {
-    const auto* req = static_cast<const netpolicy::v1::PodUpRequest*>(item.request);
-    auto* resp = static_cast<netpolicy::v1::StatusResponse*>(item.response);
-    NET_CTRL_INFO ctrl = {};
-    ctrl.pid_ = req->pid();
-    ctrl.pod_id_ = req->pod_id();
-    ret = SetNs(ctrl.pid_, const_cast<char*>(kBasePath.data()));
-    if (ret == 0) {
-      ret = InitNfqueue(epoll_fd, ctrl, daemon);
-      if (ret == 0)
-        WriteIptableRule(1, 1, daemon.IptablesVersion(), daemon.WafEnabled());
-    }
-    resp->set_status(ret);
-    break;
-  }
-  case ControlOp::kPodDown: {
-    const auto* req = static_cast<const netpolicy::v1::PodDownRequest*>(item.request);
-    auto* resp = static_cast<netpolicy::v1::StatusResponse*>(item.response);
-    ret = daemon.Microseg().DeleteNfQueRes(epoll_fd, req->pod_id());
-    resp->set_status(ret);
-    break;
-  }
-  case ControlOp::kAddPolicyRule: {
-    const auto* req = static_cast<const netpolicy::v1::AddPolicyRuleRequest*>(item.request);
-    auto* resp = static_cast<netpolicy::v1::StatusResponse*>(item.response);
-    std::string json = grpc_bridge::BuildAddPolicyRuleJson(*req);
-    ret = ParseNetPolicy(const_cast<char*>(json.c_str()), daemon);
-    daemon.Microseg().PrintPolicyLog();
-    resp->set_status(ret);
-    break;
-  }
-  case ControlOp::kDeletePolicyRule: {
-    const auto* req = static_cast<const netpolicy::v1::DeletePolicyRuleRequest*>(item.request);
-    auto* resp = static_cast<netpolicy::v1::StatusResponse*>(item.response);
-    std::string policy_name = req->policy_name();
-    ret = DeletePolicy(policy_name, daemon);
-    resp->set_status(ret);
-    break;
-  }
-  case ControlOp::kAddWafRule: {
-    const auto* req = static_cast<const netpolicy::v1::AddWafRuleRequest*>(item.request);
-    auto* resp = static_cast<netpolicy::v1::StatusResponse*>(item.response);
-    std::string json = grpc_bridge::BuildAddWafRuleJson(*req);
-    bool found = daemon.WafRoot().ParseConfiguration(const_cast<char*>(json.c_str()));
-    resp->set_status(found ? 0 : 1);
-    break;
-  }
-  case ControlOp::kDeleteWafRule: {
-    const auto* req = static_cast<const netpolicy::v1::DeleteWafRuleRequest*>(item.request);
-    auto* resp = static_cast<netpolicy::v1::StatusResponse*>(item.response);
-    std::string json = grpc_bridge::BuildDeleteWafRuleJson(*req);
-    bool found = daemon.WafRoot().RemoveWafRule(const_cast<char*>(json.c_str()));
-    resp->set_status(found ? 0 : 1);
-    break;
-  }
-  case ControlOp::kDumpHeapProfile: {
-    const auto* req = static_cast<const netpolicy::v1::DumpHeapProfileRequest*>(item.request);
-    auto* resp = static_cast<netpolicy::v1::StatusResponse*>(item.response);
-    std::string json = grpc_bridge::BuildDumpHeapProfileJson(*req);
-    admin::Status status = admin::Heap::handleHeapProfile(json);
-    resp->set_status((status == admin::Status::OK) ? 0 : 1);
-    break;
-  }
-  case ControlOp::kDumpConfig: {
-    const auto* req = static_cast<const netpolicy::v1::DumpConfigRequest*>(item.request);
-    auto* resp = static_cast<netpolicy::v1::DumpConfigResponse*>(item.response);
-    cJSON* config = daemon.Microseg().GetAllConfig(req->policy_name(), daemon.ConnMgr());
-    grpc_bridge::ConvertConfigCJsonToProto(config, resp);
-    if (config)
-      cJSON_Delete(config);
-    break;
-  }
-  case ControlOp::kDumpConnections: {
-    const auto* req = static_cast<const netpolicy::v1::DumpConnectionsRequest*>(item.request);
-    auto* resp = static_cast<netpolicy::v1::DumpConnectionsResponse*>(item.response);
-    std::string json = grpc_bridge::BuildDumpConnectionsJson(*req);
-    cJSON* conns = dumpConnectons(json, daemon.ConnMgr());
-    grpc_bridge::ConvertConnectionsCJsonToProto(conns, resp);
-    if (conns)
-      cJSON_Delete(conns);
-    break;
-  }
-  case ControlOp::kResetConfig: {
-    auto* resp = static_cast<netpolicy::v1::StatusResponse*>(item.response);
-    ret = daemon.Microseg().ClearCfg();
-    resp->set_status(ret);
-    break;
-  }
-  case ControlOp::kUpdateNodeConfig: {
-    const auto* req = static_cast<const netpolicy::v1::UpdateNodeConfigRequest*>(item.request);
-    auto* resp = static_cast<netpolicy::v1::StatusResponse*>(item.response);
-    std::string json = grpc_bridge::BuildUpdateNodeConfigJson(*req);
-    ret = ParseNodeCfg(const_cast<char*>(json.c_str()), daemon);
-    resp->set_status(ret);
-    break;
-  }
-  case ControlOp::kSetLogLevel: {
-    const auto* req = static_cast<const netpolicy::v1::SetLogLevelRequest*>(item.request);
-    auto* resp = static_cast<netpolicy::v1::StatusResponse*>(item.response);
-    g_log_level = req->level();
-    LOG_I("set log level : %d", g_log_level.load());
-    resp->set_status(0);
-    break;
-  }
-  }
+int32_t GrpcDispatchResetConfig(DaemonContext* daemon, GrpcDispatchQueue* queue) {
+  GrpcDispatchItem item;
+  int32_t result = 1; // fail-closed default if the closure never runs
+  item.work = [&]() {
+    result = daemon->Microseg().ClearCfg();
+  };
+  std::future<void> future = item.done.get_future();
+  queue->Push(&item);
+  future.wait();
+  return result;
 }
 
-/*Epoll callback for the gRPC work-queue wake eventfd (registered by
- *RunNetPolicyDaemon, textually parallel to how the listen socket and
- *PostServer register themselves). Drains every item gRPC handler threads
- *have queued since the last wakeup and runs each through
- *DispatchGrpcControlOp on this (the epoll) thread.*/
-int32_t DispatchGrpcWorkQueueEvent(int32_t epoll_fd, int32_t fd, void* ptr) {
-  RcvEpollCb* cb = (RcvEpollCb*)ptr;
-  DaemonContext* daemon = cb->daemon_;
+int32_t GrpcDispatchPodUp(DaemonContext* daemon, GrpcDispatchQueue* queue, int32_t epoll_fd,
+                           int32_t pid, uint64_t pod_id) {
+  GrpcDispatchItem item;
+  int32_t result = 1;
+  item.work = [&]() {
+    NET_CTRL_INFO ctrl = {};
+    ctrl.pid_ = pid;
+    ctrl.pod_id_ = pod_id;
+    int ret = SetNs(ctrl.pid_, const_cast<char*>(kBasePath.data()));
+    if (ret == 0) {
+      ret = InitNfqueue(epoll_fd, ctrl, *daemon);
+      if (ret == 0)
+        WriteIptableRule(1, 1, daemon->IptablesVersion(), daemon->WafEnabled());
+    }
+    result = ret;
+  };
+  std::future<void> future = item.done.get_future();
+  queue->Push(&item);
+  future.wait();
+  return result;
+}
+
+int32_t GrpcDispatchPodDown(DaemonContext* daemon, GrpcDispatchQueue* queue, int32_t epoll_fd,
+                             uint64_t pod_id) {
+  GrpcDispatchItem item;
+  int32_t result = 1;
+  item.work = [&]() {
+    result = daemon->Microseg().DeleteNfQueRes(epoll_fd, pod_id);
+  };
+  std::future<void> future = item.done.get_future();
+  queue->Push(&item);
+  future.wait();
+  return result;
+}
+
+int32_t GrpcDispatchDeletePolicyRule(DaemonContext* daemon, GrpcDispatchQueue* queue,
+                                      rust::Str policy_name) {
+  GrpcDispatchItem item;
+  int32_t result = 1;
+  std::string name(policy_name);
+  item.work = [&]() {
+    result = DeletePolicy(name, *daemon);
+  };
+  std::future<void> future = item.done.get_future();
+  queue->Push(&item);
+  future.wait();
+  return result;
+}
+
+bool GrpcDispatchDeleteWafRule(DaemonContext* daemon, GrpcDispatchQueue* queue,
+                                rust::Vec<rust::String> pod_ips) {
+  cJSON* root = cJSON_CreateObject();
+  cJSON* ips = cJSON_CreateArray();
+  for (const auto& ip : pod_ips) {
+    cJSON_AddItemToArray(ips, cJSON_CreateString(std::string(ip).c_str()));
+  }
+  cJSON_AddItemToObject(root, "pod_ips", ips);
+  char* json_c = cJSON_PrintUnformatted(root);
+  std::string json(json_c);
+  cJSON_free(json_c);
+  cJSON_Delete(root);
+
+  GrpcDispatchItem item;
+  bool result = false;
+  item.work = [&]() {
+    result = daemon->WafRoot().RemoveWafRule(const_cast<char*>(json.c_str()));
+  };
+  std::future<void> future = item.done.get_future();
+  queue->Push(&item);
+  future.wait();
+  return result;
+}
+
+int32_t GrpcDispatchDumpHeapProfile(DaemonContext* daemon, GrpcDispatchQueue* queue,
+                                    bool enable) {
+  std::string json = std::string("{\"enable\":\"") + (enable ? "y" : "n") + "\"}";
+  GrpcDispatchItem item;
+  int32_t result = 1;
+  item.work = [&]() {
+    admin::Status status = admin::Heap::handleHeapProfile(json);
+    result = (status == admin::Status::OK) ? 0 : 1;
+  };
+  std::future<void> future = item.done.get_future();
+  queue->Push(&item);
+  future.wait();
+  return result;
+}
+
+DumpConnectionsResult GrpcDispatchDumpConnections(DaemonContext* daemon, GrpcDispatchQueue* queue,
+                                                    int32_t limit) {
+  GrpcDispatchItem item;
+  DumpConnectionsResult result{};
+  item.work = [&]() {
+    int32_t actual_count = static_cast<int32_t>(daemon->ConnMgr().connections().size());
+    int32_t safe_limit = std::min(limit, actual_count);
+    if (safe_limit < 0) safe_limit = 0;
+    std::string json = "{\"limit\":" + std::to_string(safe_limit) + "}";
+    cJSON* conns = dumpConnectons(json, daemon->ConnMgr());
+    if (conns) {
+      cJSON* total = cJSON_GetObjectItem(conns, "total");
+      if (total)
+        result.total = (int64_t)total->valuedouble;
+      cJSON* items = cJSON_GetObjectItem(conns, "items");
+      if (items) {
+        int size = cJSON_GetArraySize(items);
+        for (int i = 0; i < size; i++) {
+          cJSON* entry = cJSON_GetArrayItem(items, i);
+          if (entry && entry->valuestring)
+            result.items.push_back(rust::String::lossy(entry->valuestring));
+        }
+      }
+      cJSON_Delete(conns);
+    }
+  };
+  std::future<void> future = item.done.get_future();
+  queue->Push(&item);
+  future.wait();
+  return result;
+}
+
+int32_t GrpcDispatchUpdateNodeConfig(DaemonContext* daemon, GrpcDispatchQueue* queue,
+                                      bool is_delete, rust::Vec<rust::String> node_ips) {
+  cJSON* root = cJSON_CreateObject();
+  cJSON_AddStringToObject(root, "action", is_delete ? "delete" : "add");
+  cJSON* ips = cJSON_CreateArray();
+  for (const auto& ip : node_ips) {
+    cJSON_AddItemToArray(ips, cJSON_CreateString(std::string(ip).c_str()));
+  }
+  cJSON_AddItemToObject(root, "node_ips", ips);
+  char* json_c = cJSON_PrintUnformatted(root);
+  std::string json(json_c);
+  cJSON_free(json_c);
+  cJSON_Delete(root);
+
+  GrpcDispatchItem item;
+  int32_t result = 1;
+  item.work = [&]() {
+    result = ParseNodeCfg(const_cast<char*>(json.c_str()), *daemon);
+  };
+  std::future<void> future = item.done.get_future();
+  queue->Push(&item);
+  future.wait();
+  return result;
+}
+
+int32_t GrpcDispatchSetLogLevel(DaemonContext* daemon, GrpcDispatchQueue* queue, int32_t level) {
+  (void)daemon;
+  GrpcDispatchItem item;
+  item.work = [&]() {
+    g_log_level = level;
+    LOG_I("set log level : %d", g_log_level.load());
+  };
+  std::future<void> future = item.done.get_future();
+  queue->Push(&item);
+  future.wait();
+  return 0;
+}
+
+DumpConfigResult GrpcDispatchDumpConfig(DaemonContext* daemon, GrpcDispatchQueue* queue,
+                                          rust::Str policy_name) {
+  std::string name(policy_name);
+  GrpcDispatchItem item;
+  DumpConfigResult result{};
+  item.work = [&]() {
+    cJSON* config = daemon->Microseg().GetAllConfig(name, daemon->ConnMgr());
+    if (!config) return;
+    auto convert_entries = [](cJSON* array, rust::Vec<PolicyRuleConfigEntry>& out) {
+      if (!array) return;
+      int size = cJSON_GetArraySize(array);
+      for (int i = 0; i < size; i++) {
+        cJSON* e = cJSON_GetArrayItem(array, i);
+        if (!e) continue;
+        PolicyRuleConfigEntry entry{};
+        cJSON* v;
+        if ((v = cJSON_GetObjectItem(e, "policy_name")) && v->valuestring) entry.policy_name = rust::String::lossy(v->valuestring);
+        if ((v = cJSON_GetObjectItem(e, "priority"))) entry.priority = v->valueint;
+        if ((v = cJSON_GetObjectItem(e, "direction")) && v->valuestring) entry.direction = rust::String::lossy(v->valuestring);
+        if ((v = cJSON_GetObjectItem(e, "action")) && v->valuestring) entry.action = rust::String::lossy(v->valuestring);
+        if ((v = cJSON_GetObjectItem(e, "protocol")) && v->valuestring) entry.protocol = rust::String::lossy(v->valuestring);
+        if ((v = cJSON_GetObjectItem(e, "protocol_int"))) entry.protocol_int = v->valueint;
+        if ((v = cJSON_GetObjectItem(e, "from_address")) && v->valuestring) entry.from_address = rust::String::lossy(v->valuestring);
+        if ((v = cJSON_GetObjectItem(e, "to_address")) && v->valuestring) entry.to_address = rust::String::lossy(v->valuestring);
+        out.push_back(std::move(entry));
+      }
+    };
+    convert_entries(cJSON_GetObjectItem(config, "inbound_rules"), result.inbound_rules);
+    convert_entries(cJSON_GetObjectItem(config, "outbound_rules"), result.outbound_rules);
+    cJSON* containers = cJSON_GetObjectItem(config, "containers");
+    if (containers) {
+      int size = cJSON_GetArraySize(containers);
+      for (int i = 0; i < size; i++) {
+        cJSON* c = cJSON_GetArrayItem(containers, i);
+        if (!c) continue;
+        ContainerInfo ci{};
+        cJSON* v;
+        if ((v = cJSON_GetObjectItem(c, "pid"))) ci.pid = v->valueint;
+        if ((v = cJSON_GetObjectItem(c, "pod_id"))) ci.pod_id = (uint64_t)v->valuedouble;
+        result.containers.push_back(ci);
+      }
+    }
+    cJSON* tcp = cJSON_GetObjectItem(config, "tcp");
+    if (tcp) {
+      cJSON* conn = cJSON_GetObjectItem(tcp, "tcp_connection");
+      if (conn) result.tcp_connections = (int64_t)conn->valuedouble;
+    }
+    cJSON_Delete(config);
+  };
+  std::future<void> future = item.done.get_future();
+  queue->Push(&item);
+  future.wait();
+  return result;
+}
+
+namespace {
+const char* PolicyActionToStr(int32_t action) {
+  switch (static_cast<netpolicy::v1::PolicyAction>(action)) {
+  case netpolicy::v1::POLICY_ACTION_ALLOW: return "Allow";
+  case netpolicy::v1::POLICY_ACTION_ALERT: return "Alert";
+  default:                                 return "Deny";
+  }
+}
+const char* FlowDirectionToStr(int32_t direction) {
+  return (static_cast<netpolicy::v1::FlowDirection>(direction) == netpolicy::v1::FLOW_DIRECTION_INGRESS)
+             ? "ingress" : "egress";
+}
+const char* L4ProtocolToStr(int32_t protocol) {
+  switch (static_cast<netpolicy::v1::L4Protocol>(protocol)) {
+  case netpolicy::v1::L4_PROTOCOL_TCP:  return "TCP";
+  case netpolicy::v1::L4_PROTOCOL_UDP:  return "UDP";
+  case netpolicy::v1::L4_PROTOCOL_ICMP: return "ICMP";
+  default:                              return "";
+  }
+}
+cJSON* AddressEndpointToJsonRust(const grpc_bridge::AddressEndpoint& ep) {
+  cJSON* obj = cJSON_CreateObject();
+  cJSON_AddStringToObject(obj, "ip", std::string(ep.ip).c_str());
+  cJSON_AddNumberToObject(obj, "pod_id", static_cast<double>(ep.pod_id));
+  return obj;
+}
+} // namespace
+
+int32_t GrpcDispatchAddPolicyRule(DaemonContext* daemon, GrpcDispatchQueue* queue,
+                                    rust::Str policy_name, rust::Vec<PolicyRuleSpec> rules) {
+  std::string name(policy_name);
+  cJSON* root = cJSON_CreateObject();
+  cJSON_AddStringToObject(root, "policy_name", name.c_str());
+
+  cJSON* rules_array = cJSON_CreateArray();
+  for (const auto& rule : rules) {
+    cJSON* r = cJSON_CreateObject();
+    cJSON_AddStringToObject(r, "action", PolicyActionToStr(rule.action));
+    cJSON_AddStringToObject(r, "direction", FlowDirectionToStr(rule.direction));
+    if (static_cast<netpolicy::v1::L4Protocol>(rule.protocol) != netpolicy::v1::L4_PROTOCOL_UNSPECIFIED)
+      cJSON_AddStringToObject(r, "protocol", L4ProtocolToStr(rule.protocol));
+
+    if (!rule.http_rules.empty()) {
+      cJSON* http = cJSON_CreateArray();
+      for (const auto& h : rule.http_rules) {
+        cJSON* item = cJSON_CreateObject();
+        cJSON_AddStringToObject(item, "host", std::string(h.host).c_str());
+        cJSON_AddStringToObject(item, "method", std::string(h.method).c_str());
+        cJSON_AddStringToObject(item, "path", std::string(h.path).c_str());
+        cJSON_AddItemToArray(http, item);
+      }
+      cJSON_AddItemToObject(r, "http", http);
+    }
+
+    cJSON* from_arr = cJSON_CreateArray();
+    for (const auto& ep : rule.from_addresses) cJSON_AddItemToArray(from_arr, AddressEndpointToJsonRust(ep));
+    cJSON_AddItemToObject(r, "from_addresses", from_arr);
+
+    cJSON* to_arr = cJSON_CreateArray();
+    for (const auto& ep : rule.to_addresses) cJSON_AddItemToArray(to_arr, AddressEndpointToJsonRust(ep));
+    cJSON_AddItemToObject(r, "to_addresses", to_arr);
+
+    if (!rule.ports.empty()) {
+      cJSON* ports = cJSON_CreateArray();
+      for (const auto& p : rule.ports) {
+        cJSON* item = cJSON_CreateObject();
+        cJSON_AddNumberToObject(item, "port", p.port);
+        cJSON_AddNumberToObject(item, "endPort", p.end_port); // camelCase, see net-policy.cpp:1557
+        cJSON_AddItemToArray(ports, item);
+      }
+      cJSON_AddItemToObject(r, "ports", ports);
+    }
+
+    cJSON_AddNumberToObject(r, "priority", rule.priority);
+    cJSON_AddItemToArray(rules_array, r);
+  }
+  cJSON_AddItemToObject(root, "rules", rules_array);
+  char* json_c = cJSON_PrintUnformatted(root);
+  std::string json(json_c);
+  cJSON_free(json_c);
+  cJSON_Delete(root);
+
+  GrpcDispatchItem item;
+  int32_t result = 1;
+  item.work = [&]() {
+    result = ParseNetPolicy(const_cast<char*>(json.c_str()), *daemon);
+    daemon->Microseg().PrintPolicyLog();
+  };
+  std::future<void> future = item.done.get_future();
+  queue->Push(&item);
+  future.wait();
+  return result;
+}
+
+bool GrpcDispatchAddWafRule(DaemonContext* daemon, GrpcDispatchQueue* queue,
+                             rust::Vec<rust::String> pod_ips, rust::Vec<WafRule> rules,
+                             rust::Vec<rust::String> domains,
+                             rust::Vec<rust::String> excluded_file_types,
+                             rust::Vec<rust::String> detect_headers,
+                             rust::Vec<BlackWhiteListEntry> black_white_lists, rust::Str uri,
+                             rust::Str mode, rust::Str name, rust::Str cluster_key,
+                             rust::Str k8s_namespace, rust::Str kind, rust::Str workload_name,
+                             uint64_t service_id) {
+  cJSON* root = cJSON_CreateObject();
+  cJSON* pod_ips_arr = cJSON_CreateArray();
+  for (const auto& ip : pod_ips) cJSON_AddItemToArray(pod_ips_arr, cJSON_CreateString(std::string(ip).c_str()));
+  cJSON_AddItemToObject(root, "pod_ips", pod_ips_arr);
+
+  cJSON* rules_arr = cJSON_CreateArray();
+  for (const auto& r : rules) {
+    cJSON* ro = cJSON_CreateObject();
+    cJSON_AddNumberToObject(ro, "id", (double)r.id);
+    cJSON_AddNumberToObject(ro, "level", (double)r.level);
+    cJSON_AddStringToObject(ro, "type", std::string(r.type).c_str());
+    cJSON_AddStringToObject(ro, "name", std::string(r.name).c_str());
+    cJSON_AddStringToObject(ro, "expr", std::string(r.expr).c_str());
+    cJSON_AddStringToObject(ro, "mode", std::string(r.mode).c_str());
+    cJSON_AddStringToObject(ro, "Description", std::string(r.description).c_str()); // capital D, see waf/plugin.cc:477
+    cJSON_AddItemToArray(rules_arr, ro);
+  }
+  cJSON_AddItemToObject(root, "rules", rules_arr);
+
+  cJSON* domains_arr = cJSON_CreateArray();
+  for (const auto& d : domains) cJSON_AddItemToArray(domains_arr, cJSON_CreateString(std::string(d).c_str()));
+  cJSON_AddItemToObject(root, "domain", domains_arr); // key is "domain" (singular), matches ParseConfiguration's expected schema
+
+  cJSON* excl_arr = cJSON_CreateArray();
+  for (const auto& e : excluded_file_types) cJSON_AddItemToArray(excl_arr, cJSON_CreateString(std::string(e).c_str()));
+  cJSON_AddItemToObject(root, "excluded_file_types", excl_arr);
+
+  cJSON* dh_arr = cJSON_CreateArray();
+  for (const auto& h : detect_headers) cJSON_AddItemToArray(dh_arr, cJSON_CreateString(std::string(h).c_str()));
+  cJSON_AddItemToObject(root, "detect_headers", dh_arr);
+
+  cJSON* bwl_arr = cJSON_CreateArray();
+  for (const auto& b : black_white_lists) {
+    cJSON* bo = cJSON_CreateObject();
+    cJSON_AddNumberToObject(bo, "id", (double)b.id);
+    cJSON_AddStringToObject(bo, "name", std::string(b.name).c_str());
+    cJSON_AddStringToObject(bo, "expr", std::string(b.expr).c_str());
+    cJSON_AddStringToObject(bo, "mode", std::string(b.mode).c_str());
+    cJSON_AddItemToArray(bwl_arr, bo);
+  }
+  cJSON_AddItemToObject(root, "black_white_lists", bwl_arr);
+
+  cJSON_AddStringToObject(root, "uri", std::string(uri).c_str());
+  cJSON_AddStringToObject(root, "mode", std::string(mode).c_str());
+  cJSON_AddStringToObject(root, "name", std::string(name).c_str());
+  cJSON_AddStringToObject(root, "cluster_key", std::string(cluster_key).c_str());
+  cJSON_AddStringToObject(root, "namespace", std::string(k8s_namespace).c_str()); // wire key is "namespace", see .proto comment
+  cJSON_AddStringToObject(root, "kind", std::string(kind).c_str());
+  cJSON_AddStringToObject(root, "workload_name", std::string(workload_name).c_str());
+  cJSON_AddNumberToObject(root, "service_id", (double)service_id);
+
+  char* json_c = cJSON_PrintUnformatted(root);
+  std::string json(json_c);
+  cJSON_free(json_c);
+  cJSON_Delete(root);
+
+  GrpcDispatchItem item;
+  bool result = false;
+  item.work = [&]() {
+    result = daemon->WafRoot().ParseConfiguration(const_cast<char*>(json.c_str()));
+  };
+  std::future<void> future = item.done.get_future();
+  queue->Push(&item);
+  future.wait();
+  return result;
+}
+
+int32_t DispatchGrpcRustQueueEvent(int32_t epoll_fd, int32_t fd, void* ptr) {
+  (void)epoll_fd;
+  auto* cb = static_cast<RcvEpollCb*>(ptr);
+  GrpcDispatchQueue* queue = cb->daemon_->RustControlDispatchQueue();
   uint64_t drain;
   while (read(fd, &drain, sizeof(drain)) > 0) {
   }
-  for (auto* item : daemon->ControlWorkQueue()->DrainAll()) {
-    DispatchGrpcControlOp(epoll_fd, *item, *daemon);
+  for (auto* item : queue->DrainAll()) {
+    try {
+      item->work();
+    } catch (const std::exception& e) {
+      LOG_E("grpc dispatch closure threw: %s", e.what());
+    } catch (...) {
+      LOG_E("grpc dispatch closure threw an unknown exception");
+    }
     item->done.set_value();
   }
   return 0;
 }
+
+} // namespace grpc_bridge
 
 int ProcAcceptEvent(int32_t epoll_fd, int32_t fd, void* ptr) {
   int zClientFd;
@@ -2231,7 +2514,7 @@ int RunNetPolicyDaemon(int argc, char* argv[]) {
   int zListenFd = 0, epfd = 0, zLinkFd;
   int ret, nfds, i, opt = 1;
   struct sockaddr_in address;
-  RCV_EPOLL_CB unixEvent, postEvent, grpcWakeEvent, *pstCbEv;
+  RCV_EPOLL_CB unixEvent, postEvent, rustDispatchWakeEvent, *pstCbEv;
   // print start log
   LOG_I("policy process start......");
   /*get log level env*/
@@ -2280,20 +2563,31 @@ int RunNetPolicyDaemon(int argc, char* argv[]) {
     GOTO_ERROR(err, "listen the client connect request! err : %s.", strerror(errno));
   //
   daemon.Microseg().SetEfd(epfd);
-  // start the gRPC control/event server (additive -- see grpc/grpc_server.h;
-  // raw-socket servers above are untouched)
+  // start the gRPC event server (additive -- see grpc/grpc_server.h;
+  // raw-socket servers above are untouched); the control service now lives
+  // entirely in the Rust ControlService started below.
   ret = g_grpc_server.Start();
   if (ret != 0)
-    GOTO_ERROR(err, "failed to start grpc control/event server.");
-  daemon.WireGrpc(&g_grpc_server.GetControlWorkQueue(), &g_grpc_server.GetEventBridge());
-  grpcWakeEvent.fd_ = g_grpc_server.WakeFd();
-  grpcWakeEvent.epoll_in_func_ = DispatchGrpcWorkQueueEvent;
-  grpcWakeEvent.daemon_ = &daemon;
-  ev.data.ptr = &grpcWakeEvent;
+    GOTO_ERROR(err, "failed to start grpc event server.");
+  daemon.WireEventBridge(&g_grpc_server.GetEventBridge());
+
+  // --- Rust ControlService (production control plane, port 50051) ---
+  int rust_dispatch_wake_fd;
+  rust_dispatch_wake_fd = eventfd(0, EFD_NONBLOCK);
+  if (rust_dispatch_wake_fd < 0)
+    GOTO_ERROR(err, "create rust control dispatch eventfd failed, %s.", strerror(errno));
+  static grpc_bridge::GrpcDispatchQueue rust_dispatch_queue(rust_dispatch_wake_fd);
+  daemon.WireRustControlDispatch(&rust_dispatch_queue);
+
+  rustDispatchWakeEvent.fd_ = rust_dispatch_wake_fd;
+  rustDispatchWakeEvent.epoll_in_func_ = grpc_bridge::DispatchGrpcRustQueueEvent;
+  rustDispatchWakeEvent.daemon_ = &daemon;
+  ev.data.ptr = &rustDispatchWakeEvent;
   ev.events = EPOLLIN;
-  ret = epoll_ctl(epfd, EPOLL_CTL_ADD, grpcWakeEvent.fd_, &ev);
+  ret = epoll_ctl(epfd, EPOLL_CTL_ADD, rust_dispatch_wake_fd, &ev);
   if (ret < 0)
-    GOTO_ERROR(err, "epoll ctl failed for grpc wake fd, %s.", strerror(errno));
+    GOTO_ERROR(err, "epoll ctl failed for rust control dispatch wake fd, %s.", strerror(errno));
+
   //
   unixEvent.fd_ = zListenFd;
   unixEvent.epoll_in_func_ = ProcAcceptEvent;
@@ -2304,6 +2598,13 @@ int RunNetPolicyDaemon(int argc, char* argv[]) {
   ret = epoll_ctl(epfd, EPOLL_CTL_ADD, zListenFd, &ev);
   if (ret < 0)
     GOTO_ERROR(err, "epoll ctl failed, %s.", strerror(errno));
+
+  {
+    uint16_t bound_port = grpc_bridge::start_control_server(&daemon, &rust_dispatch_queue, epfd, /*port=*/50051);
+    if (bound_port == 0)
+      GOTO_ERROR(err, "failed to start rust control service.");
+    LOG_I("rust control service listening on port %d", (int)bound_port);
+  }
   // accept client request
   while (1) {
     nfds = epoll_wait(epfd, events, 20, -1);
