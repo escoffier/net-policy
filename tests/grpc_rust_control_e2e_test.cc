@@ -206,4 +206,15 @@ TEST_F(GrpcRustControlEndToEndTest, DumpConnectionsReturnsWithoutError) {
   EXPECT_GE(resp.total(), 0);
 }
 
+TEST_F(GrpcRustControlEndToEndTest, UpdateNodeConfigAddReturnsOkStatus) {
+  grpc::ClientContext ctx;
+  netpolicy::v1::UpdateNodeConfigRequest req;
+  req.set_action(netpolicy::v1::UpdateNodeConfigRequest::ACTION_ADD);
+  req.add_node_ips("10.0.0.5");
+  netpolicy::v1::StatusResponse resp;
+  grpc::Status status = stub_->UpdateNodeConfig(&ctx, req, &resp);
+  ASSERT_TRUE(status.ok()) << status.error_message();
+  EXPECT_EQ(resp.status(), 0);
+}
+
 } // namespace

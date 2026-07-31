@@ -3,6 +3,7 @@ pub mod proto {
 }
 
 use proto::net_policy_control_server::{NetPolicyControl, NetPolicyControlServer};
+use proto::update_node_config_request::Action;
 use proto::{
     AddPolicyRuleRequest, AddWafRuleRequest, DeletePolicyRuleRequest, DeleteWafRuleRequest,
     DumpConfigRequest, DumpConfigResponse, DumpConnectionsRequest, DumpConnectionsResponse,
@@ -71,6 +72,13 @@ mod ffi {
             queue: *mut GrpcDispatchQueue,
             limit: i32,
         ) -> DumpConnectionsResult;
+
+        unsafe fn GrpcDispatchUpdateNodeConfig(
+            daemon: *mut DaemonContext,
+            queue: *mut GrpcDispatchQueue,
+            is_delete: bool,
+            node_ips: Vec<String>,
+        ) -> i32;
     }
 
     extern "Rust" {
@@ -231,9 +239,16 @@ impl NetPolicyControl for ControlServiceImpl {
 
     async fn update_node_config(
         &self,
-        _request: Request<UpdateNodeConfigRequest>,
+        request: Request<UpdateNodeConfigRequest>,
     ) -> Result<Response<StatusResponse>, Status> {
-        Err(Status::unimplemented("UpdateNodeConfig not yet implemented"))
+        let req = request.into_inner();
+        let is_delete = req.action == Action::Delete as i32;
+        let status = tokio::task::spawn_blocking(move || unsafe {
+            ffi::GrpcDispatchUpdateNodeConfig(daemon_ptr(), queue_ptr(), is_delete, req.node_ips)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("dispatch task panicked: {e}")))?;
+        Ok(Response::new(StatusResponse { status, uuid: String::new() }))
     }
 
     async fn set_log_level(

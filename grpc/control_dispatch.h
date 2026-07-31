@@ -74,6 +74,9 @@ struct DumpConnectionsResult;
 DumpConnectionsResult GrpcDispatchDumpConnections(DaemonContext* daemon, GrpcDispatchQueue* queue,
                                                     int32_t limit);
 
+int32_t GrpcDispatchUpdateNodeConfig(DaemonContext* daemon, GrpcDispatchQueue* queue,
+                                      bool is_delete, rust::Vec<rust::String> node_ips);
+
 // Epoll callback (RcvCbFunc-shaped: int32_t(int32_t epoll_fd, int32_t fd,
 // void* ptr)) for the Rust dispatch queue's wake eventfd. Drains `queue`
 // (read from the registering RcvEpollCb, threaded through via `ptr`) and
