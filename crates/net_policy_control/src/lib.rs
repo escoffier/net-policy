@@ -5,11 +5,12 @@ pub mod proto {
 use proto::net_policy_control_server::{NetPolicyControl, NetPolicyControlServer};
 use proto::update_node_config_request::Action;
 use proto::{
-    AddPolicyRuleRequest, AddWafRuleRequest, ContainerInfo as ProtoContainerInfo,
-    DeletePolicyRuleRequest, DeleteWafRuleRequest, DumpConfigRequest, DumpConfigResponse,
-    DumpConnectionsRequest, DumpConnectionsResponse, DumpHeapProfileRequest, PodDownRequest,
-    PodUpRequest, PolicyRuleConfigEntry as ProtoConfigEntry, ResetConfigRequest,
-    SetLogLevelRequest, StatusResponse, UpdateNodeConfigRequest,
+    AddPolicyRuleRequest, AddWafRuleRequest, AddressEndpoint as ProtoAddressEndpoint,
+    ContainerInfo as ProtoContainerInfo, DeletePolicyRuleRequest, DeleteWafRuleRequest,
+    DumpConfigRequest, DumpConfigResponse, DumpConnectionsRequest, DumpConnectionsResponse,
+    DumpHeapProfileRequest, HttpMatchRule as ProtoHttpRule, PodDownRequest, PodUpRequest,
+    PolicyRuleConfigEntry as ProtoConfigEntry, PolicyRuleSpec as ProtoRuleSpec, PortRange as ProtoPortRange,
+    ResetConfigRequest, SetLogLevelRequest, StatusResponse, UpdateNodeConfigRequest,
 };
 use std::sync::OnceLock;
 use tonic::{transport::Server, Request, Response, Status};
@@ -40,6 +41,30 @@ mod ffi {
         outbound_rules: Vec<PolicyRuleConfigEntry>,
         containers: Vec<ContainerInfo>,
         tcp_connections: i64,
+    }
+
+    struct HttpMatchRule {
+        host: String,
+        method: String,
+        path: String,
+    }
+    struct AddressEndpoint {
+        ip: String,
+        pod_id: u64,
+    }
+    struct PortRange {
+        port: u32,
+        end_port: u32,
+    }
+    struct PolicyRuleSpec {
+        action: i32,
+        direction: i32,
+        protocol: i32,
+        http_rules: Vec<HttpMatchRule>,
+        from_addresses: Vec<AddressEndpoint>,
+        to_addresses: Vec<AddressEndpoint>,
+        ports: Vec<PortRange>,
+        priority: i32,
     }
 
     unsafe extern "C++" {
@@ -113,6 +138,13 @@ mod ffi {
             queue: *mut GrpcDispatchQueue,
             policy_name: &str,
         ) -> DumpConfigResult;
+
+        unsafe fn GrpcDispatchAddPolicyRule(
+            daemon: *mut DaemonContext,
+            queue: *mut GrpcDispatchQueue,
+            policy_name: &str,
+            rules: Vec<PolicyRuleSpec>,
+        ) -> i32;
     }
 
     extern "Rust" {
@@ -188,9 +220,50 @@ impl NetPolicyControl for ControlServiceImpl {
 
     async fn add_policy_rule(
         &self,
-        _request: Request<AddPolicyRuleRequest>,
+        request: Request<AddPolicyRuleRequest>,
     ) -> Result<Response<StatusResponse>, Status> {
-        Err(Status::unimplemented("AddPolicyRule not yet implemented"))
+        let req = request.into_inner();
+        let rules: Vec<ffi::PolicyRuleSpec> = req
+            .rules
+            .into_iter()
+            .map(|r: ProtoRuleSpec| ffi::PolicyRuleSpec {
+                action: r.action,
+                direction: r.direction,
+                protocol: r.protocol,
+                http_rules: r
+                    .http_rules
+                    .into_iter()
+                    .map(|h: ProtoHttpRule| ffi::HttpMatchRule {
+                        host: h.host,
+                        method: h.method,
+                        path: h.path,
+                    })
+                    .collect(),
+                from_addresses: r
+                    .from_addresses
+                    .into_iter()
+                    .map(|a: ProtoAddressEndpoint| ffi::AddressEndpoint { ip: a.ip, pod_id: a.pod_id })
+                    .collect(),
+                to_addresses: r
+                    .to_addresses
+                    .into_iter()
+                    .map(|a: ProtoAddressEndpoint| ffi::AddressEndpoint { ip: a.ip, pod_id: a.pod_id })
+                    .collect(),
+                ports: r
+                    .ports
+                    .into_iter()
+                    .map(|p: ProtoPortRange| ffi::PortRange { port: p.port, end_port: p.end_port })
+                    .collect(),
+                priority: r.priority,
+            })
+            .collect();
+        let policy_name = req.policy_name;
+        let status = tokio::task::spawn_blocking(move || unsafe {
+            ffi::GrpcDispatchAddPolicyRule(daemon_ptr(), queue_ptr(), &policy_name, rules)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("dispatch task panicked: {e}")))?;
+        Ok(Response::new(StatusResponse { status, uuid: String::new() }))
     }
 
     async fn delete_policy_rule(

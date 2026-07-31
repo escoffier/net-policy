@@ -2319,6 +2319,100 @@ DumpConfigResult GrpcDispatchDumpConfig(DaemonContext* daemon, GrpcDispatchQueue
   return result;
 }
 
+namespace {
+const char* PolicyActionToStr(int32_t action) {
+  switch (static_cast<netpolicy::v1::PolicyAction>(action)) {
+  case netpolicy::v1::POLICY_ACTION_ALLOW: return "Allow";
+  case netpolicy::v1::POLICY_ACTION_ALERT: return "Alert";
+  default:                                 return "Deny";
+  }
+}
+const char* FlowDirectionToStr(int32_t direction) {
+  return (static_cast<netpolicy::v1::FlowDirection>(direction) == netpolicy::v1::FLOW_DIRECTION_INGRESS)
+             ? "ingress" : "egress";
+}
+const char* L4ProtocolToStr(int32_t protocol) {
+  switch (static_cast<netpolicy::v1::L4Protocol>(protocol)) {
+  case netpolicy::v1::L4_PROTOCOL_TCP:  return "TCP";
+  case netpolicy::v1::L4_PROTOCOL_UDP:  return "UDP";
+  case netpolicy::v1::L4_PROTOCOL_ICMP: return "ICMP";
+  default:                              return "";
+  }
+}
+cJSON* AddressEndpointToJsonRust(const grpc_bridge::AddressEndpoint& ep) {
+  cJSON* obj = cJSON_CreateObject();
+  cJSON_AddStringToObject(obj, "ip", std::string(ep.ip).c_str());
+  cJSON_AddNumberToObject(obj, "pod_id", static_cast<double>(ep.pod_id));
+  return obj;
+}
+} // namespace
+
+int32_t GrpcDispatchAddPolicyRule(DaemonContext* daemon, GrpcDispatchQueue* queue,
+                                    rust::Str policy_name, rust::Vec<PolicyRuleSpec> rules) {
+  std::string name(policy_name);
+  cJSON* root = cJSON_CreateObject();
+  cJSON_AddStringToObject(root, "policy_name", name.c_str());
+
+  cJSON* rules_array = cJSON_CreateArray();
+  for (const auto& rule : rules) {
+    cJSON* r = cJSON_CreateObject();
+    cJSON_AddStringToObject(r, "action", PolicyActionToStr(rule.action));
+    cJSON_AddStringToObject(r, "direction", FlowDirectionToStr(rule.direction));
+    if (static_cast<netpolicy::v1::L4Protocol>(rule.protocol) != netpolicy::v1::L4_PROTOCOL_UNSPECIFIED)
+      cJSON_AddStringToObject(r, "protocol", L4ProtocolToStr(rule.protocol));
+
+    if (!rule.http_rules.empty()) {
+      cJSON* http = cJSON_CreateArray();
+      for (const auto& h : rule.http_rules) {
+        cJSON* item = cJSON_CreateObject();
+        cJSON_AddStringToObject(item, "host", std::string(h.host).c_str());
+        cJSON_AddStringToObject(item, "method", std::string(h.method).c_str());
+        cJSON_AddStringToObject(item, "path", std::string(h.path).c_str());
+        cJSON_AddItemToArray(http, item);
+      }
+      cJSON_AddItemToObject(r, "http", http);
+    }
+
+    cJSON* from_arr = cJSON_CreateArray();
+    for (const auto& ep : rule.from_addresses) cJSON_AddItemToArray(from_arr, AddressEndpointToJsonRust(ep));
+    cJSON_AddItemToObject(r, "from_addresses", from_arr);
+
+    cJSON* to_arr = cJSON_CreateArray();
+    for (const auto& ep : rule.to_addresses) cJSON_AddItemToArray(to_arr, AddressEndpointToJsonRust(ep));
+    cJSON_AddItemToObject(r, "to_addresses", to_arr);
+
+    if (!rule.ports.empty()) {
+      cJSON* ports = cJSON_CreateArray();
+      for (const auto& p : rule.ports) {
+        cJSON* item = cJSON_CreateObject();
+        cJSON_AddNumberToObject(item, "port", p.port);
+        cJSON_AddNumberToObject(item, "endPort", p.end_port); // camelCase, see net-policy.cpp:1557
+        cJSON_AddItemToArray(ports, item);
+      }
+      cJSON_AddItemToObject(r, "ports", ports);
+    }
+
+    cJSON_AddNumberToObject(r, "priority", rule.priority);
+    cJSON_AddItemToArray(rules_array, r);
+  }
+  cJSON_AddItemToObject(root, "rules", rules_array);
+  char* json_c = cJSON_PrintUnformatted(root);
+  std::string json(json_c);
+  cJSON_free(json_c);
+  cJSON_Delete(root);
+
+  GrpcDispatchItem item;
+  int32_t result = 1;
+  item.work = [&]() {
+    result = ParseNetPolicy(const_cast<char*>(json.c_str()), *daemon);
+    daemon->Microseg().PrintPolicyLog();
+  };
+  std::future<void> future = item.done.get_future();
+  queue->Push(&item);
+  future.wait();
+  return result;
+}
+
 int32_t DispatchGrpcRustQueueEvent(int32_t epoll_fd, int32_t fd, void* ptr) {
   (void)epoll_fd;
   auto* cb = static_cast<RcvEpollCb*>(ptr);

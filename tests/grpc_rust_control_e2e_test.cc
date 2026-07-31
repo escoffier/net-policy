@@ -238,4 +238,38 @@ TEST_F(GrpcRustControlEndToEndTest, DumpConfigForUnknownPolicyReturnsEmptyResult
   EXPECT_EQ(resp.outbound_rules_size(), 0);
 }
 
+TEST_F(GrpcRustControlEndToEndTest, AddPolicyRuleThenReadBackViaDumpConfig) {
+  netpolicy::v1::AddPolicyRuleRequest add_req;
+  add_req.set_policy_name("rust-e2e-test-policy");
+  auto* rule = add_req.add_rules();
+  rule->set_action(netpolicy::v1::POLICY_ACTION_ALLOW);
+  rule->set_direction(netpolicy::v1::FLOW_DIRECTION_INGRESS);
+  rule->set_priority(1);
+  rule->add_from_addresses()->set_ip("192.168.0.1");
+  rule->add_to_addresses()->set_ip("192.168.0.2");
+
+  grpc::ClientContext add_ctx;
+  netpolicy::v1::StatusResponse add_resp;
+  grpc::Status status = stub_->AddPolicyRule(&add_ctx, add_req, &add_resp);
+  ASSERT_TRUE(status.ok()) << status.error_message();
+  EXPECT_EQ(add_resp.status(), 0);
+
+  grpc::ClientContext dump_ctx;
+  netpolicy::v1::DumpConfigRequest dump_req;
+  dump_req.set_policy_name("rust-e2e-test-policy");
+  netpolicy::v1::DumpConfigResponse dump_resp;
+  status = stub_->DumpConfig(&dump_ctx, dump_req, &dump_resp);
+  ASSERT_TRUE(status.ok()) << status.error_message();
+  ASSERT_EQ(dump_resp.inbound_rules_size(), 1);
+  EXPECT_EQ(dump_resp.inbound_rules(0).policy_name(), "rust-e2e-test-policy");
+
+  grpc::ClientContext del_ctx;
+  netpolicy::v1::DeletePolicyRuleRequest del_req;
+  del_req.set_policy_name("rust-e2e-test-policy");
+  netpolicy::v1::StatusResponse del_resp;
+  status = stub_->DeletePolicyRule(&del_ctx, del_req, &del_resp);
+  ASSERT_TRUE(status.ok());
+  EXPECT_EQ(del_resp.status(), 0);
+}
+
 } // namespace
