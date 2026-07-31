@@ -42,6 +42,12 @@ mod ffi {
             epoll_fd: i32,
             pod_id: u64,
         ) -> i32;
+
+        unsafe fn GrpcDispatchDeletePolicyRule(
+            daemon: *mut DaemonContext,
+            queue: *mut GrpcDispatchQueue,
+            policy_name: &str,
+        ) -> i32;
     }
 
     extern "Rust" {
@@ -124,9 +130,15 @@ impl NetPolicyControl for ControlServiceImpl {
 
     async fn delete_policy_rule(
         &self,
-        _request: Request<DeletePolicyRuleRequest>,
+        request: Request<DeletePolicyRuleRequest>,
     ) -> Result<Response<StatusResponse>, Status> {
-        Err(Status::unimplemented("DeletePolicyRule not yet implemented"))
+        let req = request.into_inner();
+        let status = tokio::task::spawn_blocking(move || unsafe {
+            ffi::GrpcDispatchDeletePolicyRule(daemon_ptr(), queue_ptr(), &req.policy_name)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("dispatch task panicked: {e}")))?;
+        Ok(Response::new(StatusResponse { status, uuid: String::new() }))
     }
 
     async fn add_waf_rule(

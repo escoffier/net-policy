@@ -141,4 +141,14 @@ TEST_F(GrpcRustControlEndToEndTest, PodDownForUnknownPodReturnsZeroStatus) {
   EXPECT_EQ(resp.status(), 0);
 }
 
+TEST_F(GrpcRustControlEndToEndTest, DeletePolicyRuleForUnknownNameReturnsZeroStatus) {
+  grpc::ClientContext ctx;
+  netpolicy::v1::DeletePolicyRuleRequest req;
+  req.set_policy_name("does-not-exist");
+  netpolicy::v1::StatusResponse resp;
+  grpc::Status status = stub_->DeletePolicyRule(&ctx, req, &resp);
+  ASSERT_TRUE(status.ok()) << status.error_message();
+  EXPECT_EQ(resp.status(), 0);
+}
+
 } // namespace

@@ -6,6 +6,7 @@
 #include <future>
 #include <mutex>
 #include <vector>
+#include "rust/cxx.h"
 
 class DaemonContext; // forward declaration; full type in net-policy.h
 
@@ -52,6 +53,9 @@ int32_t GrpcDispatchPodUp(DaemonContext* daemon, GrpcDispatchQueue* queue, int32
 
 int32_t GrpcDispatchPodDown(DaemonContext* daemon, GrpcDispatchQueue* queue, int32_t epoll_fd,
                              uint64_t pod_id);
+
+int32_t GrpcDispatchDeletePolicyRule(DaemonContext* daemon, GrpcDispatchQueue* queue,
+                                      rust::Str policy_name);
 
 // Epoll callback (RcvCbFunc-shaped: int32_t(int32_t epoll_fd, int32_t fd,
 // void* ptr)) for the Rust dispatch queue's wake eventfd. Drains `queue`

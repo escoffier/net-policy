@@ -2144,6 +2144,20 @@ int32_t GrpcDispatchPodDown(DaemonContext* daemon, GrpcDispatchQueue* queue, int
   return result;
 }
 
+int32_t GrpcDispatchDeletePolicyRule(DaemonContext* daemon, GrpcDispatchQueue* queue,
+                                      rust::Str policy_name) {
+  GrpcDispatchItem item;
+  int32_t result = 1;
+  std::string name(policy_name);
+  item.work = [&]() {
+    result = DeletePolicy(name, *daemon);
+  };
+  std::future<void> future = item.done.get_future();
+  queue->Push(&item);
+  future.wait();
+  return result;
+}
+
 int32_t DispatchGrpcRustQueueEvent(int32_t epoll_fd, int32_t fd, void* ptr) {
   (void)epoll_fd;
   auto* cb = static_cast<RcvEpollCb*>(ptr);
