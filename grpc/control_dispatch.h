@@ -57,6 +57,9 @@ int32_t GrpcDispatchPodDown(DaemonContext* daemon, GrpcDispatchQueue* queue, int
 int32_t GrpcDispatchDeletePolicyRule(DaemonContext* daemon, GrpcDispatchQueue* queue,
                                       rust::Str policy_name);
 
+bool GrpcDispatchDeleteWafRule(DaemonContext* daemon, GrpcDispatchQueue* queue,
+                                rust::Vec<rust::String> pod_ips);
+
 // Epoll callback (RcvCbFunc-shaped: int32_t(int32_t epoll_fd, int32_t fd,
 // void* ptr)) for the Rust dispatch queue's wake eventfd. Drains `queue`
 // (read from the registering RcvEpollCb, threaded through via `ptr`) and

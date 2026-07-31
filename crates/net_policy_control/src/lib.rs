@@ -48,6 +48,12 @@ mod ffi {
             queue: *mut GrpcDispatchQueue,
             policy_name: &str,
         ) -> i32;
+
+        unsafe fn GrpcDispatchDeleteWafRule(
+            daemon: *mut DaemonContext,
+            queue: *mut GrpcDispatchQueue,
+            pod_ips: Vec<String>,
+        ) -> bool;
     }
 
     extern "Rust" {
@@ -150,9 +156,15 @@ impl NetPolicyControl for ControlServiceImpl {
 
     async fn delete_waf_rule(
         &self,
-        _request: Request<DeleteWafRuleRequest>,
+        request: Request<DeleteWafRuleRequest>,
     ) -> Result<Response<StatusResponse>, Status> {
-        Err(Status::unimplemented("DeleteWafRule not yet implemented"))
+        let req = request.into_inner();
+        let found = tokio::task::spawn_blocking(move || unsafe {
+            ffi::GrpcDispatchDeleteWafRule(daemon_ptr(), queue_ptr(), req.pod_ips)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("dispatch task panicked: {e}")))?;
+        Ok(Response::new(StatusResponse { status: if found { 0 } else { 1 }, uuid: String::new() }))
     }
 
     async fn dump_heap_profile(

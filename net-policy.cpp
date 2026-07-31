@@ -2158,6 +2158,30 @@ int32_t GrpcDispatchDeletePolicyRule(DaemonContext* daemon, GrpcDispatchQueue* q
   return result;
 }
 
+bool GrpcDispatchDeleteWafRule(DaemonContext* daemon, GrpcDispatchQueue* queue,
+                                rust::Vec<rust::String> pod_ips) {
+  cJSON* root = cJSON_CreateObject();
+  cJSON* ips = cJSON_CreateArray();
+  for (const auto& ip : pod_ips) {
+    cJSON_AddItemToArray(ips, cJSON_CreateString(std::string(ip).c_str()));
+  }
+  cJSON_AddItemToObject(root, "pod_ips", ips);
+  char* json_c = cJSON_PrintUnformatted(root);
+  std::string json(json_c);
+  cJSON_free(json_c);
+  cJSON_Delete(root);
+
+  GrpcDispatchItem item;
+  bool result = false;
+  item.work = [&]() {
+    result = daemon->WafRoot().RemoveWafRule(const_cast<char*>(json.c_str()));
+  };
+  std::future<void> future = item.done.get_future();
+  queue->Push(&item);
+  future.wait();
+  return result;
+}
+
 int32_t DispatchGrpcRustQueueEvent(int32_t epoll_fd, int32_t fd, void* ptr) {
   (void)epoll_fd;
   auto* cb = static_cast<RcvEpollCb*>(ptr);
