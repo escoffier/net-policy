@@ -1,7 +1,11 @@
 #include "grpc/control_dispatch.h"
 
+#include <cerrno>
+#include <cstring>
 #include <sys/eventfd.h>
 #include <unistd.h>
+
+#include "log.h"
 
 namespace grpc_bridge {
 
@@ -14,7 +18,9 @@ void GrpcDispatchQueue::Push(GrpcDispatchItem* item) {
   }
   uint64_t one = 1;
   ssize_t written = write(wake_fd_, &one, sizeof(one));
-  (void)written; // best-effort wake; DrainAll's caller polls on a timeout regardless
+  if (written < 0) {
+    LOG_E("grpc dispatch queue wake write failed, %s; item may not be processed until the next unrelated wake", strerror(errno));
+  }
 }
 
 std::vector<GrpcDispatchItem*> GrpcDispatchQueue::DrainAll() {

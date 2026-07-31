@@ -2054,10 +2054,13 @@ int32_t GrpcDispatchDumpHeapProfile(DaemonContext* daemon, GrpcDispatchQueue* qu
 
 DumpConnectionsResult GrpcDispatchDumpConnections(DaemonContext* daemon, GrpcDispatchQueue* queue,
                                                     int32_t limit) {
-  std::string json = "{\"limit\":" + std::to_string(limit) + "}";
   GrpcDispatchItem item;
   DumpConnectionsResult result{};
   item.work = [&]() {
+    int32_t actual_count = static_cast<int32_t>(daemon->ConnMgr().connections().size());
+    int32_t safe_limit = std::min(limit, actual_count);
+    if (safe_limit < 0) safe_limit = 0;
+    std::string json = "{\"limit\":" + std::to_string(safe_limit) + "}";
     cJSON* conns = dumpConnectons(json, daemon->ConnMgr());
     if (conns) {
       cJSON* total = cJSON_GetObjectItem(conns, "total");
@@ -2069,7 +2072,7 @@ DumpConnectionsResult GrpcDispatchDumpConnections(DaemonContext* daemon, GrpcDis
         for (int i = 0; i < size; i++) {
           cJSON* entry = cJSON_GetArrayItem(items, i);
           if (entry && entry->valuestring)
-            result.items.push_back(entry->valuestring);
+            result.items.push_back(rust::String::lossy(entry->valuestring));
         }
       }
       cJSON_Delete(conns);
@@ -2135,14 +2138,14 @@ DumpConfigResult GrpcDispatchDumpConfig(DaemonContext* daemon, GrpcDispatchQueue
         if (!e) continue;
         PolicyRuleConfigEntry entry{};
         cJSON* v;
-        if ((v = cJSON_GetObjectItem(e, "policy_name")) && v->valuestring) entry.policy_name = v->valuestring;
+        if ((v = cJSON_GetObjectItem(e, "policy_name")) && v->valuestring) entry.policy_name = rust::String::lossy(v->valuestring);
         if ((v = cJSON_GetObjectItem(e, "priority"))) entry.priority = v->valueint;
-        if ((v = cJSON_GetObjectItem(e, "direction")) && v->valuestring) entry.direction = v->valuestring;
-        if ((v = cJSON_GetObjectItem(e, "action")) && v->valuestring) entry.action = v->valuestring;
-        if ((v = cJSON_GetObjectItem(e, "protocol")) && v->valuestring) entry.protocol = v->valuestring;
+        if ((v = cJSON_GetObjectItem(e, "direction")) && v->valuestring) entry.direction = rust::String::lossy(v->valuestring);
+        if ((v = cJSON_GetObjectItem(e, "action")) && v->valuestring) entry.action = rust::String::lossy(v->valuestring);
+        if ((v = cJSON_GetObjectItem(e, "protocol")) && v->valuestring) entry.protocol = rust::String::lossy(v->valuestring);
         if ((v = cJSON_GetObjectItem(e, "protocol_int"))) entry.protocol_int = v->valueint;
-        if ((v = cJSON_GetObjectItem(e, "from_address")) && v->valuestring) entry.from_address = v->valuestring;
-        if ((v = cJSON_GetObjectItem(e, "to_address")) && v->valuestring) entry.to_address = v->valuestring;
+        if ((v = cJSON_GetObjectItem(e, "from_address")) && v->valuestring) entry.from_address = rust::String::lossy(v->valuestring);
+        if ((v = cJSON_GetObjectItem(e, "to_address")) && v->valuestring) entry.to_address = rust::String::lossy(v->valuestring);
         out.push_back(std::move(entry));
       }
     };
@@ -2352,7 +2355,13 @@ int32_t DispatchGrpcRustQueueEvent(int32_t epoll_fd, int32_t fd, void* ptr) {
   while (read(fd, &drain, sizeof(drain)) > 0) {
   }
   for (auto* item : queue->DrainAll()) {
-    item->work();
+    try {
+      item->work();
+    } catch (const std::exception& e) {
+      LOG_E("grpc dispatch closure threw: %s", e.what());
+    } catch (...) {
+      LOG_E("grpc dispatch closure threw an unknown exception");
+    }
     item->done.set_value();
   }
   return 0;
@@ -2579,12 +2588,6 @@ int RunNetPolicyDaemon(int argc, char* argv[]) {
   if (ret < 0)
     GOTO_ERROR(err, "epoll ctl failed for rust control dispatch wake fd, %s.", strerror(errno));
 
-  {
-    uint16_t bound_port = grpc_bridge::start_control_server(&daemon, &rust_dispatch_queue, epfd, /*port=*/50051);
-    if (bound_port == 0)
-      GOTO_ERROR(err, "failed to start rust control service.");
-    LOG_I("rust control service listening on port %d", (int)bound_port);
-  }
   //
   unixEvent.fd_ = zListenFd;
   unixEvent.epoll_in_func_ = ProcAcceptEvent;
@@ -2595,6 +2598,13 @@ int RunNetPolicyDaemon(int argc, char* argv[]) {
   ret = epoll_ctl(epfd, EPOLL_CTL_ADD, zListenFd, &ev);
   if (ret < 0)
     GOTO_ERROR(err, "epoll ctl failed, %s.", strerror(errno));
+
+  {
+    uint16_t bound_port = grpc_bridge::start_control_server(&daemon, &rust_dispatch_queue, epfd, /*port=*/50051);
+    if (bound_port == 0)
+      GOTO_ERROR(err, "failed to start rust control service.");
+    LOG_I("rust control service listening on port %d", (int)bound_port);
+  }
   // accept client request
   while (1) {
     nfds = epoll_wait(epfd, events, 20, -1);

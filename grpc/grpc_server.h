@@ -11,7 +11,8 @@ namespace grpc_bridge {
 
 /*port for the gRPC event server; distinct from the existing raw-socket ports
  *(9999 control, 8888 push) and from the Rust ControlService's production
- *port (50051, grpc/control_dispatch.h) -- all keep running untouched*/
+ *port (50051, set in RunNetPolicyDaemon's call to start_control_server in
+ *net-policy.cpp) -- all keep running untouched*/
 inline constexpr int kGrpcPort = 50052;
 
 /*Owns the gRPC event server. RunNetPolicyDaemon (net-policy.cpp) calls

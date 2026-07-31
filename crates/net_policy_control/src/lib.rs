@@ -214,7 +214,7 @@ mod ffi {
  *on the C++ epoll thread inside the dispatch closures -- Rust never touches
  *DaemonContext's fields directly.*/
 struct ServerState {
-    daemon: usize, // DaemonContext* as usize; see with_daemon()/with_queue() below
+    daemon: usize, // DaemonContext* as usize; see daemon_ptr()/queue_ptr() below
     queue: usize,
     epoll_fd: i32,
 }
@@ -232,11 +232,6 @@ fn queue_ptr() -> *mut ffi::GrpcDispatchQueue {
 
 struct ControlServiceImpl;
 
-// Every other RPC on this service is added in a later Phase 2 task,
-// following the exact ResetConfig pattern established here (a
-// GrpcDispatchXxx C++ function + an ffi bridge declaration + a method body
-// that spawn_blocking's into it). Stubbed as unimplemented until then so the
-// service can compile and serve ResetConfig today.
 #[tonic::async_trait]
 impl NetPolicyControl for ControlServiceImpl {
     async fn pod_up(
