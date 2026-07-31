@@ -2251,6 +2251,19 @@ int32_t GrpcDispatchUpdateNodeConfig(DaemonContext* daemon, GrpcDispatchQueue* q
   return result;
 }
 
+int32_t GrpcDispatchSetLogLevel(DaemonContext* daemon, GrpcDispatchQueue* queue, int32_t level) {
+  (void)daemon;
+  GrpcDispatchItem item;
+  item.work = [&]() {
+    g_log_level = level;
+    LOG_I("set log level : %d", g_log_level.load());
+  };
+  std::future<void> future = item.done.get_future();
+  queue->Push(&item);
+  future.wait();
+  return 0;
+}
+
 int32_t DispatchGrpcRustQueueEvent(int32_t epoll_fd, int32_t fd, void* ptr) {
   (void)epoll_fd;
   auto* cb = static_cast<RcvEpollCb*>(ptr);

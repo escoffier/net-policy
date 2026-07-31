@@ -217,4 +217,14 @@ TEST_F(GrpcRustControlEndToEndTest, UpdateNodeConfigAddReturnsOkStatus) {
   EXPECT_EQ(resp.status(), 0);
 }
 
+TEST_F(GrpcRustControlEndToEndTest, SetLogLevelReturnsOkStatus) {
+  grpc::ClientContext ctx;
+  netpolicy::v1::SetLogLevelRequest req;
+  req.set_level(2);
+  netpolicy::v1::StatusResponse resp;
+  grpc::Status status = stub_->SetLogLevel(&ctx, req, &resp);
+  ASSERT_TRUE(status.ok()) << status.error_message();
+  EXPECT_EQ(resp.status(), 0);
+}
+
 } // namespace

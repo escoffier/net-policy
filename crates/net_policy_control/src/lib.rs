@@ -79,6 +79,12 @@ mod ffi {
             is_delete: bool,
             node_ips: Vec<String>,
         ) -> i32;
+
+        unsafe fn GrpcDispatchSetLogLevel(
+            daemon: *mut DaemonContext,
+            queue: *mut GrpcDispatchQueue,
+            level: i32,
+        ) -> i32;
     }
 
     extern "Rust" {
@@ -253,9 +259,15 @@ impl NetPolicyControl for ControlServiceImpl {
 
     async fn set_log_level(
         &self,
-        _request: Request<SetLogLevelRequest>,
+        request: Request<SetLogLevelRequest>,
     ) -> Result<Response<StatusResponse>, Status> {
-        Err(Status::unimplemented("SetLogLevel not yet implemented"))
+        let req = request.into_inner();
+        let status = tokio::task::spawn_blocking(move || unsafe {
+            ffi::GrpcDispatchSetLogLevel(daemon_ptr(), queue_ptr(), req.level)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("dispatch task panicked: {e}")))?;
+        Ok(Response::new(StatusResponse { status, uuid: String::new() }))
     }
 }
 
