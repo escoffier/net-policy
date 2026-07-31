@@ -81,6 +81,7 @@ set(SOURCES
     waf/plugin.cc
     waf/rule.cc
     grpc/work_queue.cc
+    grpc/control_dispatch.cc
     grpc/proto_json_bridge.cc
     grpc/control_service.cc
     grpc/event_bridge.cc
@@ -254,6 +255,7 @@ add_executable(net_rule_grpc_test
     waf/plugin.cc
     waf/rule.cc
     grpc/work_queue.cc
+    grpc/control_dispatch.cc
     grpc/proto_json_bridge.cc
     grpc/control_service.cc
     grpc/event_bridge.cc
