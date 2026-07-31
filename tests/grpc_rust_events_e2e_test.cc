@@ -62,6 +62,14 @@ TEST_F(GrpcRustEventsEndToEndTest, SubscribeEventsReceivesPublishedPolicyMatch) 
   EXPECT_EQ(match.policy_name(), "test-policy");
 
   ctx.TryCancel();
+  reader->Finish(); // ignore the returned status -- we intentionally cancelled
+  // Give the server-side spawn_blocking loop time to notice the torn-down
+  // stream (via a failed blocking_send) and exit before the next TEST_F
+  // starts a new SubscribeEvents call against the same shared global
+  // queue -- otherwise this test's now-stale loop can race the next
+  // test's loop for the next published event and steal it. 500ms is the
+  // loop's own wait_and_pop timeout; add a safety margin.
+  std::this_thread::sleep_for(std::chrono::milliseconds(600));
 }
 
 TEST_F(GrpcRustEventsEndToEndTest, SubscribeEventsReceivesPublishedWafAttack) {
@@ -86,6 +94,14 @@ TEST_F(GrpcRustEventsEndToEndTest, SubscribeEventsReceivesPublishedWafAttack) {
   EXPECT_EQ(attack.attacked_url(), "url");
 
   ctx.TryCancel();
+  reader->Finish(); // ignore the returned status -- we intentionally cancelled
+  // Give the server-side spawn_blocking loop time to notice the torn-down
+  // stream (via a failed blocking_send) and exit before the next TEST_F
+  // starts a new SubscribeEvents call against the same shared global
+  // queue -- otherwise this test's now-stale loop can race the next
+  // test's loop for the next published event and steal it. 500ms is the
+  // loop's own wait_and_pop timeout; add a safety margin.
+  std::this_thread::sleep_for(std::chrono::milliseconds(600));
 }
 
 // The server-side spawn_blocking loop has no direct C++-observable handle
@@ -107,6 +123,13 @@ TEST_F(GrpcRustEventsEndToEndTest, SubscribeEventsStopsAfterClientCancellation) 
   // default per-test deadline, is the backstop if it doesn't) with a
   // cancellation-shaped status rather than hang or report OK.
   EXPECT_EQ(status.error_code(), grpc::StatusCode::CANCELLED);
+  // Give the server-side spawn_blocking loop time to notice the torn-down
+  // stream (via a failed blocking_send) and exit before the next TEST_F
+  // starts a new SubscribeEvents call against the same shared global
+  // queue -- otherwise this test's now-stale loop can race the next
+  // test's loop for the next published event and steal it. 500ms is the
+  // loop's own wait_and_pop timeout; add a safety margin.
+  std::this_thread::sleep_for(std::chrono::milliseconds(600));
 }
 
 } // namespace
