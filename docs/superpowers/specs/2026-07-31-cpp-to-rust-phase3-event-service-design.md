@@ -47,12 +47,13 @@ wired into `net-rule`/`net_rule_grpc_test` via Corrosion, mirroring
 generated code as independent, linking against `net_policy_common.pb.cc` as
 a separately-compiled shared unit).
 
-A new entry point, `start_event_server(epoll_fd: i32, port: u16) -> u16`,
-mirrors `start_control_server`'s shape (own OS thread, own dedicated `tokio`
+A new entry point, `start_event_server(port: u16) -> u16`, mirrors
+`start_control_server`'s shape (own OS thread, own dedicated `tokio`
 runtime, port-bound-before-return synchronization via a channel) but takes
-**no `DaemonContext` pointer** — `SubscribeEvents` never touches policy/WAF
-state, only the event queue, so this crate has zero coupling to
-`DaemonContext` or the single-writer invariant that governs
+**no `DaemonContext` pointer and no `epoll_fd`** — `SubscribeEvents` never
+touches policy/WAF state or registers anything with the epoll loop, only
+the event queue, so this crate has zero coupling to `DaemonContext` or the
+single-writer invariant that governs
 `net_policy_control`.
 
 `GrpcServer`, `EventServiceImpl`, and `EventBridge` (all C++) are deleted
