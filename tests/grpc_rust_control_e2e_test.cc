@@ -227,4 +227,15 @@ TEST_F(GrpcRustControlEndToEndTest, SetLogLevelReturnsOkStatus) {
   EXPECT_EQ(resp.status(), 0);
 }
 
+TEST_F(GrpcRustControlEndToEndTest, DumpConfigForUnknownPolicyReturnsEmptyResult) {
+  grpc::ClientContext ctx;
+  netpolicy::v1::DumpConfigRequest req;
+  req.set_policy_name("does-not-exist");
+  netpolicy::v1::DumpConfigResponse resp;
+  grpc::Status status = stub_->DumpConfig(&ctx, req, &resp);
+  ASSERT_TRUE(status.ok()) << status.error_message();
+  EXPECT_EQ(resp.inbound_rules_size(), 0);
+  EXPECT_EQ(resp.outbound_rules_size(), 0);
+}
+
 } // namespace

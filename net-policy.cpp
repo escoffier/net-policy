@@ -2264,6 +2264,61 @@ int32_t GrpcDispatchSetLogLevel(DaemonContext* daemon, GrpcDispatchQueue* queue,
   return 0;
 }
 
+DumpConfigResult GrpcDispatchDumpConfig(DaemonContext* daemon, GrpcDispatchQueue* queue,
+                                          rust::Str policy_name) {
+  std::string name(policy_name);
+  GrpcDispatchItem item;
+  DumpConfigResult result{};
+  item.work = [&]() {
+    cJSON* config = daemon->Microseg().GetAllConfig(name, daemon->ConnMgr());
+    if (!config) return;
+    auto convert_entries = [](cJSON* array, rust::Vec<PolicyRuleConfigEntry>& out) {
+      if (!array) return;
+      int size = cJSON_GetArraySize(array);
+      for (int i = 0; i < size; i++) {
+        cJSON* e = cJSON_GetArrayItem(array, i);
+        if (!e) continue;
+        PolicyRuleConfigEntry entry{};
+        cJSON* v;
+        if ((v = cJSON_GetObjectItem(e, "policy_name")) && v->valuestring) entry.policy_name = v->valuestring;
+        if ((v = cJSON_GetObjectItem(e, "priority"))) entry.priority = v->valueint;
+        if ((v = cJSON_GetObjectItem(e, "direction")) && v->valuestring) entry.direction = v->valuestring;
+        if ((v = cJSON_GetObjectItem(e, "action")) && v->valuestring) entry.action = v->valuestring;
+        if ((v = cJSON_GetObjectItem(e, "protocol")) && v->valuestring) entry.protocol = v->valuestring;
+        if ((v = cJSON_GetObjectItem(e, "protocol_int"))) entry.protocol_int = v->valueint;
+        if ((v = cJSON_GetObjectItem(e, "from_address")) && v->valuestring) entry.from_address = v->valuestring;
+        if ((v = cJSON_GetObjectItem(e, "to_address")) && v->valuestring) entry.to_address = v->valuestring;
+        out.push_back(std::move(entry));
+      }
+    };
+    convert_entries(cJSON_GetObjectItem(config, "inbound_rules"), result.inbound_rules);
+    convert_entries(cJSON_GetObjectItem(config, "outbound_rules"), result.outbound_rules);
+    cJSON* containers = cJSON_GetObjectItem(config, "containers");
+    if (containers) {
+      int size = cJSON_GetArraySize(containers);
+      for (int i = 0; i < size; i++) {
+        cJSON* c = cJSON_GetArrayItem(containers, i);
+        if (!c) continue;
+        ContainerInfo ci{};
+        cJSON* v;
+        if ((v = cJSON_GetObjectItem(c, "pid"))) ci.pid = v->valueint;
+        if ((v = cJSON_GetObjectItem(c, "pod_id"))) ci.pod_id = (uint64_t)v->valuedouble;
+        result.containers.push_back(ci);
+      }
+    }
+    cJSON* tcp = cJSON_GetObjectItem(config, "tcp");
+    if (tcp) {
+      cJSON* conn = cJSON_GetObjectItem(tcp, "tcp_connection");
+      if (conn) result.tcp_connections = (int64_t)conn->valuedouble;
+    }
+    cJSON_Delete(config);
+  };
+  std::future<void> future = item.done.get_future();
+  queue->Push(&item);
+  future.wait();
+  return result;
+}
+
 int32_t DispatchGrpcRustQueueEvent(int32_t epoll_fd, int32_t fd, void* ptr) {
   (void)epoll_fd;
   auto* cb = static_cast<RcvEpollCb*>(ptr);

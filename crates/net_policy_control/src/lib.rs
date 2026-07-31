@@ -5,10 +5,11 @@ pub mod proto {
 use proto::net_policy_control_server::{NetPolicyControl, NetPolicyControlServer};
 use proto::update_node_config_request::Action;
 use proto::{
-    AddPolicyRuleRequest, AddWafRuleRequest, DeletePolicyRuleRequest, DeleteWafRuleRequest,
-    DumpConfigRequest, DumpConfigResponse, DumpConnectionsRequest, DumpConnectionsResponse,
-    DumpHeapProfileRequest, PodDownRequest, PodUpRequest, ResetConfigRequest, SetLogLevelRequest,
-    StatusResponse, UpdateNodeConfigRequest,
+    AddPolicyRuleRequest, AddWafRuleRequest, ContainerInfo as ProtoContainerInfo,
+    DeletePolicyRuleRequest, DeleteWafRuleRequest, DumpConfigRequest, DumpConfigResponse,
+    DumpConnectionsRequest, DumpConnectionsResponse, DumpHeapProfileRequest, PodDownRequest,
+    PodUpRequest, PolicyRuleConfigEntry as ProtoConfigEntry, ResetConfigRequest,
+    SetLogLevelRequest, StatusResponse, UpdateNodeConfigRequest,
 };
 use std::sync::OnceLock;
 use tonic::{transport::Server, Request, Response, Status};
@@ -18,6 +19,27 @@ mod ffi {
     struct DumpConnectionsResult {
         total: i64,
         items: Vec<String>,
+    }
+
+    struct PolicyRuleConfigEntry {
+        policy_name: String,
+        priority: i32,
+        direction: String,
+        action: String,
+        protocol: String,
+        protocol_int: i32,
+        from_address: String,
+        to_address: String,
+    }
+    struct ContainerInfo {
+        pid: i32,
+        pod_id: u64,
+    }
+    struct DumpConfigResult {
+        inbound_rules: Vec<PolicyRuleConfigEntry>,
+        outbound_rules: Vec<PolicyRuleConfigEntry>,
+        containers: Vec<ContainerInfo>,
+        tcp_connections: i64,
     }
 
     unsafe extern "C++" {
@@ -85,6 +107,12 @@ mod ffi {
             queue: *mut GrpcDispatchQueue,
             level: i32,
         ) -> i32;
+
+        unsafe fn GrpcDispatchDumpConfig(
+            daemon: *mut DaemonContext,
+            queue: *mut GrpcDispatchQueue,
+            policy_name: &str,
+        ) -> DumpConfigResult;
     }
 
     extern "Rust" {
@@ -213,9 +241,35 @@ impl NetPolicyControl for ControlServiceImpl {
 
     async fn dump_config(
         &self,
-        _request: Request<DumpConfigRequest>,
+        request: Request<DumpConfigRequest>,
     ) -> Result<Response<DumpConfigResponse>, Status> {
-        Err(Status::unimplemented("DumpConfig not yet implemented"))
+        let req = request.into_inner();
+        let result = tokio::task::spawn_blocking(move || unsafe {
+            ffi::GrpcDispatchDumpConfig(daemon_ptr(), queue_ptr(), &req.policy_name)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("dispatch task panicked: {e}")))?;
+
+        let convert = |e: ffi::PolicyRuleConfigEntry| ProtoConfigEntry {
+            policy_name: e.policy_name,
+            priority: e.priority,
+            direction: e.direction,
+            action: e.action,
+            protocol: e.protocol,
+            protocol_int: e.protocol_int,
+            from_address: e.from_address,
+            to_address: e.to_address,
+        };
+        Ok(Response::new(DumpConfigResponse {
+            inbound_rules: result.inbound_rules.into_iter().map(convert).collect(),
+            outbound_rules: result.outbound_rules.into_iter().map(convert).collect(),
+            containers: result
+                .containers
+                .into_iter()
+                .map(|c| ProtoContainerInfo { pid: c.pid, pod_id: c.pod_id })
+                .collect(),
+            tcp_connections: result.tcp_connections,
+        }))
     }
 
     async fn dump_connections(
