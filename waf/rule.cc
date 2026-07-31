@@ -1,4 +1,3 @@
-#define PCRE2_CODE_UNIT_WIDTH 8
 #include <regex>
 #include <sstream>
 #include <iomanip>
@@ -6,10 +5,27 @@
 #include <iostream>
 #include <chrono>
 #include <stack>
-#include <pcre2.h>
+#include <stdexcept>
 #include "rule.h"
 #include "net-policy.h"
 #include "log.h"
+#include "waf_rules_core_cxxbridge/lib.h"
+
+namespace {
+// rust::Str requires valid UTF-8 and throws std::invalid_argument otherwise.
+// Attacker-controlled HTTP bytes (path, Host, X-Forwarded-For, request
+// body) carry no such guarantee, so every FFI call taking one must fail
+// closed (treat as no-match) rather than let the exception escape
+// uncaught and crash the daemon via std::terminate.
+inline bool IsValidUtf8(const std::string &s) {
+    try {
+        (void)rust::Str(s);
+        return true;
+    } catch (const std::invalid_argument &) {
+        return false;
+    }
+}
+}  // namespace
 
 /*
 std::string GetNowTime()
@@ -62,121 +78,6 @@ std::string getRuleVaule(std::string str)
 		value = str.substr(firstQuotePos + 1, lastQuotePos - firstQuotePos - 1);
 	}
 	return value;
-}
-
-/*eval*/
-bool eval(const std::string& expression) {
-    char op;
-    std::stack<char> operators;
-    std::stack<bool> operands;
-
-    for (size_t i = 0; i < expression.length(); i++)
-    {
-        char c = expression[i];
-
-        if (c == ' ') continue;
-
-        if (c == '(')
-        {
-            operators.push(c);
-        }
-        else if (c == ')')
-        {
-            while (!operators.empty() && operators.top() != '(')
-            {
-                op = operators.top();
-                operators.pop();
-
-                bool op2 = operands.top();
-                operands.pop();
-
-                bool op1 = operands.top();
-                operands.pop();
-
-                bool result;
-                if (op == '&')
-                    result = op1 && op2;
-                else if (op == '|')
-                    result = op1 || op2;
-
-                operands.push(result);
-            }
-
-            if (!operators.empty()) operators.pop();
-        }
-        else if (c == '&' && i + 1 < expression.length() && expression[i + 1] == '&')
-        {
-            i++;
-            while (!operators.empty() && operators.top() != '(' && operators.top() != '|')
-            {
-                operators.pop();
-
-                bool op2 = operands.top();
-                operands.pop();
-
-                bool op1 = operands.top();
-                operands.pop();
-
-                bool result = op1 && op2;
-
-                operands.push(result);
-            }
-
-            operators.push('&');
-        }
-        else if (c == '|' && i + 1 < expression.length() && expression[i + 1] == '|')
-        {
-            i++;
-            while (!operators.empty() && operators.top() != '(')
-            {
-                operators.pop();
-
-                bool op2 = operands.top();
-                operands.pop();
-
-                bool op1 = operands.top();
-                operands.pop();
-
-                bool result = op1 || op2;
-
-                operands.push(result);
-            }
-
-            operators.push('|');
-        }
-        else if (c == 't' && i + 3 < expression.length() && expression.substr(i, 4) == "true")
-        {
-            operands.push(true);
-            i += 3;
-        }
-        else if (c == 'f' && i + 4 < expression.length() && expression.substr(i, 5) == "false")
-        {
-            operands.push(false);
-            i += 4;
-        }
-    }
-
-    while (!operators.empty())
-    {
-        op = operators.top();
-        operators.pop();
-
-        bool op2 = operands.top();
-        operands.pop();
-
-        bool op1 = operands.top();
-        operands.pop();
-
-        bool result;
-        if (op == '&')
-            result = op1 && op2;
-        else if (op == '|')
-            result = op1 || op2;
-
-        operands.push(result);
-    }
-
-    return operands.top();
 }
 
 int CountSubstr(const std::string& str, const std::string subStr)
@@ -246,52 +147,8 @@ int64_t GetNowTime()
 
 bool isIPAddress(const std::string& str)
 {
-    std::regex pattern("^([01]?\\d\\d?|2[0-4]\\d|25[0-5])\\."
-                      "([01]?\\d\\d?|2[0-4]\\d|25[0-5])\\."
-                      "([01]?\\d\\d?|2[0-4]\\d|25[0-5])\\."
-                      "([01]?\\d\\d?|2[0-4]\\d|25[0-5])$");
-    return std::regex_match(str, pattern);
-}
-
-std::string calculateNetworkAddress(std::string ipAddress, int subnetMask) {
-    // 将IP地址字符串拆分为四个部分
-    std::stringstream ss(ipAddress);
-    std::string segment;
-    int octets[4] = {0};
-    int i = 0;
-    while (std::getline(ss, segment, '.')) {
-        octets[i++] = std::stoi(segment);
-    }
-    
-    // 计算网络地址
-    uint32_t ip = (octets[0] << 24) | (octets[1] << 16) | (octets[2] << 8) | octets[3];
-    uint32_t subnetMaskBits = (0xFFFFFFFFU << (32 - subnetMask));
-    uint32_t networkAddress = ip & subnetMaskBits;
-    
-    // 将网络地址转换回字符串形式
-    std::stringstream networkAddressSS;
-    networkAddressSS << ((networkAddress >> 24) & 0xFF) << "." 
-                     << ((networkAddress >> 16) & 0xFF) << "." 
-                     << ((networkAddress >> 8) & 0xFF) << "." 
-                     << (networkAddress & 0xFF);
-    
-    return networkAddressSS.str();
-}
-
-std::string ipv4CidrToIp(std::string cidr, int &mask)
-{
-    size_t index;
-    std::string sip, smask;
-    smask = "32";
-    sip = cidr;
-    index = cidr.find("/");
-    if(index != std::string::npos)
-    {
-        sip = cidr.substr(0, index);
-        smask = cidr.substr(index + 1);
-    }
-    mask = atoi(smask.c_str());
-    return calculateNetworkAddress(sip, mask);   
+    if (!IsValidUtf8(str)) return false;
+    return waf_rules::is_ip_address(str);
 }
 
 std::string SaveHeadersInfo(AttackedLog &r, std::unordered_map<std::string, std::string> &pairs)
@@ -749,73 +606,58 @@ void Rules::AddBlackWhiteList(BWList &bw)
     }
 }
 
-/*pcre2 match — returns matched substring, or nullopt on no match*/
+/*regex match — name kept for API stability; no longer backed by PCRE2, now
+  dispatches to waf_rules_core (Rust, via regex_first_match). Returns matched
+  substring, or nullopt on no match.*/
 std::optional<std::string> Rules::Pcre2Regex(std::uint64_t id, std::string &expr, std::string &src)
 {
-    std::optional<std::string> result;
-    pcre2_code *re = nullptr;
-    PCRE2_UCHAR buffer[256];
-    int errorcode, rc;
-    PCRE2_SIZE erroroffset;
-    PCRE2_SPTR substring_start = nullptr;
-    PCRE2_SIZE substring_length = 0, *ovector;
-    PCRE2_SPTR pattern = (PCRE2_SPTR)expr.c_str();
-    PCRE2_SPTR input   = (PCRE2_SPTR)src.c_str();
-    // 编译正则表达式
-    re = pcre2_compile(pattern, PCRE2_ZERO_TERMINATED, 0, &errorcode, &erroroffset, NULL);
-    if(!re)
-    {
-        pcre2_get_error_message(errorcode, buffer, sizeof(buffer));
-        LOG_E("PCRE2 compilation failed, id : %lu, erroroffset : %d, error : %s, number : %d",
-              id, (int)erroroffset, (char *)buffer, errorcode);
+    // expr or src may contain invalid UTF-8 (e.g. a raw non-UTF8 byte in an
+    // HTTP header/body); rust::Str's UTF-8 validation would throw here.
+    // Treat as no-match rather than crashing the daemon.
+    if (!IsValidUtf8(expr) || !IsValidUtf8(src)) {
         return std::nullopt;
     }
-    // 匹配正则表达式
-    pcre2_match_data *match_data = pcre2_match_data_create_from_pattern(re, NULL);
-    if(!match_data)
-    {
-        LOG_E("PCRE2 match data create from pattern failed, id : %lu", id);
-        goto end;
+    auto result = waf_rules::regex_first_match(expr, src);
+    if (!result.matched) {
+        return std::nullopt;
     }
-    ovector = pcre2_get_ovector_pointer(match_data);
-    rc = pcre2_match(re, input, PCRE2_ZERO_TERMINATED, 0, 0, match_data, NULL);
-    while (rc > 0)
-    {
-        for (int i = 0; i < rc; i++)
-        {
-            substring_start  = input + ovector[2 * i];
-            substring_length = ovector[2 * i + 1] - ovector[2 * i];
-            result = std::string(reinterpret_cast<const char*>(substring_start), substring_length);
-            goto end;
-        }
-        input = substring_start + substring_length;
-        rc = pcre2_match(re, input, PCRE2_ZERO_TERMINATED, 0, 0, match_data, NULL);
-        ovector = pcre2_get_ovector_pointer(match_data);
-    }
-end:
-    if(match_data) pcre2_match_data_free(match_data);
-    if(re) pcre2_code_free(re);
-    return result;
+    return std::string(result.value);
 }
 
 bool Rules::MatchIgnoreType(std::string &src)
 {
-    auto value = split(src, "?");
-    auto pos = value.at(0).rfind(".");
-    if(pos == std::string::npos) return false;
-    auto data = value.at(0).substr(pos);
-    auto it = this->ignore_.find(data);
-    return (it == this->ignore_.end()) ? false : true;
+    // src is the (attacker-controlled) request path; guard against invalid
+    // UTF-8 before crossing the FFI boundary. See IsValidUtf8's comment.
+    if (!IsValidUtf8(src)) return false;
+    rust::Vec<rust::String> suffixes;
+    for (auto &entry : this->ignore_) {
+        // entry.first is an admin-configured ignored file-extension string.
+        // rust::String's constructor throws std::invalid_argument on
+        // invalid UTF-8, same as rust::Str. Skip just this bad config
+        // entry rather than crash the daemon -- other entries should
+        // still be checked.
+        if (!IsValidUtf8(entry.first)) continue;
+        suffixes.push_back(rust::String(entry.first));
+    }
+    return waf_rules::match_ignore_type(src, suffixes);
 }
 
 /*match ignore type*/
 bool Rules::MatchDomain(std::string &src)
 {
-    for(int i = 0; i < (int)this->domain_.size(); i++)
-    {
-        if(src == this->domain_.at(i)) return true;
+    // src is the (attacker-controlled) Host/authority header; guard against
+    // invalid UTF-8 before crossing the FFI boundary. See IsValidUtf8's comment.
+    if (!IsValidUtf8(src)) return false;
+    rust::Vec<rust::String> domains;
+    for (auto &entry : this->domain_) {
+        // entry is an admin-configured domain string. rust::String's
+        // constructor throws std::invalid_argument on invalid UTF-8, same
+        // as rust::Str. Skip just this bad config entry rather than crash
+        // the daemon -- other domains should still be checked.
+        if (!IsValidUtf8(entry)) continue;
+        domains.push_back(rust::String(entry));
     }
-    return false;
+    return waf_rules::match_domain(src, domains);
 }
 
 /*match force white list*/
@@ -850,17 +692,32 @@ bool Rules::MatchForceWhiteList(std::vector<std::string> &ips, std::string &path
                 break;
 
             case AUTO_RULE_IP_CIDR:
-                sip = ipv4CidrToIp(wRule.at(j), mask);
+            {
+                // wRule.at(j) is the rule's own configured CIDR string
+                // (admin config, not attacker input); guard against invalid
+                // UTF-8 so a bad config entry can't crash the daemon via
+                // the FFI boundary. Skip just this rule entry (break out of
+                // the switch, continuing the outer for(j...) loop) rather
+                // than aborting the whole match.
+                if (!IsValidUtf8(wRule.at(j))) break;
+                auto cidr = waf_rules::ipv4_cidr_to_network(wRule.at(j));
+                sip = std::string(cidr.network_ip);
+                mask = cidr.mask;
                 for(n = 0; n < (int)ips.size(); n++)
                 {
                     ip = ips.at(n);
-                    rip = calculateNetworkAddress(ip, mask);
+                    // ip is derived from X-Forwarded-For and may be invalid
+                    // UTF-8; skip this candidate rather than crash (there may
+                    // be other, valid IPs later in the list to check).
+                    if (!IsValidUtf8(ip)) continue;
+                    rip = std::string(waf_rules::ipv4_network_address(ip, mask));
                     if(rip != sip) continue;
                     policy = this->force_white_list_.at(i);
                     policy.mode_ = ip;
                     return true;
                 }
                 break;
+            }
 
             default:
                 break;
@@ -927,21 +784,40 @@ bool Rules::MatchBlackWhiteList(std::vector<std::string> &ips, std::string &path
                 break;
 
             case AUTO_RULE_IP_CIDR:
-                sip = ipv4CidrToIp(bwRule.at(j), mask);
-                for(n = 0; n < (int)ips.size(); n++)
-                {
-                    ip = ips.at(n);
-                    rip = calculateNetworkAddress(ip, mask);
-                    if(rip != sip) continue;
-                    sMathRet = "true";
-                    sMode = ip;
-                    sDesc = (policy.action_ == ATCTION_DROP) ? "IP黑名单" : "IP白名单";
-                    break;
+            {
+                // bwRule.at(j) is the rule's own configured CIDR string
+                // (admin config, not attacker input); guard against invalid
+                // UTF-8 so a bad config entry can't crash the daemon via
+                // the FFI boundary. Treat it as a non-match for this rule
+                // entry (leaving sMathRet/sMode/sDesc at their "false"/
+                // "default" values) rather than skipping the push_backs
+                // below outright -- mode_/desc_/bRet must stay aligned
+                // with bwRule's indexing for the boolean-expression
+                // evaluation further down.
+                if (IsValidUtf8(bwRule.at(j))) {
+                    auto cidr = waf_rules::ipv4_cidr_to_network(bwRule.at(j));
+                    sip = std::string(cidr.network_ip);
+                    mask = cidr.mask;
+                    for(n = 0; n < (int)ips.size(); n++)
+                    {
+                        ip = ips.at(n);
+                        // ip is derived from X-Forwarded-For and may be invalid
+                        // UTF-8; skip this candidate rather than crash (there may
+                        // be other, valid IPs later in the list to check).
+                        if (!IsValidUtf8(ip)) continue;
+                        rip = std::string(waf_rules::ipv4_network_address(ip, mask));
+                        if(rip != sip) continue;
+                        sMathRet = "true";
+                        sMode = ip;
+                        sDesc = (policy.action_ == ATCTION_DROP) ? "IP黑名单" : "IP白名单";
+                        break;
+                    }
                 }
                 mode.push_back(ip);
                 desc.push_back(sDesc);
                 bRet.push_back(sMathRet);
                 break;
+            }
 
             case AUTO_RULE_PATH_EQUAL:
                 for(n = 0; n < 1; n++)
@@ -964,7 +840,11 @@ bool Rules::MatchBlackWhiteList(std::vector<std::string> &ips, std::string &path
                 {
                     if(path.length() == 0) break;
                     data = split(path, "?");
-                    if (!std::regex_search(data.at(0), std::regex(bwRule.at(j)))) break;
+                    // bwRule.at(j) or data.at(0) may contain invalid UTF-8
+                    // (e.g. a raw non-UTF8 byte in the HTTP request path);
+                    // treat as no-match rather than crashing the daemon.
+                    if (!IsValidUtf8(bwRule.at(j)) || !IsValidUtf8(data.at(0))) break;
+                    if (!waf_rules::regex_first_match(bwRule.at(j), data.at(0)).matched) break;
                     sMathRet = "true";
                     sMode = path;
                     sDesc = (policy.action_ == ATCTION_DROP) ? "路径黑名单" : "路径白名单";
@@ -1044,7 +924,14 @@ bool Rules::MatchBlackWhiteList(std::vector<std::string> &ips, std::string &path
             }
         }
         /*eval*/
-        if(eval(expr)) return true;
+        // expr is built from policy.oprexpr_ (admin-config-derived, not
+        // directly attacker-controlled) plus "true"/"false" tokens; still
+        // guard for defense-in-depth so a malformed config can't crash the
+        // daemon via the FFI UTF-8 check. This only covers the UTF-8 case --
+        // eval_bool_expr's separate internal panic risk on unbalanced
+        // &&/|| structure is a tracked, deliberately deferred follow-up
+        // (see progress.md), out of scope here.
+        if(IsValidUtf8(expr) && waf_rules::eval_bool_expr(expr)) return true;
     }
     /*return*/
     return false;

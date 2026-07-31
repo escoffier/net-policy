@@ -34,6 +34,25 @@ include(FetchContent)
 # set(BUILD_STATIC_LIBS ON CACHE INTERNAL "")
 # FetchContent_MakeAvailable(llhttp)
 
+FetchContent_Declare(
+  Corrosion
+  GIT_REPOSITORY https://github.com/corrosion-rs/corrosion.git
+  GIT_TAG v0.5
+)
+FetchContent_MakeAvailable(Corrosion)
+
+corrosion_import_crate(MANIFEST_PATH ${CMAKE_CURRENT_SOURCE_DIR}/Cargo.toml)
+
+corrosion_add_cxxbridge(ffi_smoke_cxxbridge
+  CRATE ffi_smoke
+  FILES lib.rs
+)
+
+corrosion_add_cxxbridge(waf_rules_core_cxxbridge
+  CRATE waf_rules_core
+  FILES lib.rs
+)
+
 add_compile_definitions(GLOG_CUSTOM_PREFIX_SUPPORT)
 
 set(SOURCES
@@ -134,6 +153,7 @@ add_executable(net_rule_test
     tests/codec_test.cc
     tests/connection_manager_test.cc
     tests/http2/codec_tests.cc
+    tests/ffi_smoke_test.cc
 )
 
 set (PRIVATE_CXX_FLAGS
@@ -166,6 +186,7 @@ target_link_libraries(net-rule
   libtcmalloc_and_profiler.a
   gRPC::grpc++
   protobuf::libprotobuf
+  waf_rules_core_cxxbridge
 )
 
 # target_link_libraries(net-rule 
@@ -197,6 +218,7 @@ ${CMAKE_THREAD_LIBS_INIT}
 libunwind.a
 liblzma.a
 libz.a
+ffi_smoke_cxxbridge
 GTest::gtest_main)
 
 include(GoogleTest)
@@ -241,6 +263,7 @@ add_executable(net_rule_grpc_test
     tests/grpc_control_service_test.cc
     tests/grpc_event_bridge_test.cc
     tests/grpc_e2e_test.cc
+    tests/waf_rules_test.cc
 )
 target_include_directories(net_rule_grpc_test PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/ ${CMAKE_CURRENT_BINARY_DIR}/proto-gen)
 target_link_libraries(net_rule_grpc_test
@@ -261,6 +284,7 @@ target_link_libraries(net_rule_grpc_test
   libtcmalloc_and_profiler.a
   gRPC::grpc++
   protobuf::libprotobuf
+  waf_rules_core_cxxbridge
   GTest::gtest_main)
 gtest_discover_tests(net_rule_grpc_test)
 

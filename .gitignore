@@ -2,4 +2,6 @@
 net-rule
 include/
 .cache
-build*
+/build*
+/target
+.worktrees/
