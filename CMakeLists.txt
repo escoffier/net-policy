@@ -62,6 +62,11 @@ corrosion_add_cxxbridge(net_policy_control_cxxbridge
 # C++ #include of its own and so never needed this.
 target_include_directories(net_policy_control_cxxbridge PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
+corrosion_add_cxxbridge(net_policy_events_cxxbridge
+  CRATE net_policy_events
+  FILES lib.rs
+)
+
 add_compile_definitions(GLOG_CUSTOM_PREFIX_SUPPORT)
 
 set(SOURCES
@@ -195,6 +200,7 @@ target_link_libraries(net-rule
   protobuf::libprotobuf
   waf_rules_core_cxxbridge
   net_policy_control_cxxbridge
+  net_policy_events_cxxbridge
 )
 # waf_rules_core_cxxbridge and net_policy_control_cxxbridge are separate Rust
 # staticlib crates that both depend on the `cxx` crate; since each staticlib
@@ -300,6 +306,7 @@ target_link_libraries(net_rule_grpc_test
   protobuf::libprotobuf
   waf_rules_core_cxxbridge
   net_policy_control_cxxbridge
+  net_policy_events_cxxbridge
   GTest::gtest_main)
 # See the matching comment on net-rule's LINK_FLAGS above.
 set_target_properties(net_rule_grpc_test PROPERTIES LINK_FLAGS "-Wl,--allow-multiple-definition")
