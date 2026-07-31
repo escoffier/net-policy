@@ -53,6 +53,11 @@ corrosion_add_cxxbridge(waf_rules_core_cxxbridge
   FILES lib.rs
 )
 
+corrosion_add_cxxbridge(net_policy_control_cxxbridge
+  CRATE net_policy_control
+  FILES lib.rs
+)
+
 add_compile_definitions(GLOG_CUSTOM_PREFIX_SUPPORT)
 
 set(SOURCES
@@ -188,9 +193,10 @@ target_link_libraries(net-rule
   gRPC::grpc++
   protobuf::libprotobuf
   waf_rules_core_cxxbridge
+  net_policy_control_cxxbridge
 )
 
-# target_link_libraries(net-rule 
+# target_link_libraries(net-rule
 # libnfnetlink 
 # libnetfilter_queue 
 # libnetfilter_conntrack 
@@ -287,6 +293,7 @@ target_link_libraries(net_rule_grpc_test
   gRPC::grpc++
   protobuf::libprotobuf
   waf_rules_core_cxxbridge
+  net_policy_control_cxxbridge
   GTest::gtest_main)
 gtest_discover_tests(net_rule_grpc_test)
 
