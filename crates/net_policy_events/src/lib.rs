@@ -41,6 +41,8 @@ mod ffi {
             attacked_url: &str,
             rsp_content_type: &str,
         );
+
+        unsafe fn start_event_server(port: u16) -> u16;
     }
 }
 
@@ -184,6 +186,72 @@ pub fn publish_waf_attack(
         })),
     };
     queue().push(event);
+}
+
+use proto::net_policy_events_server::{NetPolicyEvents, NetPolicyEventsServer};
+use proto::SubscribeEventsRequest;
+use std::pin::Pin;
+use tokio_stream::{Stream, StreamExt};
+use tonic::{transport::Server, Request, Response, Status};
+
+struct EventServiceImpl;
+
+#[tonic::async_trait]
+impl NetPolicyEvents for EventServiceImpl {
+    type SubscribeEventsStream =
+        Pin<Box<dyn Stream<Item = Result<PolicyEvent, Status>> + Send + 'static>>;
+
+    async fn subscribe_events(
+        &self,
+        _request: Request<SubscribeEventsRequest>,
+    ) -> Result<Response<Self::SubscribeEventsStream>, Status> {
+        let (tx, rx) = tokio::sync::mpsc::channel::<PolicyEvent>(16);
+        tokio::task::spawn_blocking(move || {
+            // Mirrors EventServiceImpl::SubscribeEvents's existing
+            // while(!context->IsCancelled()) + 500ms-timeout loop
+            // (grpc/event_service.cc, deleted in Task 8). There's no
+            // direct cancellation-token equivalent to context->IsCancelled()
+            // here; instead, blocking_send's failure (the Receiver was
+            // dropped because the client disconnected and tonic tore down
+            // the response stream) is the signal to stop, exactly mirroring
+            // the C++ version's `if (!writer->Write(event)) break;`.
+            loop {
+                if let Some(event) = queue().wait_and_pop(Duration::from_millis(500)) {
+                    if tx.blocking_send(event).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+        let stream = tokio_stream::wrappers::ReceiverStream::new(rx).map(Ok);
+        Ok(Response::new(Box::pin(stream) as Self::SubscribeEventsStream))
+    }
+}
+
+unsafe fn start_event_server(port: u16) -> u16 {
+    let (port_tx, port_rx) = std::sync::mpsc::channel::<u16>();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().expect("failed to build tokio runtime");
+        rt.block_on(async move {
+            let addr: std::net::SocketAddr =
+                format!("0.0.0.0:{port}").parse().expect("invalid bind address");
+            let listener = match tokio::net::TcpListener::bind(addr).await {
+                Ok(l) => l,
+                Err(_) => {
+                    let _ = port_tx.send(0);
+                    return;
+                }
+            };
+            let bound_port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
+            let _ = port_tx.send(bound_port);
+            let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+            let _ = Server::builder()
+                .add_service(NetPolicyEventsServer::new(EventServiceImpl))
+                .serve_with_incoming(incoming)
+                .await;
+        });
+    });
+    port_rx.recv().unwrap_or(0)
 }
 
 #[cfg(test)]
