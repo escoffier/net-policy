@@ -14,6 +14,11 @@ use tonic::{transport::Server, Request, Response, Status};
 
 #[cxx::bridge(namespace = "grpc_bridge")]
 mod ffi {
+    struct DumpConnectionsResult {
+        total: i64,
+        items: Vec<String>,
+    }
+
     unsafe extern "C++" {
         include!("grpc/control_dispatch.h");
 
@@ -60,6 +65,12 @@ mod ffi {
             queue: *mut GrpcDispatchQueue,
             enable: bool,
         ) -> i32;
+
+        unsafe fn GrpcDispatchDumpConnections(
+            daemon: *mut DaemonContext,
+            queue: *mut GrpcDispatchQueue,
+            limit: i32,
+        ) -> DumpConnectionsResult;
     }
 
     extern "Rust" {
@@ -195,9 +206,15 @@ impl NetPolicyControl for ControlServiceImpl {
 
     async fn dump_connections(
         &self,
-        _request: Request<DumpConnectionsRequest>,
+        request: Request<DumpConnectionsRequest>,
     ) -> Result<Response<DumpConnectionsResponse>, Status> {
-        Err(Status::unimplemented("DumpConnections not yet implemented"))
+        let req = request.into_inner();
+        let result = tokio::task::spawn_blocking(move || unsafe {
+            ffi::GrpcDispatchDumpConnections(daemon_ptr(), queue_ptr(), req.limit)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("dispatch task panicked: {e}")))?;
+        Ok(Response::new(DumpConnectionsResponse { total: result.total, items: result.items }))
     }
 
     async fn reset_config(

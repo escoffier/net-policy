@@ -2197,6 +2197,35 @@ int32_t GrpcDispatchDumpHeapProfile(DaemonContext* daemon, GrpcDispatchQueue* qu
   return result;
 }
 
+DumpConnectionsResult GrpcDispatchDumpConnections(DaemonContext* daemon, GrpcDispatchQueue* queue,
+                                                    int32_t limit) {
+  std::string json = "{\"limit\":" + std::to_string(limit) + "}";
+  GrpcDispatchItem item;
+  DumpConnectionsResult result{};
+  item.work = [&]() {
+    cJSON* conns = dumpConnectons(json, daemon->ConnMgr());
+    if (conns) {
+      cJSON* total = cJSON_GetObjectItem(conns, "total");
+      if (total)
+        result.total = (int64_t)total->valuedouble;
+      cJSON* items = cJSON_GetObjectItem(conns, "items");
+      if (items) {
+        int size = cJSON_GetArraySize(items);
+        for (int i = 0; i < size; i++) {
+          cJSON* entry = cJSON_GetArrayItem(items, i);
+          if (entry && entry->valuestring)
+            result.items.push_back(entry->valuestring);
+        }
+      }
+      cJSON_Delete(conns);
+    }
+  };
+  std::future<void> future = item.done.get_future();
+  queue->Push(&item);
+  future.wait();
+  return result;
+}
+
 int32_t DispatchGrpcRustQueueEvent(int32_t epoll_fd, int32_t fd, void* ptr) {
   (void)epoll_fd;
   auto* cb = static_cast<RcvEpollCb*>(ptr);

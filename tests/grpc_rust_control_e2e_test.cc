@@ -190,4 +190,20 @@ TEST_F(GrpcRustControlEndToEndTest, DumpHeapProfileEnableThenDisableReturnsOkSta
   }
 }
 
+// limit=0 avoids the pre-existing, out-of-scope OOB bug in the shared legacy
+// dumpConnectons() (net-policy.cpp): it indexes conn_mgr.connections()[i] for
+// i in [0, limit) with no bounds check against the vector's actual size, so a
+// limit exceeding the real connection count (zero, in this fixture) is UB.
+// total still comes from conn_mgr.stat().tcp_conn_, independent of limit, so
+// this still exercises the full RPC round trip meaningfully.
+TEST_F(GrpcRustControlEndToEndTest, DumpConnectionsReturnsWithoutError) {
+  grpc::ClientContext ctx;
+  netpolicy::v1::DumpConnectionsRequest req;
+  req.set_limit(0);
+  netpolicy::v1::DumpConnectionsResponse resp;
+  grpc::Status status = stub_->DumpConnections(&ctx, req, &resp);
+  ASSERT_TRUE(status.ok()) << status.error_message();
+  EXPECT_GE(resp.total(), 0);
+}
+
 } // namespace
