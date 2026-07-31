@@ -131,4 +131,14 @@ TEST_F(GrpcRustControlEndToEndTest, PodUpWithInvalidPidReturnsNonZeroStatus) {
   EXPECT_NE(resp.status(), 0);
 }
 
+TEST_F(GrpcRustControlEndToEndTest, PodDownForUnknownPodReturnsZeroStatus) {
+  grpc::ClientContext ctx;
+  netpolicy::v1::PodDownRequest req;
+  req.set_pod_id(999999);
+  netpolicy::v1::StatusResponse resp;
+  grpc::Status status = stub_->PodDown(&ctx, req, &resp);
+  ASSERT_TRUE(status.ok()) << status.error_message();
+  EXPECT_EQ(resp.status(), 0);
+}
+
 } // namespace

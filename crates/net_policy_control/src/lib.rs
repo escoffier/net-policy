@@ -35,6 +35,13 @@ mod ffi {
             pid: i32,
             pod_id: u64,
         ) -> i32;
+
+        unsafe fn GrpcDispatchPodDown(
+            daemon: *mut DaemonContext,
+            queue: *mut GrpcDispatchQueue,
+            epoll_fd: i32,
+            pod_id: u64,
+        ) -> i32;
     }
 
     extern "Rust" {
@@ -96,9 +103,16 @@ impl NetPolicyControl for ControlServiceImpl {
 
     async fn pod_down(
         &self,
-        _request: Request<PodDownRequest>,
+        request: Request<PodDownRequest>,
     ) -> Result<Response<StatusResponse>, Status> {
-        Err(Status::unimplemented("PodDown not yet implemented"))
+        let req = request.into_inner();
+        let epoll_fd = STATE.get().expect("server state not initialized").epoll_fd;
+        let status = tokio::task::spawn_blocking(move || unsafe {
+            ffi::GrpcDispatchPodDown(daemon_ptr(), queue_ptr(), epoll_fd, req.pod_id)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("dispatch task panicked: {e}")))?;
+        Ok(Response::new(StatusResponse { status, uuid: String::new() }))
     }
 
     async fn add_policy_rule(

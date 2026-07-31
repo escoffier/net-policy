@@ -2131,6 +2131,19 @@ int32_t GrpcDispatchPodUp(DaemonContext* daemon, GrpcDispatchQueue* queue, int32
   return result;
 }
 
+int32_t GrpcDispatchPodDown(DaemonContext* daemon, GrpcDispatchQueue* queue, int32_t epoll_fd,
+                             uint64_t pod_id) {
+  GrpcDispatchItem item;
+  int32_t result = 1;
+  item.work = [&]() {
+    result = daemon->Microseg().DeleteNfQueRes(epoll_fd, pod_id);
+  };
+  std::future<void> future = item.done.get_future();
+  queue->Push(&item);
+  future.wait();
+  return result;
+}
+
 int32_t DispatchGrpcRustQueueEvent(int32_t epoll_fd, int32_t fd, void* ptr) {
   (void)epoll_fd;
   auto* cb = static_cast<RcvEpollCb*>(ptr);
