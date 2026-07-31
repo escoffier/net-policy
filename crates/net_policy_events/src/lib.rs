@@ -215,7 +215,21 @@ impl NetPolicyEvents for EventServiceImpl {
             // dropped because the client disconnected and tonic tore down
             // the response stream) is the signal to stop, exactly mirroring
             // the C++ version's `if (!writer->Write(event)) break;`.
+            //
+            // That check alone isn't sufficient on its own: it only fires
+            // once this loop actually wins the race to pop an event and
+            // attempts to deliver it, so an idle disconnected subscriber
+            // (no events flowing) would never notice a client had gone
+            // away and would keep competing for the next event published
+            // against the shared global queue, indefinitely. Checking
+            // tx.is_closed() up front closes that gap: once the client
+            // disconnects and tonic drops the paired Receiver, this loop
+            // retires on its own within one wait_and_pop timeout (<=500ms)
+            // even if no event ever arrives to reveal the broken channel.
             loop {
+                if tx.is_closed() {
+                    break;
+                }
                 if let Some(event) = queue().wait_and_pop(Duration::from_millis(500)) {
                     if tx.blocking_send(event).is_err() {
                         break;
