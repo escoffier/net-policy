@@ -145,7 +145,7 @@ public:
 
 struct RcvEpollCb; // forward declaration — full definition follows NFQ_RES_INFO
 class DaemonContext; // forward declaration — full definition follows PostServer
-namespace grpc_bridge { class ControlWorkQueue; class EventBridge; }
+namespace grpc_bridge { class ControlWorkQueue; class EventBridge; class GrpcDispatchQueue; }
 
 class NFQ_RES_INFO
 {
@@ -491,6 +491,11 @@ public:
     }
     grpc_bridge::ControlWorkQueue* ControlWorkQueue() { return control_work_queue_; }
 
+    /*non-owning; wired once at startup, mirrors WireGrpc's existing pattern
+     *exactly -- see grpc/control_dispatch.h for GrpcDispatchQueue.*/
+    void WireRustControlDispatch(grpc_bridge::GrpcDispatchQueue* q) { rust_dispatch_queue_ = q; }
+    grpc_bridge::GrpcDispatchQueue* RustControlDispatchQueue() { return rust_dispatch_queue_; }
+
 private:
     bool waf_enable_      = false;
     int  local_net_ns_fd_ = 0;
@@ -504,4 +509,5 @@ private:
     http::extension::PluginRootContext   waf_root_;
 
     grpc_bridge::ControlWorkQueue* control_work_queue_ = nullptr; // non-owning
+    grpc_bridge::GrpcDispatchQueue* rust_dispatch_queue_ = nullptr; // non-owning
 };

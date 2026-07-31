@@ -24,6 +24,7 @@
 #include <netinet/in.h>
 #include <sched.h>
 #include <sys/epoll.h>
+#include <sys/eventfd.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -32,9 +33,11 @@
 #include <gflags/gflags.h>
 #include "net-policy.h"
 #include "grpc/work_queue.h"
+#include "grpc/control_dispatch.h"
 #include "grpc/proto_json_bridge.h"
 #include "grpc/event_bridge.h"
 #include "grpc/grpc_server.h"
+#include "net_policy_control_cxxbridge/lib.h"
 #include "proto/net_policy_control.pb.h"
 
 using std::string;
@@ -2086,6 +2089,42 @@ int32_t DispatchGrpcWorkQueueEvent(int32_t epoll_fd, int32_t fd, void* ptr) {
   return 0;
 }
 
+/*Rust-facing dispatch functions -- see grpc/control_dispatch.h. These are the
+ *reverse-direction counterpart to DispatchGrpcControlOp above: instead of a
+ *gRPC handler thread pushing a ControlWorkItem* carrying a protobuf Message*
+ *(which can't cross the cxx boundary), the Rust tonic handler pushes a
+ *GrpcDispatchItem carrying a closure, blocks on its future, and the epoll
+ *thread runs the closure exactly once DispatchGrpcRustQueueEvent wakes.*/
+namespace grpc_bridge {
+
+int32_t GrpcDispatchResetConfig(DaemonContext* daemon, GrpcDispatchQueue* queue) {
+  GrpcDispatchItem item;
+  int32_t result = 1; // fail-closed default if the closure never runs
+  item.work = [&]() {
+    result = daemon->Microseg().ClearCfg();
+  };
+  std::future<void> future = item.done.get_future();
+  queue->Push(&item);
+  future.wait();
+  return result;
+}
+
+int32_t DispatchGrpcRustQueueEvent(int32_t epoll_fd, int32_t fd, void* ptr) {
+  (void)epoll_fd;
+  auto* cb = static_cast<RcvEpollCb*>(ptr);
+  GrpcDispatchQueue* queue = cb->daemon_->RustControlDispatchQueue();
+  uint64_t drain;
+  while (read(fd, &drain, sizeof(drain)) > 0) {
+  }
+  for (auto* item : queue->DrainAll()) {
+    item->work();
+    item->done.set_value();
+  }
+  return 0;
+}
+
+} // namespace grpc_bridge
+
 int ProcAcceptEvent(int32_t epoll_fd, int32_t fd, void* ptr) {
   int zClientFd;
   socklen_t cliAddrLen;
@@ -2231,7 +2270,7 @@ int RunNetPolicyDaemon(int argc, char* argv[]) {
   int zListenFd = 0, epfd = 0, zLinkFd;
   int ret, nfds, i, opt = 1;
   struct sockaddr_in address;
-  RCV_EPOLL_CB unixEvent, postEvent, grpcWakeEvent, *pstCbEv;
+  RCV_EPOLL_CB unixEvent, postEvent, grpcWakeEvent, rustDispatchWakeEvent, *pstCbEv;
   // print start log
   LOG_I("policy process start......");
   /*get log level env*/
@@ -2294,6 +2333,31 @@ int RunNetPolicyDaemon(int argc, char* argv[]) {
   ret = epoll_ctl(epfd, EPOLL_CTL_ADD, grpcWakeEvent.fd_, &ev);
   if (ret < 0)
     GOTO_ERROR(err, "epoll ctl failed for grpc wake fd, %s.", strerror(errno));
+
+  // --- Rust ControlService bridge (additive during Phase 2 development --
+  // temporary dev port; production cutover happens in a later change) ---
+  int rust_dispatch_wake_fd;
+  rust_dispatch_wake_fd = eventfd(0, EFD_NONBLOCK);
+  if (rust_dispatch_wake_fd < 0)
+    GOTO_ERROR(err, "create rust control dispatch eventfd failed, %s.", strerror(errno));
+  static grpc_bridge::GrpcDispatchQueue rust_dispatch_queue(rust_dispatch_wake_fd);
+  daemon.WireRustControlDispatch(&rust_dispatch_queue);
+
+  rustDispatchWakeEvent.fd_ = rust_dispatch_wake_fd;
+  rustDispatchWakeEvent.epoll_in_func_ = grpc_bridge::DispatchGrpcRustQueueEvent;
+  rustDispatchWakeEvent.daemon_ = &daemon;
+  ev.data.ptr = &rustDispatchWakeEvent;
+  ev.events = EPOLLIN;
+  ret = epoll_ctl(epfd, EPOLL_CTL_ADD, rust_dispatch_wake_fd, &ev);
+  if (ret < 0)
+    GOTO_ERROR(err, "epoll ctl failed for rust control dispatch wake fd, %s.", strerror(errno));
+
+  {
+    uint16_t bound_port = grpc_bridge::start_control_server(&daemon, &rust_dispatch_queue, epfd, /*dev_port=*/50053);
+    if (bound_port == 0)
+      GOTO_ERROR(err, "failed to start rust control service.");
+    LOG_I("rust control service listening on port %d (dev)", (int)bound_port);
+  }
   //
   unixEvent.fd_ = zListenFd;
   unixEvent.epoll_in_func_ = ProcAcceptEvent;

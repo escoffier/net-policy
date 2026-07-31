@@ -39,4 +39,19 @@ private:
   std::deque<GrpcDispatchItem*> queue_;
 };
 
+// Rust-callable dispatch functions. Each builds a closure capturing `daemon`
+// by pointer, pushes it onto `queue`, blocks until the epoll thread
+// (DispatchGrpcRustQueueEvent, net-policy.cpp) has run it, and returns the
+// typed result. Implemented in net-policy.cpp, where DaemonContext's full
+// definition and the legacy policy/WAF functions are already visible --
+// mirrors where DispatchGrpcControlOp lives today.
+int32_t GrpcDispatchResetConfig(DaemonContext* daemon, GrpcDispatchQueue* queue);
+
+// Epoll callback (RcvCbFunc-shaped: int32_t(int32_t epoll_fd, int32_t fd,
+// void* ptr)) for the Rust dispatch queue's wake eventfd. Drains `queue`
+// (read from the registering RcvEpollCb, threaded through via `ptr`) and
+// runs each item's closure on this (the epoll) thread. Implemented in
+// net-policy.cpp since it needs RcvEpollCb's shape from net-policy.h.
+int32_t DispatchGrpcRustQueueEvent(int32_t epoll_fd, int32_t fd, void* ptr);
+
 } // namespace grpc_bridge

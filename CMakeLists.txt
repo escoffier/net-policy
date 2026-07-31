@@ -57,6 +57,10 @@ corrosion_add_cxxbridge(net_policy_control_cxxbridge
   CRATE net_policy_control
   FILES lib.rs
 )
+# lib.rs's cxx bridge does `include!("grpc/control_dispatch.h")`, resolved
+# relative to the repo root -- unlike waf_rules_core_cxxbridge, which has no
+# C++ #include of its own and so never needed this.
+target_include_directories(net_policy_control_cxxbridge PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
 add_compile_definitions(GLOG_CUSTOM_PREFIX_SUPPORT)
 
@@ -195,6 +199,14 @@ target_link_libraries(net-rule
   waf_rules_core_cxxbridge
   net_policy_control_cxxbridge
 )
+# waf_rules_core_cxxbridge and net_policy_control_cxxbridge are separate Rust
+# staticlib crates that both depend on the `cxx` crate; since each staticlib
+# statically embeds its own copy of cxx's internal runtime shim symbols
+# (e.g. cxxbridge1$rust_vec$bool$...), linking two such crates into the same
+# binary trips the linker's ODR check even though the duplicated bodies are
+# byte-identical. --allow-multiple-definition is the standard workaround
+# (see cxx-rs upstream issues on multi-crate staticlib linking).
+set_target_properties(net-rule PROPERTIES LINK_FLAGS "-Wl,--allow-multiple-definition")
 
 # target_link_libraries(net-rule
 # libnfnetlink 
@@ -271,6 +283,7 @@ add_executable(net_rule_grpc_test
     tests/grpc_control_service_test.cc
     tests/grpc_event_bridge_test.cc
     tests/grpc_e2e_test.cc
+    tests/grpc_rust_control_e2e_test.cc
     tests/waf_rules_test.cc
 )
 target_include_directories(net_rule_grpc_test PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/ ${CMAKE_CURRENT_BINARY_DIR}/proto-gen)
@@ -295,6 +308,8 @@ target_link_libraries(net_rule_grpc_test
   waf_rules_core_cxxbridge
   net_policy_control_cxxbridge
   GTest::gtest_main)
+# See the matching comment on net-rule's LINK_FLAGS above.
+set_target_properties(net_rule_grpc_test PROPERTIES LINK_FLAGS "-Wl,--allow-multiple-definition")
 gtest_discover_tests(net_rule_grpc_test)
 
 
