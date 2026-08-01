@@ -2599,19 +2599,23 @@ int RunNetPolicyDaemon(int argc, char* argv[]) {
   if (ret < 0)
     GOTO_ERROR(err, "epoll ctl failed, %s.", strerror(errno));
 
-  {
-    uint16_t bound_port = grpc_bridge::start_control_server(&daemon, &rust_dispatch_queue, epfd, /*port=*/50051);
-    if (bound_port == 0)
-      GOTO_ERROR(err, "failed to start rust control service.");
-    LOG_I("rust control service listening on port %d", (int)bound_port);
-  }
-
   // --- Rust EventService (production event stream, port 50052) ---
+  // Started before start_control_server below: it has no DaemonContext/epoll_fd
+  // coupling, so unlike start_control_server it doesn't need to be the very last
+  // fallible step. Ordering it first means that if IT fails, nothing is listening
+  // on 50051 yet either, so there's no use-after-free window in that direction.
   {
     uint16_t event_port = grpc_bridge::start_event_server(/*port=*/50052);
     if (event_port == 0)
       GOTO_ERROR(err, "failed to start rust event service.");
     LOG_I("rust event service listening on port %d", (int)event_port);
+  }
+
+  {
+    uint16_t bound_port = grpc_bridge::start_control_server(&daemon, &rust_dispatch_queue, epfd, /*port=*/50051);
+    if (bound_port == 0)
+      GOTO_ERROR(err, "failed to start rust control service.");
+    LOG_I("rust control service listening on port %d", (int)bound_port);
   }
   // accept client request
   while (1) {

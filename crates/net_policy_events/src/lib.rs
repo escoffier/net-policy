@@ -61,7 +61,16 @@ impl EventQueue {
     fn push(&self, event: PolicyEvent) {
         let mut guard = self.inner.lock().unwrap();
         if guard.len() >= EVENT_QUEUE_CAPACITY {
-            guard.pop_front(); // drop oldest, matching grpc/event_bridge.cc's existing policy
+            // Drop oldest, matching the policy of grpc/event_bridge.cc's
+            // EventBridge::Push (deleted in Task 8). That C++ version logged a
+            // warning on every overflow; log here too so operators still have
+            // signal when events are being dropped -- including the degenerate
+            // case of zero subscribers, where the queue sits permanently full
+            // and would otherwise silently discard every publish forever.
+            eprintln!(
+                "net_policy_events: event queue full (capacity {EVENT_QUEUE_CAPACITY}), dropping oldest event"
+            );
+            guard.pop_front();
         }
         guard.push_back(event);
         self.condvar.notify_one();
