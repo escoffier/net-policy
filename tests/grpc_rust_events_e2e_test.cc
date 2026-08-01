@@ -7,6 +7,7 @@
 #include "net-policy.h"
 #include "net_policy_events_cxxbridge/lib.h"
 #include "proto/net_policy_events.grpc.pb.h"
+#include "waf/plugin.h"
 
 namespace {
 
@@ -168,6 +169,80 @@ TEST_F(GrpcRustEventsEndToEndTest, PostServerSendMatchMsgDualPublishesToRust) {
   // test's loop for the next published event and steal it. 500ms is the
   // loop's own wait_and_pop timeout; add a safety margin.
   std::this_thread::sleep_for(std::chrono::milliseconds(600));
+}
+
+TEST_F(GrpcRustEventsEndToEndTest, PublishWafAttackToRustEventServiceSendsEvent) {
+  grpc::ClientContext ctx;
+  netpolicy::v1::SubscribeEventsRequest req;
+  req.set_client_id("test-client");
+  auto reader = stub_->SubscribeEvents(&ctx, req);
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+  Rules rule_ctx;
+  rule_ctx.app_id_ = 99;
+  rule_ctx.res_name_ = "test-resource";
+  rule_ctx.res_kind_ = "Deployment";
+  rule_ctx.pod_namespace_ = "test-ns";
+  rule_ctx.cluster_key_ = "test-cluster";
+  AttackedLog log;
+  log.action_ = "block";
+  log.attack_ip_ = "10.10.10.10";
+  log.attacked_app_ = "victim-app";
+  log.attack_load_ = "' OR 1=1 --";
+  log.attack_time_ = 123456789;
+  log.rule_id_ = 55;
+  log.rule_name_ = "sqli-rule";
+  log.req_pkg_ = "req-bytes";
+  log.rsp_pkg_ = "rsp-bytes";
+  log.type_ = "sqli";
+  log.attacked_url_ = "/vulnerable/path";
+  log.rsp_content_type_ = "text/html";
+
+  PublishWafAttackToRustEventService(rule_ctx, log);
+
+  netpolicy::v1::PolicyEvent event;
+  ASSERT_TRUE(reader->Read(&event));
+  ASSERT_TRUE(event.has_waf_attack());
+  const auto& attack = event.waf_attack();
+  EXPECT_EQ(attack.service_id(), 99u);
+  EXPECT_EQ(attack.res_name(), "test-resource");
+  EXPECT_EQ(attack.rule_id(), 55);
+  EXPECT_EQ(attack.attacked_url(), "/vulnerable/path");
+
+  ctx.TryCancel();
+}
+
+TEST_F(GrpcRustEventsEndToEndTest, PublishWafAttackToRustEventServiceSkipsInvalidUtf8) {
+  grpc::ClientContext ctx;
+  netpolicy::v1::SubscribeEventsRequest req;
+  req.set_client_id("test-client");
+  auto reader = stub_->SubscribeEvents(&ctx, req);
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+  Rules rule_ctx;
+  rule_ctx.res_name_ = "test-resource";
+  AttackedLog log;
+  log.attacked_url_ = std::string("bad-url-\xFF-byte"); // invalid UTF-8
+
+  // must not throw/crash -- the guard in PublishWafAttackToRustEventService
+  // must catch this and skip publishing rather than let rust::Str's
+  // throwing constructor escape uncaught
+  PublishWafAttackToRustEventService(rule_ctx, log);
+
+  // reader->Read() below blocks until either an event arrives (bug -- test
+  // fails) or the stream ends. Since nothing should be published, nothing
+  // will ever arrive on its own, so a background thread cancels the
+  // context after a bounded window to unblock Read() with the expected
+  // outcome -- joined (not detached) before the test returns, so nothing
+  // touches ctx/reader/event after they go out of scope.
+  std::thread canceller([&ctx] {
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    ctx.TryCancel();
+  });
+  netpolicy::v1::PolicyEvent event;
+  bool got_event = reader->Read(&event);
+  canceller.join();
+  EXPECT_FALSE(got_event) << "expected no event to be published for invalid UTF-8 input";
 }
 
 } // namespace

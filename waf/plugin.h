@@ -7,6 +7,13 @@
 
 namespace grpc_bridge { class EventBridge; }
 
+// Dual-publishes a WAF attack event to the new Rust EventService (Phase 3
+// migration) -- extracted as a free function (rather than inlined in
+// PluginContext::onClose) so it's testable directly with a constructed
+// Rules/AttackedLog, without needing to drive PluginContext's private
+// ruleArr_/atlog_ state through a full HTTP request/response cycle.
+void PublishWafAttackToRustEventService(Rules& rule_ctx, AttackedLog& log);
+
 namespace http {
 namespace extension {
 
