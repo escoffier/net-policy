@@ -36,6 +36,8 @@
 #include "grpc/event_bridge.h"
 #include "grpc/grpc_server.h"
 #include "net_policy_control_cxxbridge/lib.h"
+#include "common/utf8_check.h"
+#include "net_policy_events_cxxbridge/lib.h"
 #include "proto/net_policy_control.pb.h"
 
 using std::string;
@@ -375,6 +377,19 @@ int PostServer::SendMatchMsg(FiveTuple& tuple, NetPolicyRule action, FlowDir dir
    *listener connected) would otherwise never see these events*/
   if (event_bridge_)
     event_bridge_->PublishPolicyMatch(tuple, action, dir, rule_key);
+  /*dual-publish to the new Rust EventService during the migration (Phase 3)
+   *-- see docs/superpowers/specs/2026-07-31-cpp-to-rust-phase3-event-service-design.md.
+   *IsValidUtf8 guards every field that could carry attacker-influenceable
+   *bytes: rust::Str throws on invalid UTF-8, and this call has no
+   *enclosing try/catch (unlike the ControlService dispatch path, which
+   *goes through GrpcDispatchQueue's closure boundary).*/
+  if (IsValidUtf8(tuple.src_addr_) && IsValidUtf8(tuple.dst_addr_) && IsValidUtf8(rule_key)) {
+    grpc_bridge::publish_policy_match(
+        tuple.proto_, static_cast<int32_t>(action), static_cast<int32_t>(dir),
+        tuple.src_port_, tuple.dst_port_, tuple.src_addr_, tuple.dst_addr_, rule_key);
+  } else {
+    LOG_W("skipped publishing policy match event to Rust EventService: invalid UTF-8 in tuple/rule_key");
+  }
   if (post_link_fd_ <= 0)
     return 0;
   memset(data, 0, sizeof(data));

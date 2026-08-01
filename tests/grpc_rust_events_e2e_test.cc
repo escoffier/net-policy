@@ -4,6 +4,7 @@
 #include <gtest/gtest.h>
 #include <grpcpp/grpcpp.h>
 
+#include "net-policy.h"
 #include "net_policy_events_cxxbridge/lib.h"
 #include "proto/net_policy_events.grpc.pb.h"
 
@@ -123,6 +124,43 @@ TEST_F(GrpcRustEventsEndToEndTest, SubscribeEventsStopsAfterClientCancellation) 
   // default per-test deadline, is the backstop if it doesn't) with a
   // cancellation-shaped status rather than hang or report OK.
   EXPECT_EQ(status.error_code(), grpc::StatusCode::CANCELLED);
+  // Give the server-side spawn_blocking loop time to notice the torn-down
+  // stream (via a failed blocking_send) and exit before the next TEST_F
+  // starts a new SubscribeEvents call against the same shared global
+  // queue -- otherwise this test's now-stale loop can race the next
+  // test's loop for the next published event and steal it. 500ms is the
+  // loop's own wait_and_pop timeout; add a safety margin.
+  std::this_thread::sleep_for(std::chrono::milliseconds(600));
+}
+
+TEST_F(GrpcRustEventsEndToEndTest, PostServerSendMatchMsgDualPublishesToRust) {
+  grpc::ClientContext ctx;
+  netpolicy::v1::SubscribeEventsRequest req;
+  req.set_client_id("test-client");
+  auto reader = stub_->SubscribeEvents(&ctx, req);
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+  PostServer server;
+  FiveTuple tuple;
+  tuple.proto_ = IPPROTO_TCP;
+  tuple.src_port_ = 4321;
+  tuple.dst_port_ = 443;
+  tuple.src_addr_ = "192.168.1.1";
+  tuple.dst_addr_ = "192.168.1.2";
+  int ret = server.SendMatchMsg(tuple, NetPolicyRule::kDeny, FlowDir::kEgress, "dual-publish-test");
+  EXPECT_EQ(ret, 0);
+
+  netpolicy::v1::PolicyEvent event;
+  ASSERT_TRUE(reader->Read(&event));
+  ASSERT_TRUE(event.has_policy_match());
+  const auto& match = event.policy_match();
+  EXPECT_EQ(match.action(), netpolicy::v1::POLICY_ACTION_DENY);
+  EXPECT_EQ(match.direction(), netpolicy::v1::FLOW_DIRECTION_EGRESS);
+  EXPECT_EQ(match.src_ip(), "192.168.1.1");
+  EXPECT_EQ(match.policy_name(), "dual-publish-test");
+
+  ctx.TryCancel();
+  reader->Finish(); // ignore the returned status -- we intentionally cancelled
   // Give the server-side spawn_blocking loop time to notice the torn-down
   // stream (via a failed blocking_send) and exit before the next TEST_F
   // starts a new SubscribeEvents call against the same shared global
