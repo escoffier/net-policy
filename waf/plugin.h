@@ -5,13 +5,11 @@
 #include "http/filter.h"
 #include "rule.h"
 
-namespace grpc_bridge { class EventBridge; }
-
-// Dual-publishes a WAF attack event to the new Rust EventService (Phase 3
-// migration) -- extracted as a free function (rather than inlined in
-// PluginContext::onClose) so it's testable directly with a constructed
-// Rules/AttackedLog, without needing to drive PluginContext's private
-// ruleArr_/atlog_ state through a full HTTP request/response cycle.
+// Publishes a WAF attack event to the Rust EventService -- extracted as a
+// free function (rather than inlined in PluginContext::onClose) so it's
+// testable directly with a constructed Rules/AttackedLog, without needing to
+// drive PluginContext's private ruleArr_/atlog_ state through a full HTTP
+// request/response cycle.
 void PublishWafAttackToRustEventService(Rules& rule_ctx, AttackedLog& log);
 
 namespace http {
@@ -54,7 +52,6 @@ private:
 class PluginRootContext {
 private:
   int *post_fd_;
-  grpc_bridge::EventBridge* event_bridge_ = nullptr;
   std::unordered_map<std::string, Rules> waf_rules_;
 
 public:
@@ -62,10 +59,6 @@ public:
   ~PluginRootContext();
 
   void SetPostFd(int *fd) { post_fd_ = fd; }
-
-  /*non-owning; wired once at startup after the gRPC server exists*/
-  void SetEventBridge(grpc_bridge::EventBridge* eb) { event_bridge_ = eb; }
-  grpc_bridge::EventBridge* GetEventBridge() const { return event_bridge_; }
 
   int HttpPost(std::string value);
 

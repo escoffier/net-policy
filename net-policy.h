@@ -145,7 +145,7 @@ public:
 
 struct RcvEpollCb; // forward declaration — full definition follows NFQ_RES_INFO
 class DaemonContext; // forward declaration — full definition follows PostServer
-namespace grpc_bridge { class EventBridge; class GrpcDispatchQueue; }
+namespace grpc_bridge { class GrpcDispatchQueue; }
 
 class NFQ_RES_INFO
 {
@@ -442,20 +442,16 @@ public:
                       const std::string& rule_key);
     /*return pointer to the fd so the WAF plugin can write directly*/
     int* FdPtr() { return &post_link_fd_; }
-    /*non-owning; wired once at startup after the gRPC server exists*/
-    void SetEventBridge(grpc_bridge::EventBridge* eb) { event_bridge_ = eb; }
 
 private:
     int post_link_fd_ = 0;
-    grpc_bridge::EventBridge* event_bridge_ = nullptr;
 };
 
 /*single aggregate owner of everything that used to be a free-standing global
  *in net-policy.cpp/waf/plugin.cc. One instance is constructed on the stack of
- *RunNetPolicyDaemon (exactly like grpc_bridge::GrpcServer g_grpc_server) and
- *threaded through every epoll callback via RcvEpollCb::daemon_ /
- *NFQ_RES_INFO::daemon_. Not copyable — there is exactly one instance for the
- *life of the process (or of a test).*/
+ *RunNetPolicyDaemon and threaded through every epoll callback via
+ *RcvEpollCb::daemon_ / NFQ_RES_INFO::daemon_. Not copyable — there is
+ *exactly one instance for the life of the process (or of a test).*/
 class DaemonContext
 {
 public:
@@ -481,16 +477,8 @@ public:
     int  IptablesVersion() const      { return ipt_ver_; }
     void SetIptablesVersion(int v)    { ipt_ver_ = v; }
 
-    /*---- gRPC wiring: GrpcServer is a sibling object, constructed separately
-     *in RunNetPolicyDaemon; this stores a non-owning pointer into it, set once
-     *at startup after both objects exist ----*/
-    void WireEventBridge(grpc_bridge::EventBridge* eb) {
-        post_server_.SetEventBridge(eb);
-        waf_root_.SetEventBridge(eb);
-    }
-
-    /*non-owning; wired once at startup, mirrors WireEventBridge's existing pattern
-     *exactly -- see grpc/control_dispatch.h for GrpcDispatchQueue.*/
+    /*non-owning; wired once at startup -- see grpc/control_dispatch.h for
+     *GrpcDispatchQueue.*/
     void WireRustControlDispatch(grpc_bridge::GrpcDispatchQueue* q) { rust_dispatch_queue_ = q; }
     grpc_bridge::GrpcDispatchQueue* RustControlDispatchQueue() { return rust_dispatch_queue_; }
 

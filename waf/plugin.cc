@@ -12,7 +12,7 @@
 #include "net/stream.h"
 #include "plugin.h"
 #include "log.h"
-#include "grpc/event_bridge.h"
+#include "net-policy.h" // PSEUDO_HEADER, cJSON (via cjson.h) -- used directly below
 #include "common/utf8_check.h"
 #include "net_policy_events_cxxbridge/lib.h"
 
@@ -166,11 +166,8 @@ FilterStatus PluginContext::onClose()
   if(!str) GOTO_ERROR(err, "json format failed.");
   /*http post*/
   root_ctx_->HttpPost(str);
-  /*publish to gRPC subscribers too -- see grpc/event_bridge.h*/
-  if (auto* eb = root_ctx_->GetEventBridge())
-    eb->PublishWafAttack(ruleArr, atlog);
-  /*dual-publish to the new Rust EventService during the migration (Phase 3)
-   *-- see docs/superpowers/specs/2026-07-31-cpp-to-rust-phase3-event-service-design.md.*/
+  /*publish to the Rust EventService -- see PublishWafAttackToRustEventService
+   *above for the IsValidUtf8 guard details.*/
   PublishWafAttackToRustEventService(ruleArr, atlog);
 
 err:

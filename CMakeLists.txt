@@ -95,9 +95,6 @@ set(SOURCES
     waf/plugin.cc
     waf/rule.cc
     grpc/control_dispatch.cc
-    grpc/event_bridge.cc
-    grpc/event_service.cc
-    grpc/grpc_server.cc
 )
 
 add_subdirectory(libnfnetlink)
@@ -276,12 +273,7 @@ add_executable(net_rule_grpc_test
     waf/plugin.cc
     waf/rule.cc
     grpc/control_dispatch.cc
-    grpc/event_bridge.cc
-    grpc/event_service.cc
-    grpc/grpc_server.cc
     ${NET_POLICY_PROTO_GENERATED_SRCS}
-    tests/grpc_event_bridge_test.cc
-    tests/grpc_e2e_test.cc
     tests/grpc_rust_control_e2e_test.cc
     tests/grpc_rust_events_e2e_test.cc
     tests/waf_rules_test.cc
