@@ -1,12 +1,47 @@
 #[cxx::bridge(namespace = "policy_engine")]
 mod ffi {
-    extern "Rust" {
-        fn policy_engine_ffi_smoke() -> i32;
+    #[derive(Default)]
+    struct SharedRulePort {
+        end_port: u16,
+        port: u16,
+        proto: u8,
     }
-}
 
-fn policy_engine_ffi_smoke() -> i32 {
-    42
+    #[derive(Default)]
+    struct SharedRuleDetail {
+        proto: u8,
+        priority: i32,
+        addr_type: i32,
+        /// 0 = Ingress, 1 = Egress -- matches FlowDir's C++ underlying values
+        direction: i32,
+        /// matches NetPolicyRule's uint32_t values directly (kDeny=0,
+        /// kAllow=1, kMark=2, kAllowRsp=3, kAllowReq=4, kDefault=5)
+        action: u32,
+        action_dsc: String,
+        policy_key: String,
+        src_ip: String,
+        dst_ip: String,
+        ports: Vec<SharedRulePort>,
+    }
+
+    struct MatchedRule {
+        matched: bool,
+        detail: SharedRuleDetail,
+    }
+
+    extern "Rust" {
+        type RustPolicyEngine;
+
+        fn new_policy_engine() -> Box<RustPolicyEngine>;
+        fn add_policy(self: &mut RustPolicyEngine, rule: SharedRuleDetail, port: SharedRulePort);
+        fn delete_policy(self: &mut RustPolicyEngine, dir: i32, name: &str);
+        fn match_five_tuple(
+            self: &RustPolicyEngine, proto: u8, dst_port: u16, src_port: u16,
+            src_addr: &str, dst_addr: &str, dir: i32,
+        ) -> MatchedRule;
+        fn clear_cfg(self: &mut RustPolicyEngine);
+        fn all_rules(self: &RustPolicyEngine, dir: i32) -> Vec<SharedRuleDetail>;
+    }
 }
 
 fn parse_cidr(cidr: &str) -> (String, i32) {
@@ -415,6 +450,79 @@ impl RustPolicyEngine {
     /// stable across runs anyway.
     fn all_rules_internal(&self, dir: FlowDir) -> Vec<RuleDetail> {
         self.tree(dir).chain.chain.values().flat_map(|group| group.rules.values().cloned()).collect()
+    }
+}
+
+impl From<ffi::SharedRulePort> for RulePort {
+    fn from(p: ffi::SharedRulePort) -> Self {
+        RulePort { end_port: p.end_port, port: p.port, proto: p.proto }
+    }
+}
+
+impl From<ffi::SharedRuleDetail> for RuleDetail {
+    fn from(d: ffi::SharedRuleDetail) -> Self {
+        RuleDetail {
+            proto: d.proto,
+            priority: d.priority,
+            addr_type: d.addr_type,
+            direction: if d.direction == 0 { FlowDir::Ingress } else { FlowDir::Egress },
+            action: d.action,
+            action_dsc: d.action_dsc,
+            policy_key: d.policy_key,
+            src_ip: d.src_ip,
+            dst_ip: d.dst_ip,
+            ports: d.ports.into_iter().map(RulePort::from).collect(),
+        }
+    }
+}
+
+impl From<RuleDetail> for ffi::SharedRuleDetail {
+    fn from(d: RuleDetail) -> Self {
+        ffi::SharedRuleDetail {
+            proto: d.proto,
+            priority: d.priority,
+            addr_type: d.addr_type,
+            direction: if d.direction == FlowDir::Ingress { 0 } else { 1 },
+            action: d.action,
+            action_dsc: d.action_dsc,
+            policy_key: d.policy_key,
+            src_ip: d.src_ip,
+            dst_ip: d.dst_ip,
+            ports: d.ports.into_iter().map(|p| ffi::SharedRulePort { end_port: p.end_port, port: p.port, proto: p.proto }).collect(),
+        }
+    }
+}
+
+fn dir_from_i32(dir: i32) -> FlowDir {
+    if dir == 0 { FlowDir::Ingress } else { FlowDir::Egress }
+}
+
+fn new_policy_engine() -> Box<RustPolicyEngine> {
+    Box::new(RustPolicyEngine::new())
+}
+
+impl RustPolicyEngine {
+    fn add_policy(&mut self, rule: ffi::SharedRuleDetail, port: ffi::SharedRulePort) {
+        self.add_policy_internal(RuleDetail::from(rule), RulePort::from(port));
+    }
+
+    fn delete_policy(&mut self, dir: i32, name: &str) {
+        self.delete_policy_internal(dir_from_i32(dir), name);
+    }
+
+    fn match_five_tuple(&self, proto: u8, dst_port: u16, src_port: u16, src_addr: &str, dst_addr: &str, dir: i32) -> ffi::MatchedRule {
+        match self.match_five_tuple_internal(proto, dst_port, src_port, src_addr, dst_addr, dir_from_i32(dir)) {
+            Some(detail) => ffi::MatchedRule { matched: true, detail: detail.into() },
+            None => ffi::MatchedRule { matched: false, detail: ffi::SharedRuleDetail::default() },
+        }
+    }
+
+    fn clear_cfg(&mut self) {
+        self.clear_cfg_internal();
+    }
+
+    fn all_rules(&self, dir: i32) -> Vec<ffi::SharedRuleDetail> {
+        self.all_rules_internal(dir_from_i32(dir)).into_iter().map(ffi::SharedRuleDetail::from).collect()
     }
 }
 
