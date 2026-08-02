@@ -10,22 +10,7 @@
 #include "net-policy.h"
 #include "log.h"
 #include "waf_rules_core_cxxbridge/lib.h"
-
-namespace {
-// rust::Str requires valid UTF-8 and throws std::invalid_argument otherwise.
-// Attacker-controlled HTTP bytes (path, Host, X-Forwarded-For, request
-// body) carry no such guarantee, so every FFI call taking one must fail
-// closed (treat as no-match) rather than let the exception escape
-// uncaught and crash the daemon via std::terminate.
-inline bool IsValidUtf8(const std::string &s) {
-    try {
-        (void)rust::Str(s);
-        return true;
-    } catch (const std::invalid_argument &) {
-        return false;
-    }
-}
-}  // namespace
+#include "common/utf8_check.h"
 
 /*
 std::string GetNowTime()

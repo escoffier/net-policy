@@ -62,6 +62,11 @@ corrosion_add_cxxbridge(net_policy_control_cxxbridge
 # C++ #include of its own and so never needed this.
 target_include_directories(net_policy_control_cxxbridge PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
+corrosion_add_cxxbridge(net_policy_events_cxxbridge
+  CRATE net_policy_events
+  FILES lib.rs
+)
+
 add_compile_definitions(GLOG_CUSTOM_PREFIX_SUPPORT)
 
 set(SOURCES
@@ -90,9 +95,6 @@ set(SOURCES
     waf/plugin.cc
     waf/rule.cc
     grpc/control_dispatch.cc
-    grpc/event_bridge.cc
-    grpc/event_service.cc
-    grpc/grpc_server.cc
 )
 
 add_subdirectory(libnfnetlink)
@@ -106,13 +108,13 @@ add_subdirectory(libnetfilter_queue)
 set(NET_POLICY_PROTO_FILES
     proto/net_policy_common.proto
     proto/net_policy_control.proto
-    proto/net_policy_events.proto
 )
 set(NET_POLICY_PROTO_GEN_DIR ${CMAKE_CURRENT_BINARY_DIR}/proto-gen/proto)
 file(MAKE_DIRECTORY ${NET_POLICY_PROTO_GEN_DIR})
 
-set(NET_POLICY_PROTO_GENERATED_SRCS "")
-foreach(proto_file ${NET_POLICY_PROTO_FILES})
+# Generates the .pb.cc/.pb.h/.grpc.pb.cc/.grpc.pb.h for one proto_file and appends the
+# two compiled sources (pb.cc, grpc.pb.cc) to the list named by out_var.
+macro(net_policy_add_proto proto_file out_var)
   get_filename_component(proto_name ${proto_file} NAME_WE)
   set(pb_cc      ${NET_POLICY_PROTO_GEN_DIR}/${proto_name}.pb.cc)
   set(pb_h       ${NET_POLICY_PROTO_GEN_DIR}/${proto_name}.pb.h)
@@ -129,13 +131,36 @@ foreach(proto_file ${NET_POLICY_PROTO_FILES})
     DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/${proto_file}
     COMMENT "Generating gRPC/protobuf code for ${proto_file}"
     VERBATIM)
-  list(APPEND NET_POLICY_PROTO_GENERATED_SRCS ${pb_cc} ${grpc_pb_cc})
+  list(APPEND ${out_var} ${pb_cc} ${grpc_pb_cc})
+endmacro()
+
+set(NET_POLICY_PROTO_GENERATED_SRCS "")
+foreach(proto_file ${NET_POLICY_PROTO_FILES})
+  net_policy_add_proto(${proto_file} NET_POLICY_PROTO_GENERATED_SRCS)
+endforeach()
+
+# proto/net_policy_events.proto is kept out of NET_POLICY_PROTO_FILES/SOURCES above:
+# no C++ in net-rule references its generated types anymore (net-policy.cpp and
+# waf/plugin.cc only include net_policy_events_cxxbridge/lib.h, which carries no
+# proto-generated C++ types across the FFI boundary -- the Rust net_policy_events
+# crate is the actual EventService server now). The only remaining C++ consumer of
+# this proto's generated code is tests/grpc_rust_events_e2e_test.cc, which needs the
+# generated gRPC CLIENT stub to talk to the Rust server as a test client. Generated
+# into its own list, and added only to net_rule_grpc_test below, so net-rule doesn't
+# compile/link the unused ~679KB NetPolicyEvents::Service server-side scaffolding.
+set(NET_POLICY_EVENTS_PROTO_FILES
+    proto/net_policy_events.proto
+)
+set(NET_POLICY_EVENTS_PROTO_GENERATED_SRCS "")
+foreach(proto_file ${NET_POLICY_EVENTS_PROTO_FILES})
+  net_policy_add_proto(${proto_file} NET_POLICY_EVENTS_PROTO_GENERATED_SRCS)
 endforeach()
 
 # Generated code isn't held to this project's -Wall -Werror (see target_compile_options
 # below, which applies only to the net-rule target) -- protobuf/grpc generated sources
 # routinely trip -Wunused-parameter/-Wshadow that would otherwise break the build.
-set_source_files_properties(${NET_POLICY_PROTO_GENERATED_SRCS} PROPERTIES COMPILE_OPTIONS "-w")
+set_source_files_properties(${NET_POLICY_PROTO_GENERATED_SRCS} ${NET_POLICY_EVENTS_PROTO_GENERATED_SRCS}
+  PROPERTIES COMPILE_OPTIONS "-w")
 
 list(APPEND SOURCES ${NET_POLICY_PROTO_GENERATED_SRCS})
 
@@ -195,14 +220,16 @@ target_link_libraries(net-rule
   protobuf::libprotobuf
   waf_rules_core_cxxbridge
   net_policy_control_cxxbridge
+  net_policy_events_cxxbridge
 )
-# waf_rules_core_cxxbridge and net_policy_control_cxxbridge are separate Rust
-# staticlib crates that both depend on the `cxx` crate; since each staticlib
-# statically embeds its own copy of cxx's internal runtime shim symbols
-# (e.g. cxxbridge1$rust_vec$bool$...), linking two such crates into the same
-# binary trips the linker's ODR check even though the duplicated bodies are
-# byte-identical. --allow-multiple-definition is the standard workaround
-# (see cxx-rs upstream issues on multi-crate staticlib linking).
+# waf_rules_core_cxxbridge, net_policy_control_cxxbridge, and
+# net_policy_events_cxxbridge are separate Rust staticlib crates that all depend
+# on the `cxx` crate; since each staticlib statically embeds its own copy of
+# cxx's internal runtime shim symbols (e.g. cxxbridge1$rust_vec$bool$...),
+# linking multiple such crates into the same binary trips the linker's ODR check
+# even though the duplicated bodies are byte-identical. --allow-multiple-definition
+# is the standard workaround (see cxx-rs upstream issues on multi-crate staticlib
+# linking).
 set_target_properties(net-rule PROPERTIES LINK_FLAGS "-Wl,--allow-multiple-definition")
 
 # target_link_libraries(net-rule
@@ -270,13 +297,10 @@ add_executable(net_rule_grpc_test
     waf/plugin.cc
     waf/rule.cc
     grpc/control_dispatch.cc
-    grpc/event_bridge.cc
-    grpc/event_service.cc
-    grpc/grpc_server.cc
     ${NET_POLICY_PROTO_GENERATED_SRCS}
-    tests/grpc_event_bridge_test.cc
-    tests/grpc_e2e_test.cc
+    ${NET_POLICY_EVENTS_PROTO_GENERATED_SRCS}
     tests/grpc_rust_control_e2e_test.cc
+    tests/grpc_rust_events_e2e_test.cc
     tests/waf_rules_test.cc
 )
 target_include_directories(net_rule_grpc_test PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/ ${CMAKE_CURRENT_BINARY_DIR}/proto-gen)
@@ -300,6 +324,7 @@ target_link_libraries(net_rule_grpc_test
   protobuf::libprotobuf
   waf_rules_core_cxxbridge
   net_policy_control_cxxbridge
+  net_policy_events_cxxbridge
   GTest::gtest_main)
 # See the matching comment on net-rule's LINK_FLAGS above.
 set_target_properties(net_rule_grpc_test PROPERTIES LINK_FLAGS "-Wl,--allow-multiple-definition")

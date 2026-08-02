@@ -33,9 +33,9 @@
 #include <gflags/gflags.h>
 #include "net-policy.h"
 #include "grpc/control_dispatch.h"
-#include "grpc/event_bridge.h"
-#include "grpc/grpc_server.h"
 #include "net_policy_control_cxxbridge/lib.h"
+#include "common/utf8_check.h"
+#include "net_policy_events_cxxbridge/lib.h"
 #include "proto/net_policy_control.pb.h"
 
 using std::string;
@@ -370,11 +370,20 @@ int PostServer::SendMatchMsg(FiveTuple& tuple, NetPolicyRule action, FlowDir dir
   int ret, len;
   char buf[11] = {"#%% pre"};
   char data[1024];
-  /*publish to gRPC subscribers unconditionally -- this must run before the
-   *post_link_fd_ early-return below, since a gRPC-only deployment (no legacy
-   *listener connected) would otherwise never see these events*/
-  if (event_bridge_)
-    event_bridge_->PublishPolicyMatch(tuple, action, dir, rule_key);
+  /*publish to the Rust EventService unconditionally -- this must run before
+   *the post_link_fd_ early-return below, since a gRPC-only deployment (no
+   *legacy listener connected) would otherwise never see these events.
+   *IsValidUtf8 guards every field that could carry attacker-influenceable
+   *bytes: rust::Str throws on invalid UTF-8, and this call has no
+   *enclosing try/catch (unlike the ControlService dispatch path, which
+   *goes through GrpcDispatchQueue's closure boundary).*/
+  if (IsValidUtf8(tuple.src_addr_) && IsValidUtf8(tuple.dst_addr_) && IsValidUtf8(rule_key)) {
+    grpc_bridge::publish_policy_match(
+        tuple.proto_, static_cast<int32_t>(action), static_cast<int32_t>(dir),
+        tuple.src_port_, tuple.dst_port_, tuple.src_addr_, tuple.dst_addr_, rule_key);
+  } else {
+    LOG_W("skipped publishing policy match event to Rust EventService: invalid UTF-8 in tuple/rule_key");
+  }
   if (post_link_fd_ <= 0)
     return 0;
   memset(data, 0, sizeof(data));
@@ -2486,13 +2495,11 @@ int GetIptablesVersion() {
 
 int RunNetPolicyDaemon(int argc, char* argv[]) {
   /*single aggregate owner of everything that used to be a free-standing
-   *global (see net-policy.h's DaemonContext); runs alongside the raw-socket
-   *servers below -- see grpc/grpc_server.h. Both declared here
-   *(unconditionally constructed before any of the fallible setup below, and
-   *before the registerFilter calls that need daemon) so that none of the
-   *GOTO_ERROR jumps to err: below cross either object's initialization.*/
+   *global (see net-policy.h's DaemonContext). Declared here (unconditionally
+   *constructed before any of the fallible setup below, and before the
+   *registerFilter calls that need daemon) so that no GOTO_ERROR jump to err:
+   *below can cross its initialization.*/
   DaemonContext daemon;
-  grpc_bridge::GrpcServer g_grpc_server;
 
   google::InitGoogleLogging(argv[0], &CustomPrefix);
   google::ParseCommandLineFlags(&argc, &argv, true);
@@ -2563,13 +2570,6 @@ int RunNetPolicyDaemon(int argc, char* argv[]) {
     GOTO_ERROR(err, "listen the client connect request! err : %s.", strerror(errno));
   //
   daemon.Microseg().SetEfd(epfd);
-  // start the gRPC event server (additive -- see grpc/grpc_server.h;
-  // raw-socket servers above are untouched); the control service now lives
-  // entirely in the Rust ControlService started below.
-  ret = g_grpc_server.Start();
-  if (ret != 0)
-    GOTO_ERROR(err, "failed to start grpc event server.");
-  daemon.WireEventBridge(&g_grpc_server.GetEventBridge());
 
   // --- Rust ControlService (production control plane, port 50051) ---
   int rust_dispatch_wake_fd;
@@ -2598,6 +2598,18 @@ int RunNetPolicyDaemon(int argc, char* argv[]) {
   ret = epoll_ctl(epfd, EPOLL_CTL_ADD, zListenFd, &ev);
   if (ret < 0)
     GOTO_ERROR(err, "epoll ctl failed, %s.", strerror(errno));
+
+  // --- Rust EventService (production event stream, port 50052) ---
+  // Started before start_control_server below: it has no DaemonContext/epoll_fd
+  // coupling, so unlike start_control_server it doesn't need to be the very last
+  // fallible step. Ordering it first means that if IT fails, nothing is listening
+  // on 50051 yet either, so there's no use-after-free window in that direction.
+  {
+    uint16_t event_port = grpc_bridge::start_event_server(/*port=*/50052);
+    if (event_port == 0)
+      GOTO_ERROR(err, "failed to start rust event service.");
+    LOG_I("rust event service listening on port %d", (int)event_port);
+  }
 
   {
     uint16_t bound_port = grpc_bridge::start_control_server(&daemon, &rust_dispatch_queue, epfd, /*port=*/50051);

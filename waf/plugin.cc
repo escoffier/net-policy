@@ -12,8 +12,36 @@
 #include "net/stream.h"
 #include "plugin.h"
 #include "log.h"
-#include "grpc/event_bridge.h"
+#include "net-policy.h" // PSEUDO_HEADER, cJSON (via cjson.h) -- used directly below
+#include "common/utf8_check.h"
+#include "net_policy_events_cxxbridge/lib.h"
 
+void PublishWafAttackToRustEventService(Rules& rule_ctx, AttackedLog& log) {
+  /*Every string field here is attacker-influenceable (attack_load/
+   *attacked_url come straight from the request being inspected), so all of
+   *them must pass IsValidUtf8 before crossing into rust::Str -- unlike
+   *Task 5's five-tuple fields (mostly network-layer-derived, lower risk),
+   *these are HTTP-layer payload data. This call has no enclosing
+   *try/catch, so a skipped guard here would abort the whole daemon on the
+   *very thread that processes every HTTP connection.*/
+  if (IsValidUtf8(rule_ctx.res_name_) && IsValidUtf8(rule_ctx.GetAppName()) &&
+      IsValidUtf8(rule_ctx.res_kind_) && IsValidUtf8(rule_ctx.pod_namespace_) &&
+      IsValidUtf8(rule_ctx.cluster_key_) && IsValidUtf8(log.action_) &&
+      IsValidUtf8(log.attack_ip_) && IsValidUtf8(log.attacked_app_) &&
+      IsValidUtf8(log.attack_load_) && IsValidUtf8(log.rule_name_) &&
+      IsValidUtf8(log.req_pkg_) && IsValidUtf8(log.rsp_pkg_) &&
+      IsValidUtf8(log.type_) && IsValidUtf8(log.attacked_url_) &&
+      IsValidUtf8(log.rsp_content_type_)) {
+    grpc_bridge::publish_waf_attack(
+        rule_ctx.app_id_, rule_ctx.res_name_, rule_ctx.GetAppName(), rule_ctx.res_kind_,
+        rule_ctx.pod_namespace_, rule_ctx.cluster_key_, log.action_, log.attack_ip_,
+        log.attacked_app_, log.attack_load_, log.attack_time_, log.rule_id_,
+        log.rule_name_, log.req_pkg_, log.rsp_pkg_, log.type_, log.attacked_url_,
+        log.rsp_content_type_);
+  } else {
+    LOG_W("skipped publishing WAF attack event to Rust EventService: invalid UTF-8 in a field");
+  }
+}
 
 namespace http {
 namespace extension {
@@ -138,9 +166,9 @@ FilterStatus PluginContext::onClose()
   if(!str) GOTO_ERROR(err, "json format failed.");
   /*http post*/
   root_ctx_->HttpPost(str);
-  /*publish to gRPC subscribers too -- see grpc/event_bridge.h*/
-  if (auto* eb = root_ctx_->GetEventBridge())
-    eb->PublishWafAttack(ruleArr, atlog);
+  /*publish to the Rust EventService -- see PublishWafAttackToRustEventService
+   *above for the IsValidUtf8 guard details.*/
+  PublishWafAttackToRustEventService(ruleArr, atlog);
 
 err:
   if(root) cJSON_Delete(root);
