@@ -583,6 +583,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "net_policy_engine"
+version = "0.1.0"
+dependencies = [
+ "cxx",
+]
+
+[[package]]
+name = "net_policy_events"
+version = "0.1.0"
+dependencies = [
+ "cxx",
+ "prost",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tonic-build",
+]
+
+[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
