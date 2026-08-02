@@ -280,6 +280,211 @@ mod tests {
     }
 }
 
+use std::collections::BTreeSet;
+
+pub struct RustPolicyEngine {
+    input_tree: PolicyTree,
+    output_tree: PolicyTree,
+    // std::set<int> in C++ -- BTreeSet (sorted iteration), NOT HashSet. See
+    // Global Constraints: CreateRuleKeyByTuple's generated-key order depends
+    // on this, and the caller returns on the first matching key.
+    mask_cidr: BTreeSet<i32>,
+    priority: BTreeSet<i32>,
+}
+
+impl RustPolicyEngine {
+    fn new() -> Self {
+        let mut mask_cidr = BTreeSet::new();
+        mask_cidr.insert(32);
+        RustPolicyEngine {
+            input_tree: PolicyTree::new(FlowDir::Ingress),
+            output_tree: PolicyTree::new(FlowDir::Egress),
+            mask_cidr,
+            priority: BTreeSet::new(),
+        }
+    }
+
+    fn tree(&self, dir: FlowDir) -> &PolicyTree {
+        match dir {
+            FlowDir::Ingress => &self.input_tree,
+            FlowDir::Egress => &self.output_tree,
+        }
+    }
+
+    fn tree_mut(&mut self, dir: FlowDir) -> &mut PolicyTree {
+        match dir {
+            FlowDir::Ingress => &mut self.input_tree,
+            FlowDir::Egress => &mut self.output_tree,
+        }
+    }
+
+    fn add_mask_and_priority(&mut self, priority: i32, mask: i32) {
+        self.priority.insert(priority);
+        if mask > 0 && mask <= 32 {
+            self.mask_cidr.insert(mask);
+        }
+    }
+
+    /// Mirrors PolicyRule::CreateRuleKeyByTuple exactly: for each known
+    /// priority, emits 2 wildcard keys (any-source for ingress / any-dest
+    /// for egress) plus 2 CIDR-masked keys per known mask (proto-specific +
+    /// proto-wildcard "0" variant). Order matters -- see Global Constraints.
+    fn create_rule_key_by_tuple(&self, proto: u8, src_addr: &str, dst_addr: &str, dir: FlowDir) -> Vec<String> {
+        let ingress = dir == FlowDir::Ingress;
+        let cidr_addr = if ingress { src_addr } else { dst_addr };
+        let exact_addr = if ingress { dst_addr } else { src_addr };
+        let proto_str = proto.to_string();
+
+        let mut keys = Vec::with_capacity(self.priority.len() * 2 * (1 + self.mask_cidr.len()));
+        for &priority in &self.priority {
+            let proto_pfx = format!("{}-{}-", priority, proto_str);
+            let proto0_pfx = format!("{}-0-", priority);
+
+            let wildcard_suffix = if ingress {
+                format!("0.0.0.0/32-{}", exact_addr)
+            } else {
+                format!("{}-0.0.0.0/32", exact_addr)
+            };
+            keys.push(format!("{}{}", proto_pfx, wildcard_suffix));
+            keys.push(format!("{}{}", proto0_pfx, wildcard_suffix));
+
+            for &mask in &self.mask_cidr {
+                let cidr = format!("{}/{}", ipv4_cidr_to_ip(cidr_addr, mask), mask);
+                let cidr_suffix = if ingress {
+                    format!("{}-{}", cidr, exact_addr)
+                } else {
+                    format!("{}-{}", exact_addr, cidr)
+                };
+                keys.push(format!("{}{}", proto_pfx, cidr_suffix));
+                keys.push(format!("{}{}", proto0_pfx, cidr_suffix));
+            }
+        }
+        keys
+    }
+}
+
+impl RustPolicyEngine {
+    /// Mirrors PolicyRule::AddPolicyToTree.
+    fn add_policy_internal(&mut self, policy: RuleDetail, port: RulePort) {
+        let (_key, mask) = policy.create_rule_key();
+        let priority = policy.priority;
+        let dir = policy.direction;
+        self.tree_mut(dir).add_policy_to_chain(policy, port);
+        self.add_mask_and_priority(priority, mask);
+    }
+
+    /// Mirrors PolicyRule::DeletePolicy.
+    fn delete_policy_internal(&mut self, dir: FlowDir, name: &str) {
+        self.tree_mut(dir).delete_policy_from_tree(name);
+    }
+
+    /// Mirrors PolicyRule::ClearCfg.
+    fn clear_cfg_internal(&mut self) {
+        self.mask_cidr.clear();
+        self.priority.clear();
+        self.mask_cidr.insert(32);
+        self.input_tree.clear();
+        self.output_tree.clear();
+    }
+
+    /// Single-call replacement for MatchNetPolicyRule's current three-call
+    /// sequence (GetPolicyTree -> CreateRuleKeyByTuple -> loop over
+    /// MatchRuleGroup) -- see the design spec's FFI-granularity rationale.
+    /// Mirrors that function's node-IP-registry-agnostic core (the
+    /// IsNodeIp check itself stays in C++, in MatchNetPolicyRule, since
+    /// MicroSegEngine's node registry is out of scope for this crate).
+    fn match_five_tuple_internal(&self, proto: u8, dst_port: u16, src_port: u16, src_addr: &str, dst_addr: &str, dir: FlowDir) -> Option<RuleDetail> {
+        let tree = self.tree(dir);
+        if tree.size() == 0 {
+            return None;
+        }
+        for key in self.create_rule_key_by_tuple(proto, src_addr, dst_addr, dir) {
+            if let Some(matched) = tree.chain.match_rule_group(&key, proto, dst_port, src_port) {
+                return Some(matched);
+            }
+        }
+        None
+    }
+
+    /// Supports the C++-side GetAllConfig, which currently walks
+    /// PolicyTree::chain_/RuleGroup::rules_ directly (public members on
+    /// types this phase deletes) -- this flat enumeration replaces that
+    /// walk. Order is unspecified (HashMap iteration); GetAllConfig's JSON
+    /// output ordering was never a documented contract, only an
+    /// implementation artifact of unordered_map iteration, which was never
+    /// stable across runs anyway.
+    fn all_rules_internal(&self, dir: FlowDir) -> Vec<RuleDetail> {
+        self.tree(dir).chain.chain.values().flat_map(|group| group.rules.values().cloned()).collect()
+    }
+}
+
+#[cfg(test)]
+mod engine_tests {
+    use super::*;
+
+    fn sample_rule(policy_key: &str, priority: i32, proto: u8, dir: FlowDir, src: &str, dst: &str) -> RuleDetail {
+        RuleDetail {
+            proto, priority, addr_type: 0, direction: dir, action: 1,
+            action_dsc: String::new(), policy_key: policy_key.to_string(),
+            src_ip: src.to_string(), dst_ip: dst.to_string(), ports: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn engine_add_and_match_cidr_rule() {
+        let mut engine = RustPolicyEngine::new();
+        let rule = sample_rule("p1", 10, 6, FlowDir::Ingress, "10.0.0.0/24", "1.2.3.4");
+        engine.add_policy_internal(rule, RulePort { end_port: 0, port: 0, proto: 6 });
+        let matched = engine.match_five_tuple_internal(6, 80, 12345, "10.0.0.5", "1.2.3.4", FlowDir::Ingress);
+        assert!(matched.is_some());
+        assert_eq!(matched.unwrap().policy_key, "p1");
+    }
+
+    #[test]
+    fn engine_no_match_when_tree_empty() {
+        let engine = RustPolicyEngine::new();
+        assert!(engine.match_five_tuple_internal(6, 80, 12345, "10.0.0.5", "1.2.3.4", FlowDir::Ingress).is_none());
+    }
+
+    #[test]
+    fn engine_delete_then_no_match() {
+        let mut engine = RustPolicyEngine::new();
+        let rule = sample_rule("p1", 10, 6, FlowDir::Ingress, "10.0.0.0/24", "1.2.3.4");
+        engine.add_policy_internal(rule, RulePort { end_port: 0, port: 0, proto: 6 });
+        engine.delete_policy_internal(FlowDir::Ingress, "p1");
+        assert!(engine.match_five_tuple_internal(6, 80, 12345, "10.0.0.5", "1.2.3.4", FlowDir::Ingress).is_none());
+    }
+
+    #[test]
+    fn engine_egress_matches_dst_cidr() {
+        let mut engine = RustPolicyEngine::new();
+        let rule = sample_rule("p1", 10, 6, FlowDir::Egress, "1.2.3.4", "10.0.0.0/24");
+        engine.add_policy_internal(rule, RulePort { end_port: 0, port: 0, proto: 6 });
+        let matched = engine.match_five_tuple_internal(6, 80, 12345, "1.2.3.4", "10.0.0.9", FlowDir::Egress);
+        assert!(matched.is_some());
+    }
+
+    #[test]
+    fn engine_all_rules_returns_added_rule() {
+        let mut engine = RustPolicyEngine::new();
+        let rule = sample_rule("p1", 10, 6, FlowDir::Ingress, "10.0.0.0/24", "1.2.3.4");
+        engine.add_policy_internal(rule, RulePort { end_port: 0, port: 0, proto: 6 });
+        let rules = engine.all_rules_internal(FlowDir::Ingress);
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].policy_key, "p1");
+    }
+
+    #[test]
+    fn engine_clear_cfg_resets_everything() {
+        let mut engine = RustPolicyEngine::new();
+        let rule = sample_rule("p1", 10, 6, FlowDir::Ingress, "10.0.0.0/24", "1.2.3.4");
+        engine.add_policy_internal(rule, RulePort { end_port: 0, port: 0, proto: 6 });
+        engine.clear_cfg_internal();
+        assert_eq!(engine.all_rules_internal(FlowDir::Ingress).len(), 0);
+        assert!(engine.match_five_tuple_internal(6, 80, 12345, "10.0.0.5", "1.2.3.4", FlowDir::Ingress).is_none());
+    }
+}
+
 #[cfg(test)]
 mod policy_tree_tests {
     use super::*;
