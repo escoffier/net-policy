@@ -345,7 +345,7 @@ void NfQueData::ClearNfQueResource(int efd, int ipt_ver) {
     /*print debug log*/
     LOG_D("destroy nfqueue, pid : %d.", res->pid_);
     /*clear iptables rule*/
-    ClearIptabelsRule(ipt_ver);
+    net_iptables::clear_iptables_rule(ipt_ver);
     /*free nfque resource — unique_ptr handles delete*/
     res->FreeResource(efd);
   }

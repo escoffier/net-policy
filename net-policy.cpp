@@ -1207,144 +1207,6 @@ void UpdateMark(std::unordered_map<uint64_t, string>& cgRes, DaemonContext& daem
   }
 }
 
-/*check iptables rule*/
-bool CheckIptablesRule(int ipt_ver) {
-  int length;
-  FILE* fp = NULL;
-  char buf[1024];
-  const char* icheck = (ipt_ver == 0) ? "iptables -t mangle -S | grep TS_ZERO_PREROUTING"
-                                      : "iptables-legacy -t mangle -S | grep TS_ZERO_PREROUTING";
-  //
-  fp = popen(icheck, "r");
-  if (!fp)
-    RETURN_ERROR(false, "popen iptables input command failed, %s.", strerror(errno));
-
-  length = fread(buf, 1, sizeof(buf), fp);
-  pclose(fp);
-
-  if (length < 0)
-    RETURN_ERROR(false, "fread iptables input command ret failed, %s.", strerror(errno));
-  if ((length == 0) || (strlen(buf) == 0))
-    return false;
-
-  return true;
-}
-
-void ClearIptabelsRule(int ipt_ver) {
-  const char* clear = (ipt_ver == 0) ? "iptables -t mangle -F" : "iptables-legacy -t mangle -F";
-  const char* dichan = (ipt_ver == 0) ? "iptables -t mangle -X TS_ZERO_PREROUTING"
-                                      : "iptables-legacy -t mangle -X TS_ZERO_PREROUTING";
-  const char* dochan = (ipt_ver == 0) ? "iptables -t mangle -X TS_ZERO_OUTPUT"
-                                      : "iptables-legacy -t mangle -X TS_ZERO_OUTPUT";
-  system(clear);
-  system(dichan);
-  system(dochan);
-}
-
-/*exec iptables*/
-void WriteIptableRule(int iMarkNum, int oMarkNum, int ipt_ver, bool waf_enable) {
-  int ret;
-  FILE* fp = NULL;
-  char buf[1024];
-  char cmd[1024];
-  const char* simark = nullptr;
-  const char* somark = nullptr;
-
-  const char* pcheck = (ipt_ver == 0) ? "iptables -t mangle -S | grep TS_ZERO_PREROUTING"
-                                      : "iptables-legacy -t mangle -S | grep TS_ZERO_PREROUTING";
-  const char* ocheck = (ipt_ver == 0) ? "iptables -t mangle -S | grep TS_ZERO_OUTPUT"
-                                      : "iptables-legacy -t mangle -S | grep TS_ZERO_OUTPUT";
-
-  const char* icreate = (ipt_ver == 0)
-                            ? "iptables -t mangle -N TS_ZERO_PREROUTING 2>/dev/null && iptables -t "
-                              "mangle -I PREROUTING -j TS_ZERO_PREROUTING"
-                            : "iptables-legacy -t mangle -N TS_ZERO_PREROUTING 2>/dev/null && "
-                              "iptables-legacy -t mangle -I PREROUTING -j TS_ZERO_PREROUTING";
-  const char* ocreate = (ipt_ver == 0) ? "iptables -t mangle -N TS_ZERO_OUTPUT 2>/dev/null && "
-                                         "iptables -t mangle -I OUTPUT -j TS_ZERO_OUTPUT"
-                                       : "iptables-legacy -t mangle -N TS_ZERO_OUTPUT 2>/dev/null "
-                                         "&& iptables-legacy -t mangle -I OUTPUT -j TS_ZERO_OUTPUT";
-
-  const char* imark = (ipt_ver == 0)
-                          ? "iptables -t mangle -I PREROUTING -j CONNMARK --restore-mark"
-                          : "iptables-legacy -t mangle -I PREROUTING -j CONNMARK --restore-mark";
-  const char* omark = (ipt_ver == 0)
-                          ? "iptables -t mangle -I OUTPUT -j CONNMARK --restore-mark"
-                          : "iptables-legacy -t mangle -I OUTPUT -j CONNMARK --restore-mark";
-
-  if (!waf_enable) {
-    simark = (ipt_ver == 0) ? "iptables -t mangle -A INPUT -j CONNMARK --save-mark"
-                            : "iptables-legacy -t mangle -A INPUT -j CONNMARK --save-mark";
-    somark = (ipt_ver == 0) ? "iptables -t mangle -A POSTROUTING -j CONNMARK --save-mark"
-                            : "iptables-legacy -t mangle -A POSTROUTING -j CONNMARK --save-mark";
-  }
-
-  const char* ipass =
-      (ipt_ver == 0)
-          ? "iptables -t mangle -A TS_ZERO_PREROUTING -m mark --mark %d -j ACCEPT"
-          : "iptables-legacy -t mangle -A TS_ZERO_PREROUTING -m mark --mark %d -j ACCEPT";
-  const char* infque =
-      (ipt_ver == 0)
-          ? "iptables -t mangle -A TS_ZERO_PREROUTING -j NFQUEUE --queue-num 0 --queue-bypass"
-          : "iptables-legacy -t mangle -A TS_ZERO_PREROUTING -j NFQUEUE --queue-num 0 "
-            "--queue-bypass";
-
-  const char* opass =
-      (ipt_ver == 0) ? "iptables -t mangle -A TS_ZERO_OUTPUT -m mark --mark %d -j ACCEPT"
-                     : "iptables-legacy -t mangle -A TS_ZERO_OUTPUT -m mark --mark %d -j ACCEPT";
-  const char* onfque =
-      (ipt_ver == 0)
-          ? "iptables -t mangle -A TS_ZERO_OUTPUT -j NFQUEUE --queue-num 1 --queue-bypass"
-          : "iptables-legacy -t mangle -A TS_ZERO_OUTPUT -j NFQUEUE --queue-num 1 --queue-bypass";
-
-  // check iptables rule
-  // if(CheckIptablesRule(ipt_ver)) return;
-  if (CheckIptablesRule(ipt_ver)) {
-    ClearIptabelsRule(ipt_ver);
-  }
-  //
-  fp = popen(pcheck, "r");
-  if (!fp)
-    GOTO_ERROR(err, "popen iptables input command failed, %s.", strerror(errno));
-  ret = fread(buf, 1, sizeof(buf), fp);
-  if (ret < 0)
-    GOTO_ERROR(err, "fread iptables input command ret failed, %s.", strerror(errno));
-  if ((ret == 0) || (strlen(buf) == 0)) {
-    system(icreate);
-    system(imark);
-    bzero(cmd, sizeof(cmd));
-    sprintf(cmd, ipass, iMarkNum);
-    system(cmd);
-    system(infque);
-    if (simark)
-      system(simark);
-  }
-  pclose(fp);
-  //
-  fp = popen(ocheck, "r");
-  if (!fp)
-    GOTO_ERROR(err, "popen iptables output command failed, %s.", strerror(errno));
-  ret = fread(buf, 1, sizeof(buf), fp);
-  if (ret < 0)
-    GOTO_ERROR(err, "fread iptables output command ret failed, %s.", strerror(errno));
-  if ((ret == 0) || (strlen(buf) == 0)) {
-    system(ocreate);
-    system(omark);
-    bzero(cmd, sizeof(cmd));
-    sprintf(cmd, opass, oMarkNum);
-    system(cmd);
-    system(onfque);
-    if (somark)
-      system(somark);
-  }
-  pclose(fp);
-  return;
-err:
-  if (fp)
-    pclose(fp);
-  return;
-}
-
 NET_POLICY_RULE ConvertRuleAction(std::string& str) {
   if ((str.compare("Allow") == 0) || (str.compare("Log") == 0))
     return NetPolicyRule::kAllow;
@@ -1663,7 +1525,7 @@ int32_t GrpcDispatchPodUp(DaemonContext* daemon, GrpcDispatchQueue* queue, int32
     if (ret == 0) {
       ret = InitNfqueue(epoll_fd, ctrl, *daemon);
       if (ret == 0)
-        WriteIptableRule(1, 1, daemon->IptablesVersion(), daemon->WafEnabled());
+        net_iptables::write_iptable_rule(1, 1, daemon->IptablesVersion(), daemon->WafEnabled());
     }
     result = ret;
   };
@@ -2128,37 +1990,6 @@ void CustomPrefix(std::ostream& s, const google::LogMessageInfo& l, void*) {
     << l.line_number;
 }
 
-/*returns the detected iptables "version" (0 == modern iptables, 1 == legacy);
- *on any command-execution failure, returns 0 -- matching the previous
- *behavior of leaving g_ipt_ver at its zero-initialized default when this
- *function couldn't determine anything.*/
-int GetIptablesVersion() {
-  int ret;
-  FILE* fp = NULL;
-  std::string value;
-  char buf[1024];
-  /*exec command*/
-  fp = popen("iptables -t nat -S PREROUTING", "r");
-  if (!fp)
-    RETURN_ERROR(0, "popen iptables command failed, %s.", strerror(errno));
-  /*init memory*/
-  memset(buf, 0, sizeof(buf));
-  /*read data*/
-  ret = fread(buf, 1, sizeof(buf), fp);
-  /*close*/
-  pclose(fp);
-  /*check result*/
-  if (ret < 0)
-    RETURN_ERROR(0, "fread iptables command's ret failed, %s.", strerror(errno));
-  /*to string*/
-  value = buf;
-  auto pos = value.find("-A PREROUTING");
-  if (pos != std::string::npos)
-    return 0;
-  /*use new iptables*/
-  return 1;
-}
-
 int RunNetPolicyDaemon(int argc, char* argv[]) {
   /*single aggregate owner of everything that used to be a free-standing
    *global (see net-policy.h's DaemonContext). Declared here (unconditionally
@@ -2200,7 +2031,7 @@ int RunNetPolicyDaemon(int argc, char* argv[]) {
   // open local net ns
   daemon.SetLocalNetNsFd(OpenLocalNetNs());
   /*get iptables version*/
-  daemon.SetIptablesVersion(GetIptablesVersion());
+  daemon.SetIptablesVersion(net_iptables::get_iptables_version());
   /*print debug log*/
   LOG_I("choose iptables version : %d", daemon.IptablesVersion());
   // epoll fd

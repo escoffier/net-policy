@@ -27,6 +27,7 @@
 #include "net/utility.h"
 #include "waf/plugin.h"
 #include "net_policy_engine_cxxbridge/lib.h"
+#include "net_iptables_cxxbridge/lib.h"
 #include "admin/profile.h"
 #include "utils.h"
 
@@ -48,8 +49,6 @@ inline constexpr int              kNfMatchRule    = 6;
 typedef struct nf_conntrack NF_CONNTRACK;
 /*epoll call function*/
 using RcvCbFunc = int32_t(*)(int32_t epoll_fd, int32_t fd, void* ptr);
-/*清除iptables配置*/
-extern void ClearIptabelsRule(int ipt_ver);
 extern int SetNs(int pid, char *basePath);
 /*daemon entrypoint; defined in net-policy.cpp, called from main.cpp*/
 extern int RunNetPolicyDaemon(int argc, char* argv[]);
