@@ -585,7 +585,13 @@ static int input_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct 
   if (data_len < (int)sizeof(struct iphdr))
     return nfq_set_verdict(qh, id, NF_ACCEPT, 0, NULL);
 
-  auto result = daemon->ConnMgr().receive(reinterpret_cast<const uint8_t*>(pkg), data_len);
+  // WafEnabled() is passed as `track_tcp`: the five-tuple parse below is
+  // unconditional (L3-L4 policy matching needs it on every packet), but the
+  // Rust engine's TCB tracking stays behind the same WAF gate it was behind
+  // before this phase -- FlowEngine has no reaper, so tracking with the WAF
+  // off would leak TCB entries in the default deployment.
+  auto result = daemon->ConnMgr().receive(reinterpret_cast<const uint8_t*>(pkg), data_len,
+                                          daemon->WafEnabled());
   if (!result.tuple.recognized) {
     // Replaces parse_package's failure path (`ret != kNfMatchRule` -> NF_ACCEPT).
     // The old code issued that verdict WITHOUT returning; the switch below then
@@ -610,12 +616,24 @@ static int input_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct 
   // one extra fact the new parse exposes to make this possible without a
   // second full parse pass.
   //
-  // This memcpy is safe against truncated packets in a way parse_package's old
-  // direct `(struct tcphdr*)(pkg + iph->ihl * 4)` cast was not: parse_five_tuple
-  // only reports recognized==true for TCP after confirming the buffer holds a
-  // full IP header plus a full TCP header (and the equivalent 8-byte check for
-  // UDP), whereas parse_package dereferenced tcph/udph with no bounds check
-  // beyond the caller's initial sizeof(struct iphdr) guard.
+  // This memcpy is bounds-safe in a way parse_package's old direct
+  // `(struct tcphdr*)(pkg + iph->ihl * 4)` cast was not: parse_five_tuple only
+  // reports recognized==true for TCP after confirming the buffer holds a full
+  // IP header plus a full TCP header (and the equivalent 8-byte check for UDP),
+  // whereas parse_package dereferenced tcph/udph with no bounds check beyond
+  // the caller's initial sizeof(struct iphdr) guard.
+  //
+  // That is a genuine memory-safety improvement, but it is NOT purely a
+  // strengthening: it also changes behavior for malformed/truncated packets.
+  // parse_package would read out of bounds and carry on with garbage ports,
+  // still reaching MatchMicroPolicyRule -- which could NF_DROP the packet.
+  // parse_five_tuple reports recognized==false for those same packets, so the
+  // early return above short-circuits to NF_ACCEPT before any policy check
+  // runs. A runt that a DENY-by-CIDR rule previously dropped (accidentally,
+  // off garbage data) is now accepted -- a fail-open change confined to the
+  // malformed-packet case. Practical reachability is low (NFQ is configured
+  // for full packet copies and conntrack defragments upstream). Behavior on
+  // well-formed traffic is unchanged.
   offset = static_cast<int>(result.tuple.ip_header_len);
   if (tuple.proto_ == IPPROTO_TCP) {
     memcpy(&tcphdr, pkg + result.tuple.ip_header_len, sizeof(tcphdr));
@@ -806,7 +824,13 @@ static int output_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct
   if (data_len < (int)sizeof(struct iphdr))
     return nfq_set_verdict(qh, id, NF_ACCEPT, 0, NULL);
 
-  auto result = daemon->ConnMgr().receive(reinterpret_cast<const uint8_t*>(pkg), data_len);
+  // WafEnabled() is passed as `track_tcp`: the five-tuple parse below is
+  // unconditional (L3-L4 policy matching needs it on every packet), but the
+  // Rust engine's TCB tracking stays behind the same WAF gate it was behind
+  // before this phase -- FlowEngine has no reaper, so tracking with the WAF
+  // off would leak TCB entries in the default deployment.
+  auto result = daemon->ConnMgr().receive(reinterpret_cast<const uint8_t*>(pkg), data_len,
+                                          daemon->WafEnabled());
   if (!result.tuple.recognized) {
     // See input_nfq_cb for the rationale behind returning here rather than
     // replicating parse_package's old fall-through-without-return quirk.
@@ -824,7 +848,9 @@ static int output_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct
   // Reconstruct offset/tcphdr for the downstream microseg TCP-tracking block --
   // see input_nfq_cb's identical block for the full rationale (mirrors
   // parse_package's arithmetic; bounds-checked by parse_five_tuple in a way the
-  // old direct pointer casts were not).
+  // old direct pointer casts were not, at the cost of failing open on
+  // malformed/truncated packets that previously reached policy matching via
+  // out-of-bounds reads).
   offset = static_cast<int>(result.tuple.ip_header_len);
   if (tuple.proto_ == IPPROTO_TCP) {
     memcpy(&tcphdr, pkg + result.tuple.ip_header_len, sizeof(tcphdr));

@@ -192,7 +192,7 @@ TEST(ConnectionManagerCutoverTest, HandleDataPassesTcpHeaderStartNotIpHeaderStar
   net::ConnectionManager mgr(factory);
 
   auto syn = DataPacket(/*syn=*/true, "");
-  auto syn_result = mgr.receive(syn.data(), syn.size());
+  auto syn_result = mgr.receive(syn.data(), syn.size(), /*track_tcp=*/true);
   ASSERT_TRUE(syn_result.is_tcp);
   ASSERT_EQ(mgr.DispatchWaf(syn_result.decision, syn.data(), syn.size()), net::NetStatus::OK);
 
@@ -207,7 +207,7 @@ TEST(ConnectionManagerCutoverTest, HandleDataPassesTcpHeaderStartNotIpHeaderStar
   // ip_header_len/setTCPSegment fix this test exists to check. Both
   // setTCPSegment and onData (below) run unconditionally before that
   // HTTP-parse-dependent branch, so they're unaffected either way.
-  auto data_result = mgr.receive(data_pkt.data(), data_pkt.size());
+  auto data_result = mgr.receive(data_pkt.data(), data_pkt.size(), /*track_tcp=*/true);
   ASSERT_TRUE(data_result.is_tcp);
   mgr.DispatchWaf(data_result.decision, data_pkt.data(), data_pkt.size());
 
@@ -250,7 +250,7 @@ TEST(ConnectionManagerCutoverTest, HandleClosedInvokesOnCloseAndRemovesBothConne
   net::ConnectionManager mgr(factory);
 
   auto syn = SynPacket();
-  auto syn_result = mgr.receive(syn.data(), syn.size());
+  auto syn_result = mgr.receive(syn.data(), syn.size(), /*track_tcp=*/true);
   ASSERT_TRUE(syn_result.is_tcp);
   ASSERT_EQ(mgr.DispatchWaf(syn_result.decision, syn.data(), syn.size()), net::NetStatus::OK);
   // Both the server-side (1234->80) and the auto-created peer (80->1234)
@@ -260,7 +260,7 @@ TEST(ConnectionManagerCutoverTest, HandleClosedInvokesOnCloseAndRemovesBothConne
   EXPECT_FALSE(captured_filter->close_called_);
 
   auto fin = FinPacket();
-  auto fin_result = mgr.receive(fin.data(), fin.size());
+  auto fin_result = mgr.receive(fin.data(), fin.size(), /*track_tcp=*/true);
   ASSERT_TRUE(fin_result.is_tcp);
   ASSERT_EQ(mgr.DispatchWaf(fin_result.decision, fin.data(), fin.size()), net::NetStatus::OK);
 
