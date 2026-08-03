@@ -27,25 +27,26 @@
 
 **Files:**
 - Delete: `net/filter.h`, `net/filter.cc`, `net/udp.h`, `net/udp.cc`
-- Modify: `CMakeLists.txt` (remove `net/filter.cc` and `net/udp.cc` from every `SOURCES` list that has them; remove any `#include "net/filter.h"`/`#include "udp.h"` left dangling)
-- Modify: any file that `#include`s the deleted headers (confirm via Step 1 below; as of this writing this is `net/ip.h` for `udp.h`'s sibling `ip_protocol.h` — NOT `udp.h` itself, verify)
+- Modify: `CMakeLists.txt` (remove `net/filter.cc` and `net/udp.cc` from every `SOURCES` list that has them)
+- Modify: `net/utility.h`, `net/tcp.cc` — both `#include "net/filter.h"` directly (confirmed by `grep -rln '#include "net/filter\.h"'`) without using anything `net/filter.h` declares (`NetworkFilterManager`/`NetworkFilterBase`/`addFilter` — Step 1's grep below finds zero real users of these). Deleting `net/filter.h` without removing these two include lines leaves a dangling include: `net/tcp.cc` isn't deleted until Task 7, so it would break the build for the entire span between this task and Task 7 if left in place.
 
 **Interfaces:** None — this task has no Rust component and produces nothing later tasks depend on. It's independent and goes first only to shrink the surface the rest of the phase has to reason about.
 
-- [ ] **Step 1: Confirm both are genuinely dead**
+- [ ] **Step 1: Confirm both are genuinely dead, and find every dangling include**
 
 ```bash
 grep -rn '\bNetworkFilterManager\b\|\bNetworkFilterBase\b\|\baddFilter\b' --include='*.h' --include='*.hh' --include='*.cc' --include='*.cpp' /Users/robbieqiu/workspace/net-policy | grep -v 'net/filter\.\|http/filter\.\|http/codec\.\|http/connection\.\|http/http1/codec\.\|http/http2/codec\.'
 grep -rn '\bnet::Udp\b\|"net/udp\.h"\|"udp\.h"' --include='*.h' --include='*.hh' --include='*.cc' --include='*.cpp' /Users/robbieqiu/workspace/net-policy | grep -v 'net/udp\.'
+grep -rln '#include "net/filter\.h"' --include='*.h' --include='*.hh' --include='*.cc' --include='*.cpp' /Users/robbieqiu/workspace/net-policy | grep -v 'net/filter\.'
 ```
-Expected: both commands produce zero output (all hits are inside the files being deleted, or are the unrelated `http::HttpFilterManager`/`ConnectionImpl::addFilter` family, which this task does not touch). If either command finds a real external reference, stop and re-scope — don't delete something a caller this plan didn't account for depends on.
+Expected: the first two commands produce zero output (all hits are inside the files being deleted, or are the unrelated `http::HttpFilterManager`/`ConnectionImpl::addFilter` family, which this task does not touch). The third command is expected to print `net/utility.h` and `net/tcp.cc` — both need their `#include "net/filter.h"` line removed in Step 2 (neither uses anything from it). If the first two commands find a real external reference, or the third finds a file other than these two, stop and re-scope.
 
-- [ ] **Step 2: Delete the files and their build-system references**
+- [ ] **Step 2: Delete the files, remove the dangling includes, and their build-system references**
 
 ```bash
 git rm net/filter.h net/filter.cc net/udp.h net/udp.cc
 ```
-Open `CMakeLists.txt`, find every `SOURCES` list containing `net/filter.cc` and/or `net/udp.cc` (there should be entries in `net-rule`'s and `net_rule_grpc_test`'s lists, per Global Constraints' note on `net_rule_test` already excluding the deeper `net/` files — but verify directly, don't assume `net/filter.cc`'s membership matches `net/ip.cc`'s, since `net/filter.cc` is dead code that may have a different footprint than the live `ipv4`/`Tcp` classes), and remove those two lines from each.
+In `net/utility.h` and `net/tcp.cc`, delete the `#include "net/filter.h"` line (confirmed unused by both in Step 1). Open `CMakeLists.txt`, find every `SOURCES` list containing `net/filter.cc` and/or `net/udp.cc` (there should be entries in `net-rule`'s and `net_rule_grpc_test`'s lists, per Global Constraints' note on `net_rule_test` already excluding the deeper `net/` files — but verify directly, don't assume `net/filter.cc`'s membership matches `net/ip.cc`'s, since `net/filter.cc` is dead code that may have a different footprint than the live `ipv4`/`Tcp` classes), and remove those two lines from each.
 
 - [ ] **Step 3: Build and verify**
 
@@ -1021,6 +1022,12 @@ Then read `net/connection_manager.h`'s current content (it should still resemble
 #include "http/connection.h"
 #include "http/http_filter_factory.h"
 #include "http/packet.hh"
+#include "net/stream.h"   // ConnectionInfo -- direct include; after this task
+                           // deletes net/tcp.h (which used to provide it
+                           // transitively) and Task 1 removed net/utility.h's
+                           // now-dangling include of the deleted net/filter.h
+                           // (which also used to chain to it), nothing else
+                           // in net/ pulls this in anymore
 #include "net/utility.h"  // now also declares ConnectionID / ConnectionIDHash
 #include "net_flow_engine_cxxbridge/lib.h"
 
