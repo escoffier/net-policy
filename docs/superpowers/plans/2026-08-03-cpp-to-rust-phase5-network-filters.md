@@ -640,9 +640,9 @@ git commit -m "Port TCP header parsing and TCB flow-tracking state machine to Ru
 
 **Interfaces:**
 - Consumes: `FlowEngine`, `PacketDecision`, `PacketKind`, `ConnectionId` (Task 4).
-- Produces: `net_flow::SharedConnectionId`, `net_flow::PacketDecision` (C++-visible shared structs), `net_flow::FlowEngine` (opaque Rust type), `net_flow::new_flow_engine() -> std::unique_ptr<FlowEngine>`, and its methods — the seam Task 7 wires `ConnectionManager` up to.
+- Produces: `net_flow::SharedConnectionId`, `net_flow::PacketDecision` (C++-visible shared structs), `net_flow::FlowEngine` (opaque Rust type), `net_flow::new_flow_engine() -> rust::Box<FlowEngine>`, and its methods — the seam Task 7 wires `ConnectionManager` up to.
 
-Follow the same opaque-Rust-type pattern Phase 4 established for `RustPolicyEngine` (`Box<T>` returned from Rust maps to `std::unique_ptr<T>` in C++).
+Follow the same opaque-Rust-type pattern Phase 4 established for `RustPolicyEngine`: a `Box<T>` returned from Rust for an opaque *Rust* type maps to `rust::Box<T>` on the C++ side (NOT `std::unique_ptr<T>` — that mapping is for opaque *C++* types owned from Rust, the reverse direction. Phase 4's plan originally got this backwards too and had to be corrected against the actual generated header during implementation — verify against `net_flow_engine_cxxbridge/lib.h`'s actual generated signature for `new_flow_engine`, don't take this description on faith).
 
 - [ ] **Step 1: Replace the bridge module**
 
