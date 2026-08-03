@@ -67,6 +67,11 @@ corrosion_add_cxxbridge(net_policy_events_cxxbridge
   FILES lib.rs
 )
 
+corrosion_add_cxxbridge(net_flow_engine_cxxbridge
+  CRATE net_flow_engine
+  FILES lib.rs
+)
+
 corrosion_add_cxxbridge(net_policy_engine_cxxbridge
   CRATE net_policy_engine
   FILES lib.rs
@@ -76,7 +81,6 @@ add_compile_definitions(GLOG_CUSTOM_PREFIX_SUPPORT)
 
 set(SOURCES
     net/utility.cc
-    net/filter.cc
     http/header.cc
     http/http_filter_factory.cc
     http/codec.cc
@@ -89,9 +93,6 @@ set(SOURCES
     http/http_inspector.cc
     http/connection.cc
     cjson.c
-    net/ip.cc
-    net/tcp.cc
-    net/udp.cc
     http/extension/log.cc
     admin/profile.cc
     main.cpp
@@ -173,7 +174,6 @@ add_executable(net-rule ${SOURCES})
 # add_definitions("-Wall -g")
 add_executable(net_rule_test
     net/utility.cc
-    net/filter.cc
     cjson.c
     http/header.cc
     http/codec.cc
@@ -226,6 +226,10 @@ target_link_libraries(net-rule
   waf_rules_core_cxxbridge
   net_policy_control_cxxbridge
   net_policy_events_cxxbridge
+  net_flow_engine_cxxbridge
+
+# waf_rules_core_cxxbridge, net_policy_control_cxxbridge, net_policy_events_cxxbridge,
+# and net_flow_engine_cxxbridge are separate Rust staticlib crates that all depend
   net_policy_engine_cxxbridge
 )
 # waf_rules_core_cxxbridge, net_policy_control_cxxbridge, net_policy_events_cxxbridge,
@@ -280,10 +284,6 @@ gtest_discover_tests(net_rule_test)
 # alongside net-policy.cpp now that net-policy.cpp no longer defines main() (see main.cpp).
 add_executable(net_rule_grpc_test
     net/utility.cc
-    net/filter.cc
-    net/ip.cc
-    net/tcp.cc
-    net/udp.cc
     cjson.c
     http/header.cc
     http/codec.cc
@@ -308,6 +308,7 @@ add_executable(net_rule_grpc_test
     tests/grpc_rust_control_e2e_test.cc
     tests/grpc_rust_events_e2e_test.cc
     tests/waf_rules_test.cc
+    tests/net_flow_engine_ffi_test.cc
     tests/net_policy_engine_ffi_test.cc
 )
 target_include_directories(net_rule_grpc_test PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/ ${CMAKE_CURRENT_BINARY_DIR}/proto-gen)
@@ -332,6 +333,7 @@ target_link_libraries(net_rule_grpc_test
   waf_rules_core_cxxbridge
   net_policy_control_cxxbridge
   net_policy_events_cxxbridge
+  net_flow_engine_cxxbridge
   net_policy_engine_cxxbridge
   GTest::gtest_main)
 # See the matching comment on net-rule's LINK_FLAGS above.

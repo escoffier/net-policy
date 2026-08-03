@@ -24,7 +24,6 @@
 #include "http/filter.h"
 #include "http/http_filter_factory.h"
 #include "net/connection_manager.h"
-#include "net/ip.h"
 #include "net/utility.h"
 #include "waf/plugin.h"
 #include "net_policy_engine_cxxbridge/lib.h"
