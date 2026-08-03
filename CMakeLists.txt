@@ -304,6 +304,7 @@ add_executable(net_rule_grpc_test
     tests/grpc_rust_events_e2e_test.cc
     tests/waf_rules_test.cc
     tests/net_flow_engine_ffi_test.cc
+    tests/net_flow_engine_differential_test.cc
 )
 target_include_directories(net_rule_grpc_test PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/ ${CMAKE_CURRENT_BINARY_DIR}/proto-gen)
 target_link_libraries(net_rule_grpc_test
