@@ -192,7 +192,9 @@ TEST(ConnectionManagerCutoverTest, HandleDataPassesTcpHeaderStartNotIpHeaderStar
   net::ConnectionManager mgr(factory);
 
   auto syn = DataPacket(/*syn=*/true, "");
-  ASSERT_EQ(mgr.receive(syn.data(), syn.size()), net::NetStatus::OK);
+  auto syn_result = mgr.receive(syn.data(), syn.size());
+  ASSERT_TRUE(syn_result.is_tcp);
+  ASSERT_EQ(mgr.DispatchWaf(syn_result.decision, syn.data(), syn.size()), net::NetStatus::OK);
 
   const std::string payload = "GET /x";
   auto data_pkt = DataPacket(/*syn=*/false, payload);
@@ -205,7 +207,9 @@ TEST(ConnectionManagerCutoverTest, HandleDataPassesTcpHeaderStartNotIpHeaderStar
   // ip_header_len/setTCPSegment fix this test exists to check. Both
   // setTCPSegment and onData (below) run unconditionally before that
   // HTTP-parse-dependent branch, so they're unaffected either way.
-  mgr.receive(data_pkt.data(), data_pkt.size());
+  auto data_result = mgr.receive(data_pkt.data(), data_pkt.size());
+  ASSERT_TRUE(data_result.is_tcp);
+  mgr.DispatchWaf(data_result.decision, data_pkt.data(), data_pkt.size());
 
   // setTCPSegment must see the TCP header first -- source port 1234 (wire
   // bytes 0x04 0xD2) -- NOT the IP header (which would start with 0x45, the
@@ -246,7 +250,9 @@ TEST(ConnectionManagerCutoverTest, HandleClosedInvokesOnCloseAndRemovesBothConne
   net::ConnectionManager mgr(factory);
 
   auto syn = SynPacket();
-  ASSERT_EQ(mgr.receive(syn.data(), syn.size()), net::NetStatus::OK);
+  auto syn_result = mgr.receive(syn.data(), syn.size());
+  ASSERT_TRUE(syn_result.is_tcp);
+  ASSERT_EQ(mgr.DispatchWaf(syn_result.decision, syn.data(), syn.size()), net::NetStatus::OK);
   // Both the server-side (1234->80) and the auto-created peer (80->1234)
   // entries must be present -- this is the check that would catch
   // HandleNewConnection dropping its peer_is_new branch.
@@ -254,7 +260,9 @@ TEST(ConnectionManagerCutoverTest, HandleClosedInvokesOnCloseAndRemovesBothConne
   EXPECT_FALSE(captured_filter->close_called_);
 
   auto fin = FinPacket();
-  ASSERT_EQ(mgr.receive(fin.data(), fin.size()), net::NetStatus::OK);
+  auto fin_result = mgr.receive(fin.data(), fin.size());
+  ASSERT_TRUE(fin_result.is_tcp);
+  ASSERT_EQ(mgr.DispatchWaf(fin_result.decision, fin.data(), fin.size()), net::NetStatus::OK);
 
   EXPECT_TRUE(captured_filter->close_called_);
   // Both entries must be gone -- this is the check that would catch

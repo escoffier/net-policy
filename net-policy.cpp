@@ -511,59 +511,10 @@ static int SetAcceptMark(NFQ_RES_INFO* nfq_res, FiveTuple& tuple, NFC_MSG_TYPE m
   return 0;
 }
 
-/*parse package*/
-static int parse_package(unsigned char* pkg, FiveTuple& tuple, struct tcphdr* tcphdr, int& offset) {
-  uint16_t src_port, dst_port;
-  struct iphdr* iph;
-  struct udphdr* udph;
-  struct tcphdr* tcph;
-  struct in_addr addr;
-  /*init buffer*/
-  char ntopBuf[INET_ADDRSTRLEN];
-  iph = (struct iphdr*)pkg;
-  addr.s_addr = iph->saddr;
-  tuple.src_addr_u32_ = iph->saddr;
-  tuple.src_addr_ = inet_ntop(AF_INET, &addr, ntopBuf, sizeof(ntopBuf));
-  addr.s_addr = iph->daddr;
-  tuple.dst_addr_u32_ = iph->daddr;
-  tuple.dst_addr_ = inet_ntop(AF_INET, &addr, ntopBuf, sizeof(ntopBuf));
-  if (iph->version != 4)
-    return NF_ACCEPT;
-  /*ip header length*/
-  offset = iph->ihl << 2;
-  /*procotol*/
-  switch (iph->protocol) {
-  case IPPROTO_UDP:
-    udph = (struct udphdr*)(pkg + iph->ihl * 4);
-    src_port = udph->source;
-    dst_port = udph->dest;
-    offset += sizeof(struct udphdr);
-    break;
-
-  case IPPROTO_TCP:
-    tcph = (struct tcphdr*)(pkg + iph->ihl * 4);
-    src_port = tcph->source;
-    dst_port = tcph->dest;
-    offset += tcph->doff << 2;
-    memcpy(tcphdr, tcph, sizeof(struct tcphdr));
-    break;
-
-  case IPPROTO_ICMP:
-    src_port = 0;
-    dst_port = 0;
-    break;
-
-  default:
-    return NF_ACCEPT;
-  }
-  /*five tuple*/
-  tuple.proto_    = iph->protocol;
-  tuple.src_port_ = ntohs(src_port);
-  tuple.dst_port_ = ntohs(dst_port);
-  tuple.tot_len_  = ntohs(iph->tot_len);
-  /*return*/
-  return kNfMatchRule;
-}
+// parse_package was deleted here: net_flow_engine's parse_five_tuple (Rust,
+// reached via net::ConnectionManager::receive) is now the single five-tuple
+// parser for both NFQ callbacks. Keeping it as a static would break the
+// -Wall -Werror build as an unused function.
 
 /*reset tcp link*/
 static int rst_tcp_link(unsigned char* pkg) {
@@ -600,7 +551,7 @@ static int rst_tcp_link(unsigned char* pkg) {
 static int input_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct nfq_data* nfa,
                         void* argv) {
   bool found = false;
-  int id = 0, ret, offset;
+  int id = 0, offset;
   uint32_t mark;
   FLOW_DIR dir = FlowDir::kIngress;
   std::string rule_key;
@@ -634,16 +585,53 @@ static int input_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct 
   if (data_len < (int)sizeof(struct iphdr))
     return nfq_set_verdict(qh, id, NF_ACCEPT, 0, NULL);
 
-  ret = parse_package(pkg, tuple, &tcphdr, offset);
-  if (ret != kNfMatchRule)
-    nfq_set_verdict(qh, id, ret, 0, NULL);
+  auto result = daemon->ConnMgr().receive(reinterpret_cast<const uint8_t*>(pkg), data_len);
+  if (!result.tuple.recognized) {
+    // Replaces parse_package's failure path (`ret != kNfMatchRule` -> NF_ACCEPT).
+    // The old code issued that verdict WITHOUT returning; the switch below then
+    // hit its `default:` branch (proto_ stays 0, matching none of TCP/UDP/ICMP)
+    // and issued a second NF_ACCEPT verdict for the same packet id. Returning
+    // here is behaviorally equivalent for every real packet and avoids the
+    // redundant double verdict.
+    return nfq_set_verdict(qh, id, NF_ACCEPT, 0, NULL);
+  }
+  tuple.proto_        = result.tuple.proto;
+  tuple.tot_len_      = result.tuple.tot_len;
+  tuple.src_port_     = result.tuple.src_port;
+  tuple.dst_port_     = result.tuple.dst_port;
+  tuple.src_addr_u32_ = result.tuple.src_addr;
+  tuple.dst_addr_u32_ = result.tuple.dst_addr;
+  tuple.src_addr_     = net::ipv4ToString(result.tuple.src_addr);
+  tuple.dst_addr_     = net::ipv4ToString(result.tuple.dst_addr);
+
+  // Reconstruct offset/tcphdr for the downstream microseg TCP-tracking block,
+  // which is out of scope for this phase and still reads both. Mirrors
+  // parse_package's old arithmetic exactly; result.tuple.ip_header_len is the
+  // one extra fact the new parse exposes to make this possible without a
+  // second full parse pass.
+  //
+  // This memcpy is safe against truncated packets in a way parse_package's old
+  // direct `(struct tcphdr*)(pkg + iph->ihl * 4)` cast was not: parse_five_tuple
+  // only reports recognized==true for TCP after confirming the buffer holds a
+  // full IP header plus a full TCP header (and the equivalent 8-byte check for
+  // UDP), whereas parse_package dereferenced tcph/udph with no bounds check
+  // beyond the caller's initial sizeof(struct iphdr) guard.
+  offset = static_cast<int>(result.tuple.ip_header_len);
+  if (tuple.proto_ == IPPROTO_TCP) {
+    memcpy(&tcphdr, pkg + result.tuple.ip_header_len, sizeof(tcphdr));
+    offset += tcphdr.doff << 2;
+  } else if (tuple.proto_ == IPPROTO_UDP) {
+    offset += sizeof(struct udphdr);
+  }
+  // ICMP: offset stays at ip_header_len, matching parse_package.
   /*print debug log*/
   // LOG_V("input receive %s, mark : %d, seq: %u, tot len : %d, %s:%u -> %s:%u, memory : %p ",
   // GetProtoString(tuple.proto_), mark, ntohl(tcphdr.seq), tuple.tot_len_, tuple.src_addr_.c_str(),
   // tuple.src_port_, tuple.dst_addr_.c_str(), tuple.dst_port_, argv); LOG_D("input receive data: %p",
   // pkg);
-  if (daemon->WafEnabled() && (tuple.proto_ == IPPROTO_TCP)) {
-    auto status = daemon->ConnMgr().receive(reinterpret_cast<const uint8_t*>(pkg), data_len);
+  if (daemon->WafEnabled() && result.is_tcp) {
+    auto status = daemon->ConnMgr().DispatchWaf(result.decision,
+                                                reinterpret_cast<const uint8_t*>(pkg), data_len);
     if (status == net::NetStatus::Drop) {
       return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllowReq), data_len, pkg);
     }
@@ -784,7 +772,7 @@ static int input_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct 
 static int output_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct nfq_data* nfa,
                          void* argv) {
   bool found = false;
-  int id = 0, ret, offset;
+  int id = 0, offset;
   uint32_t mark;
   FLOW_DIR dir = FlowDir::kEgress;
   std::string rule_key;
@@ -818,16 +806,41 @@ static int output_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct
   if (data_len < (int)sizeof(struct iphdr))
     return nfq_set_verdict(qh, id, NF_ACCEPT, 0, NULL);
 
-  ret = parse_package(pkg, tuple, &tcphdr, offset);
-  if (ret != kNfMatchRule)
-    nfq_set_verdict(qh, id, ret, 0, NULL);
+  auto result = daemon->ConnMgr().receive(reinterpret_cast<const uint8_t*>(pkg), data_len);
+  if (!result.tuple.recognized) {
+    // See input_nfq_cb for the rationale behind returning here rather than
+    // replicating parse_package's old fall-through-without-return quirk.
+    return nfq_set_verdict(qh, id, NF_ACCEPT, 0, NULL);
+  }
+  tuple.proto_        = result.tuple.proto;
+  tuple.tot_len_      = result.tuple.tot_len;
+  tuple.src_port_     = result.tuple.src_port;
+  tuple.dst_port_     = result.tuple.dst_port;
+  tuple.src_addr_u32_ = result.tuple.src_addr;
+  tuple.dst_addr_u32_ = result.tuple.dst_addr;
+  tuple.src_addr_     = net::ipv4ToString(result.tuple.src_addr);
+  tuple.dst_addr_     = net::ipv4ToString(result.tuple.dst_addr);
+
+  // Reconstruct offset/tcphdr for the downstream microseg TCP-tracking block --
+  // see input_nfq_cb's identical block for the full rationale (mirrors
+  // parse_package's arithmetic; bounds-checked by parse_five_tuple in a way the
+  // old direct pointer casts were not).
+  offset = static_cast<int>(result.tuple.ip_header_len);
+  if (tuple.proto_ == IPPROTO_TCP) {
+    memcpy(&tcphdr, pkg + result.tuple.ip_header_len, sizeof(tcphdr));
+    offset += tcphdr.doff << 2;
+  } else if (tuple.proto_ == IPPROTO_UDP) {
+    offset += sizeof(struct udphdr);
+  }
+  // ICMP: offset stays at ip_header_len, matching parse_package.
   /*print debug log*/
   // LOG_V("output receive %s, mark : %d, seq: %u, tot len : %d, %s:%u -> %s:%u, memory : %p ",
   // GetProtoString(tuple.proto_), mark, ntohl(tcphdr.seq), tuple.tot_len_, tuple.src_addr_.c_str(),
   // tuple.src_port_, tuple.dst_addr_.c_str(), tuple.dst_port_, argv); LOG_D("input receive data: %p",
   // pkg);
-  if (daemon->WafEnabled() && (tuple.proto_ == IPPROTO_TCP)) {
-    auto status = daemon->ConnMgr().receive(reinterpret_cast<const uint8_t*>(pkg), data_len);
+  if (daemon->WafEnabled() && result.is_tcp) {
+    auto status = daemon->ConnMgr().DispatchWaf(result.decision,
+                                                reinterpret_cast<const uint8_t*>(pkg), data_len);
     if (status == net::NetStatus::Drop) {
       // LOG_D("drop pkt: %p", pkg);
       return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllowRsp), data_len, pkg);

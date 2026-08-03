@@ -1,6 +1,7 @@
 #pragma once
 
 #include <glog/logging.h>
+#include <netinet/in.h>  // IPPROTO_TCP, for receive()'s is_tcp classification
 #include <memory>
 #include <unordered_map>
 #include <utility>
@@ -21,11 +22,44 @@ namespace net {
 
 class ConnectionManager {
 public:
+  // Populated for every recognized protocol (TCP/UDP/ICMP); `decision` is only
+  // meaningful when `is_tcp` is true (net_flow_engine only performs TCB
+  // tracking for TCP -- see net_flow_engine's parse_five_tuple vs on_packet
+  // split).
+  struct ReceiveResult {
+    // Deliberately the raw FFI struct, NOT net-policy.h's FiveTuple:
+    // net-policy.h already includes this header, so including it back here
+    // for FiveTuple would be circular. ConnectionManager only hands back the
+    // raw parsed fields; net-policy.cpp (which includes both headers safely)
+    // constructs the policy-matching FiveTuple from them.
+    net_flow::SharedFiveTuple tuple;
+    net_flow::PacketDecision decision;
+    bool is_tcp;
+  };
+
   explicit ConnectionManager(http::HttpFilterFactory& filter_factory)
       : filter_factory_(filter_factory), engine_(net_flow::new_flow_engine()) {}
 
-  NetStatus receive(const uint8_t* pkg, size_t len) {
-    auto decision = engine_->on_packet(pkg, len);
+  // Parses the packet's five-tuple (all of TCP/UDP/ICMP) and, for TCP only,
+  // additionally advances the Rust engine's TCB state machine. Deliberately
+  // does NOT dispatch to the WAF -- the caller decides whether to, via
+  // DispatchWaf below (net-policy.cpp gates that on WafEnabled()).
+  ReceiveResult receive(const uint8_t* pkg, size_t len) {
+    ReceiveResult result{};
+    result.tuple = net_flow::parse_five_tuple(pkg, len);
+    result.is_tcp = result.tuple.recognized && (result.tuple.proto == IPPROTO_TCP);
+    if (result.is_tcp) {
+      result.decision = engine_->on_packet(pkg, len);
+    }
+    return result;
+  }
+
+  // Unchanged logic from the old internal Handle{NewConnection,Data,Closed}
+  // dispatch -- only the call site moved, from inside receive() to here, an
+  // explicitly-invoked public method. Callers should only call this for TCP
+  // (ReceiveResult::is_tcp); a default-constructed decision (kind 0, Ignore)
+  // is handled as a no-op regardless.
+  NetStatus DispatchWaf(const net_flow::PacketDecision& decision, const uint8_t* pkg, size_t len) {
     switch (decision.kind) {
       case 0:  // Ignore
         return NetStatus::OK;
