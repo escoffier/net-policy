@@ -100,8 +100,9 @@ private:
       return NetStatus::OK;
     }
     auto p = seastar::net::packet::from_static_data(reinterpret_cast<const char*>(pkg), len);
+    p.trim_front(decision.ip_header_len);
     it->second->httpFilterManager()->setTCPSegment(p);
-    p.trim_front(decision.payload_offset);
+    p.trim_front(decision.payload_offset - decision.ip_header_len);
     if (http::FilterStatus::StopIteration == it->second->httpFilterManager()->onData(p)) {
       return NetStatus::OK;
     }

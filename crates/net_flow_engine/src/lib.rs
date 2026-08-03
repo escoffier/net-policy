@@ -15,6 +15,7 @@ mod ffi {
         conn_id: SharedConnectionId,
         peer_conn_id: SharedConnectionId,
         peer_is_new: bool,
+        ip_header_len: u32,
         payload_offset: u32,
     }
 
@@ -69,6 +70,7 @@ impl FlowEngine {
                     conn_id: d.conn_id.into(),
                     peer_conn_id: d.peer_conn_id.into(),
                     peer_is_new: d.peer_is_new,
+                    ip_header_len: d.ip_header_len,
                     payload_offset: d.payload_offset,
                 }
             }
@@ -234,6 +236,9 @@ struct PacketDecision {
     /// reverse-direction flow entry was newly created by this packet too
     /// (only meaningful when kind == NewConnection).
     peer_is_new: bool,
+    /// byte length of the IPv4 header alone (i.e. where the TCP header
+    /// begins in the ORIGINAL buffer); only meaningful when kind == Data.
+    ip_header_len: u32,
     /// byte offset into the ORIGINAL (ip header included) buffer where the
     /// TCP payload begins; only meaningful when kind == Data.
     payload_offset: u32,
@@ -274,6 +279,7 @@ impl FlowEngine {
             local_port: tcp.dest,
             foreign_port: tcp.source,
         };
+        let ip_header_len = ip.header_len as u32;
         let payload_offset = (ip.header_len + tcp.header_len) as u32;
 
         if self.tcbs.contains_key(&id) {
@@ -285,6 +291,7 @@ impl FlowEngine {
                     conn_id: id,
                     peer_conn_id: peer_id,
                     peer_is_new: false,
+                    ip_header_len: 0,
                     payload_offset: 0,
                 });
             }
@@ -293,6 +300,7 @@ impl FlowEngine {
                 conn_id: id,
                 peer_conn_id: peer_id,
                 peer_is_new: false,
+                ip_header_len,
                 payload_offset,
             });
         }
@@ -312,6 +320,7 @@ impl FlowEngine {
                 conn_id: id,
                 peer_conn_id: peer_id,
                 peer_is_new,
+                ip_header_len: 0,
                 payload_offset: 0,
             });
         }
@@ -425,6 +434,7 @@ mod flow_engine_tests {
         let tcp_data = tcp_segment(1234, 80, 1001, false, false, false, b"hello");
         let decision = engine.on_packet_internal(&packet(ip, tcp_data)).expect("should decide");
         assert_eq!(decision.kind, PacketKind::Data);
+        assert_eq!(decision.ip_header_len, 20);
         assert_eq!(decision.payload_offset, 40); // 20-byte IP + 20-byte TCP header
     }
 
