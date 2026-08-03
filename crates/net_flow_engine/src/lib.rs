@@ -221,19 +221,6 @@ impl FlowEngine {
                     payload_offset: 0,
                 });
             }
-            if tcp.syn {
-                let peer_is_new = !self.tcbs.contains_key(&peer_id);
-                if peer_is_new {
-                    self.tcbs.insert(peer_id, FlowState { seq: 0, server_side: false });
-                }
-                return Some(PacketDecision {
-                    kind: PacketKind::NewConnection,
-                    conn_id: id,
-                    peer_conn_id: peer_id,
-                    peer_is_new,
-                    payload_offset: 0,
-                });
-            }
             return Some(PacketDecision {
                 kind: PacketKind::Data,
                 conn_id: id,
@@ -339,18 +326,26 @@ mod flow_engine_tests {
     }
 
     #[test]
-    fn second_syn_on_established_peer_does_not_recreate_peer() {
+    fn syn_on_the_auto_created_peer_placeholder_is_treated_as_data() {
+        // A verified quirk of the real C++ Tcp::receive, replicated bug-for-bug
+        // (not re-derived from first principles): the forward SYN below inserts
+        // a TCB for A->B AND, since no B->A entry exists yet, an auto-created
+        // placeholder TCB for B->A too (so a future response has somewhere to
+        // land) -- keyed by the EXACT ConnectionID a genuine B->A SYN would use.
+        // So a real SYN arriving in the reverse direction finds that placeholder
+        // already present, takes the "known flow" branch (which only checks
+        // FIN/RST, never SYN), and is treated as a Data packet -- NOT a second
+        // NewConnection. This was verified by hand-tracing net/tcp.cc's
+        // ConnectionID field mapping, not assumed.
         let mut engine = FlowEngine::new();
         let ip_fwd = ipv4_header(6, [10, 0, 0, 1], [10, 0, 0, 2]);
         let tcp_fwd = tcp_segment(1234, 80, 1000, true, false, false, &[]);
         engine.on_packet_internal(&packet(ip_fwd, tcp_fwd)).unwrap();
 
-        // A SYN in the reverse direction, on a flow the first SYN already seeded.
         let ip_rev = ipv4_header(6, [10, 0, 0, 2], [10, 0, 0, 1]);
         let tcp_rev = tcp_segment(80, 1234, 2000, true, false, false, &[]);
         let decision = engine.on_packet_internal(&packet(ip_rev, tcp_rev)).expect("should decide");
-        assert_eq!(decision.kind, PacketKind::NewConnection);
-        assert!(!decision.peer_is_new);
+        assert_eq!(decision.kind, PacketKind::Data);
     }
 
     #[test]
