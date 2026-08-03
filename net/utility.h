@@ -1,6 +1,5 @@
 #pragma once
 
-#include "net/filter.h"
 #include <cstdint>
 #include <string>
 

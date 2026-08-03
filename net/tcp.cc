@@ -16,7 +16,6 @@
 #include "http/filter.h"
 #include "http/http_filter_factory.h"
 #include "http/packet.hh"
-#include "net/filter.h"
 #include "net/utility.h"
 #include "tcp.h"
 

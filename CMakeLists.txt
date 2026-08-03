@@ -71,7 +71,6 @@ add_compile_definitions(GLOG_CUSTOM_PREFIX_SUPPORT)
 
 set(SOURCES
     net/utility.cc
-    net/filter.cc
     http/header.cc
     http/http_filter_factory.cc
     http/codec.cc
@@ -86,7 +85,6 @@ set(SOURCES
     cjson.c
     net/ip.cc
     net/tcp.cc
-    net/udp.cc
     http/extension/log.cc
     admin/profile.cc
     main.cpp
@@ -168,7 +166,6 @@ add_executable(net-rule ${SOURCES})
 # add_definitions("-Wall -g")
 add_executable(net_rule_test
     net/utility.cc
-    net/filter.cc
     cjson.c
     http/header.cc
     http/codec.cc
@@ -274,10 +271,8 @@ gtest_discover_tests(net_rule_test)
 # alongside net-policy.cpp now that net-policy.cpp no longer defines main() (see main.cpp).
 add_executable(net_rule_grpc_test
     net/utility.cc
-    net/filter.cc
     net/ip.cc
     net/tcp.cc
-    net/udp.cc
     cjson.c
     http/header.cc
     http/codec.cc
