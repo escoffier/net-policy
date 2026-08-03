@@ -9,6 +9,18 @@ mod ffi {
     }
 
     #[derive(Default)]
+    struct SharedFiveTuple {
+        proto: u8,
+        tot_len: u16,
+        ip_header_len: u32,
+        src_port: u16,
+        dst_port: u16,
+        src_addr: u32,
+        dst_addr: u32,
+        recognized: bool,
+    }
+
+    #[derive(Default)]
     struct PacketDecision {
         /// 0 = Ignore, 1 = NewConnection, 2 = Closed, 3 = Data
         kind: i32,
@@ -36,6 +48,8 @@ mod ffi {
         unsafe fn on_packet(self: &mut FlowEngine, pkg: *const u8, len: usize) -> PacketDecision;
         fn live_connection_count(self: &FlowEngine) -> usize;
         fn connection_strings(self: &FlowEngine) -> Vec<String>;
+
+        unsafe fn parse_five_tuple(pkg: *const u8, len: usize) -> SharedFiveTuple;
     }
 }
 
@@ -57,6 +71,25 @@ impl From<ConnectionId> for ffi::SharedConnectionId {
 
 fn new_flow_engine() -> Box<FlowEngine> {
     Box::new(FlowEngine::new())
+}
+
+/// # Safety
+/// `pkg` must point to at least `len` readable bytes; the caller owns that
+/// buffer for the duration of this call. Mirrors on_packet's existing
+/// safety contract (Phase 5) -- same raw-pointer FFI precedent.
+unsafe fn parse_five_tuple(pkg: *const u8, len: usize) -> ffi::SharedFiveTuple {
+    let bytes = std::slice::from_raw_parts(pkg, len);
+    let result = parse_five_tuple_internal(bytes);
+    ffi::SharedFiveTuple {
+        proto: result.proto,
+        tot_len: result.tot_len,
+        ip_header_len: result.ip_header_len,
+        src_port: result.src_port,
+        dst_port: result.dst_port,
+        src_addr: result.src_addr,
+        dst_addr: result.dst_addr,
+        recognized: result.recognized,
+    }
 }
 
 impl FlowEngine {

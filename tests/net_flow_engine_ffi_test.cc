@@ -52,6 +52,57 @@ TEST(NetFlowEngineFfiTest, ConnectionStringsFormatsBothDirections) {
 
 namespace {
 
+std::vector<uint8_t> UdpPacket() {
+  std::vector<uint8_t> p(28, 0);  // 20-byte IP + 8-byte UDP
+  p[0] = (4 << 4) | 5;
+  p[2] = 0x00; p[3] = 0x1C;  // tot_len = 28
+  p[9] = 17;  // UDP
+  p[12] = 10; p[13] = 0; p[14] = 0; p[15] = 1;
+  p[16] = 10; p[17] = 0; p[18] = 0; p[19] = 2;
+  p[20] = 0x04; p[21] = 0xD2;  // source port 1234
+  p[22] = 0x00; p[23] = 0x50;  // dest port 80
+  return p;
+}
+
+std::vector<uint8_t> IcmpPacket() {
+  std::vector<uint8_t> p(20, 0);
+  p[0] = (4 << 4) | 5;
+  p[9] = 1;  // ICMP
+  p[12] = 10; p[13] = 0; p[14] = 0; p[15] = 1;
+  p[16] = 10; p[17] = 0; p[18] = 0; p[19] = 2;
+  return p;
+}
+
+}  // namespace
+
+TEST(NetFlowEngineFfiTest, ParseFiveTupleRecognizesUdp) {
+  auto pkt = UdpPacket();
+  auto tuple = net_flow::parse_five_tuple(pkt.data(), pkt.size());
+  EXPECT_TRUE(tuple.recognized);
+  EXPECT_EQ(tuple.proto, 17);
+  EXPECT_EQ(tuple.ip_header_len, 20);
+  EXPECT_EQ(tuple.src_port, 1234);
+  EXPECT_EQ(tuple.dst_port, 80);
+}
+
+TEST(NetFlowEngineFfiTest, ParseFiveTupleRecognizesIcmpWithZeroPorts) {
+  auto pkt = IcmpPacket();
+  auto tuple = net_flow::parse_five_tuple(pkt.data(), pkt.size());
+  EXPECT_TRUE(tuple.recognized);
+  EXPECT_EQ(tuple.proto, 1);
+  EXPECT_EQ(tuple.src_port, 0);
+  EXPECT_EQ(tuple.dst_port, 0);
+}
+
+TEST(NetFlowEngineFfiTest, ParseFiveTupleRecognizesTcpToo) {
+  auto pkt = SynPacket();  // existing helper, already defined in this file
+  auto tuple = net_flow::parse_five_tuple(pkt.data(), pkt.size());
+  EXPECT_TRUE(tuple.recognized);
+  EXPECT_EQ(tuple.proto, 6);
+}
+
+namespace {
+
 // Regression test for a bug the reviewer of Task 7 (the ConnectionManager/
 // FlowEngine cutover) caught: HandleData used to call setTCPSegment() on the
 // packet BEFORE trimming off the IP header, so the HTTP filter chain (and
