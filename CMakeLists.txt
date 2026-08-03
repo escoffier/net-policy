@@ -67,6 +67,11 @@ corrosion_add_cxxbridge(net_policy_events_cxxbridge
   FILES lib.rs
 )
 
+corrosion_add_cxxbridge(net_policy_engine_cxxbridge
+  CRATE net_policy_engine
+  FILES lib.rs
+)
+
 add_compile_definitions(GLOG_CUSTOM_PREFIX_SUPPORT)
 
 set(SOURCES
@@ -221,9 +226,10 @@ target_link_libraries(net-rule
   waf_rules_core_cxxbridge
   net_policy_control_cxxbridge
   net_policy_events_cxxbridge
+  net_policy_engine_cxxbridge
 )
-# waf_rules_core_cxxbridge, net_policy_control_cxxbridge, and
-# net_policy_events_cxxbridge are separate Rust staticlib crates that all depend
+# waf_rules_core_cxxbridge, net_policy_control_cxxbridge, net_policy_events_cxxbridge,
+# and net_policy_engine_cxxbridge are separate Rust staticlib crates that all depend
 # on the `cxx` crate; since each staticlib statically embeds its own copy of
 # cxx's internal runtime shim symbols (e.g. cxxbridge1$rust_vec$bool$...),
 # linking multiple such crates into the same binary trips the linker's ODR check
@@ -302,6 +308,7 @@ add_executable(net_rule_grpc_test
     tests/grpc_rust_control_e2e_test.cc
     tests/grpc_rust_events_e2e_test.cc
     tests/waf_rules_test.cc
+    tests/net_policy_engine_ffi_test.cc
 )
 target_include_directories(net_rule_grpc_test PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/ ${CMAKE_CURRENT_BINARY_DIR}/proto-gen)
 target_link_libraries(net_rule_grpc_test
@@ -325,6 +332,7 @@ target_link_libraries(net_rule_grpc_test
   waf_rules_core_cxxbridge
   net_policy_control_cxxbridge
   net_policy_events_cxxbridge
+  net_policy_engine_cxxbridge
   GTest::gtest_main)
 # See the matching comment on net-rule's LINK_FLAGS above.
 set_target_properties(net_rule_grpc_test PROPERTIES LINK_FLAGS "-Wl,--allow-multiple-definition")

@@ -27,7 +27,7 @@
 #include "net/ip.h"
 #include "net/utility.h"
 #include "waf/plugin.h"
-#include "policy/engine.h"
+#include "net_policy_engine_cxxbridge/lib.h"
 #include "admin/profile.h"
 #include "utils.h"
 
@@ -203,13 +203,6 @@ struct RulePort
 };
 using RULE_PORT = RulePort; // legacy alias
 
-/*result of RuleDetail::CreateRuleKey — key string plus extracted CIDR mask*/
-struct RuleKeyResult
-{
-    std::string key;
-    int         mask;
-};
-
 struct HTTP_RULE_INFO
 {
     uint8_t direction_;
@@ -238,7 +231,8 @@ public:
     void ClearNfQueResource(int efd, int ipt_ver);
 };
 
-/*策略详情*/
+/*策略详情 -- plain data holder; matching/key-generation logic now lives in
+ *the Rust policy_engine crate (see PolicyRule below)*/
 class RuleDetail
 {
 public:
@@ -252,102 +246,13 @@ public:
     std::string src_ip_;//源地址
     std::string dst_ip_;//目的地址
     std::vector<RULE_PORT> ports_;//端口信息
-
-public:
-    RuleDetail();
-    ~RuleDetail();
-    RuleDetail(const RuleDetail&) = default;
-    RuleDetail& operator=(const RuleDetail&) = default;
-    /*assign from shared_ptr — named method avoids non-standard operator= signature*/
-    void AssignFrom(const std::shared_ptr<RuleDetail>& other) { *this = *other; }
-    /*添加端口*/
-    void AddPortsCfg(RULE_PORT &);
-    /*清除端口配置*/
-    void ClearPortsCfg();
-    /*生成用于匹配的策略*/
-    RuleKeyResult CreateRuleKey();
-    /*匹配策略详情*/
-    bool MatchRuleDetail(FiveTuple &tuple, FlowDir dir);
-    /*打印策略详情*/
-    void PrintRuleDetail(std::string desc);
 };
 
-/*策略组*/
-class RuleGroup
-{
-public:
-    std::unordered_map<std::string, std::shared_ptr<RuleDetail>> rules_;//key-策略名称
-
-public:
-    RuleGroup();
-    ~RuleGroup();
-    /*增加策略详情信息*/
-    bool AddRuleDetail(RuleDetail, RULE_PORT &);
-    /*删除匹配策略*/
-    void DeleteRule(std::string policyName);
-    /*匹配策略*/
-    std::optional<RuleDetail> MatchRule(FiveTuple &tuple, FlowDir dir);
-    /*获取规则数*/
-    size_t GetRulesSize();
-};
-
-/*链上规则表*/
-class RuleChain
-{
-public:
-    FlowDir dir_;
-    std::unordered_map<std::string, std::shared_ptr<RuleGroup>> chain_;//key-匹配规则
-
-public:
-    RuleChain();
-    ~RuleChain();
-    /*获取规则表数据量*/
-    size_t RuleSize();
-    /*清空规则*/
-    void RuleChainClear();
-    /*set dir*/
-    void SetRuleDir(FlowDir);
-    /*匹配规则*/
-    std::optional<RuleDetail> MatchRuleGroup(std::string &key, FiveTuple &tuple);
-    /*生成匹配规则,并保持到链上*/
-    int AddRuleToChain(std::string key, RuleDetail &policy, RULE_PORT &stPort);
-    /*从链上删除规则*/
-    void DeleteRuleFromChain(std::string pname, std::string ruleKey);
-};
-
-/**/
-class PolicyTree : public RuleChain
-{
-public:
-    /*policy tree*/
-    std::unordered_map<std::string, std::unique_ptr<std::unordered_map<std::string, FlowDir>>> tree_;
-
-public:
-    PolicyTree();
-    ~PolicyTree();
-    /*clear*/
-    int Clear();
-    /*get size*/
-    int GetTreeSize();
-    /*delete policy*/
-    int DeletePolicyFromTree(std::string &name);
-    /*将规则添加到链上*/
-    int AddPolicyToChain(RuleDetail &policy, RULE_PORT &stPort);
-};
-
-/*网络策略详情*/
+/*网络策略详情 -- delegates all matching/mutation to the Rust policy engine*/
 class PolicyRule : public NfQueData
 {
 public:
     int efd_;
-    /*Input上的策略规则*/
-    /*Output上的策略规则*/
-    PolicyTree input_tree_;
-    PolicyTree output_tree_;
-    /*子网掩码*/
-    std::set<int> mask_cidr_;
-    /*优先级*/
-    std::set<int> priority_;
 
 public:
     PolicyRule();
@@ -356,18 +261,19 @@ public:
     int ClearCfg();
     /*删除指定策略*/
     int DeletePolicy(FlowDir dir, std::string name);
-    /*添加优先级和子网掩码*/
-    void AddMaskAndPriority(int priority, int mask);
     /*将规则添加到链上*/
     int AddPolicyToTree(RuleDetail &policy, RULE_PORT &stPort);
-    /*通过五元组生成规则*/
-    std::vector<std::string> CreateRuleKeyByTuple(FiveTuple &tuple, FlowDir dir);
-    /*获取策略map*/
-    PolicyTree *GetPolicyTree(FlowDir dir);
+    /*single-call match, replacing the old GetPolicyTree/CreateRuleKeyByTuple/
+     *MatchRuleGroup three-call sequence -- see
+     *docs/superpowers/specs/2026-08-02-cpp-to-rust-phase4-policy-engine-design.md*/
+    std::optional<RuleDetail> MatchFiveTuple(FiveTuple &tuple, FlowDir dir);
     /*获取所有规则配置*/
     cJSON *GetAllConfig(std::string name, net::ConnectionManager& conn_mgr);
     /*打印日志*/
     void PrintPolicyLog();
+
+private:
+    rust::Box<policy_engine::RustPolicyEngine> engine_;
 };
 
 /*micro-segmentation engine — owns the policy rule set and all companion state*/
@@ -384,9 +290,7 @@ public:
     int  DeleteNfQueRes(int efd, uint64_t pod_id)  { return policy_rule_.DeleteNfQueRes(efd, pod_id); }
 
     /*---- network policy (delegated to PolicyRule) ----*/
-    PolicyTree* GetPolicyTree(FlowDir dir)         { return policy_rule_.GetPolicyTree(dir); }
-    std::vector<std::string> CreateRuleKeyByTuple(FiveTuple& t, FlowDir d)
-                                                   { return policy_rule_.CreateRuleKeyByTuple(t, d); }
+    std::optional<RuleDetail> MatchFiveTuple(FiveTuple& t, FlowDir d) { return policy_rule_.MatchFiveTuple(t, d); }
     int  AddPolicy(RuleDetail& policy, RulePort& port) { return policy_rule_.AddPolicyToTree(policy, port); }
     void DeletePolicy(const std::string& name);    /*erases HTTP rules AND net policy for both directions*/
     int  ClearCfg()                                { return policy_rule_.ClearCfg(); }
