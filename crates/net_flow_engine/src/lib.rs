@@ -15,6 +15,16 @@ mod ffi {
         conn_id: SharedConnectionId,
         peer_conn_id: SharedConnectionId,
         peer_is_new: bool,
+        /// Byte length of the IPv4 header alone -- separate from
+        /// `payload_offset` (IP + TCP header combined). Only meaningful when
+        /// `kind == Data` (kind 3). C++'s HandleData (net/connection_manager.h)
+        /// MUST trim the packet by exactly this amount before calling
+        /// `setTCPSegment`, and by `payload_offset - ip_header_len` after --
+        /// matching `setTCPSegment`'s contract that its input packet already
+        /// starts at the TCP header (see waf/plugin.cc's ModifyNetPackets,
+        /// which casts the stored pointer directly to `struct tcphdr*`).
+        /// Trimming by the combined `payload_offset` before `setTCPSegment`,
+        /// or not trimming at all before it, corrupts live packets.
         ip_header_len: u32,
         payload_offset: u32,
     }
@@ -60,7 +70,6 @@ impl FlowEngine {
             None => ffi::PacketDecision { kind: KIND_IGNORE, ..Default::default() },
             Some(d) => {
                 let kind = match d.kind {
-                    PacketKind::Ignore => KIND_IGNORE,
                     PacketKind::NewConnection => KIND_NEW_CONNECTION,
                     PacketKind::Closed => KIND_CLOSED,
                     PacketKind::Data => KIND_DATA,
@@ -93,9 +102,18 @@ fn parse_ipv4_header(bytes: &[u8]) -> Option<Ipv4Header> {
     }
     let ihl = (bytes[0] & 0x0F) as usize;
     let header_len = ihl * 4;
-    // Deliberate deviation from the current C++ (see Global Constraints):
-    // reject a header claiming more bytes than are actually present, instead
-    // of trusting ihl unconditionally.
+    // Three deliberate deviations from the current C++ (see Global
+    // Constraints), all in the same spirit -- strictly more defensive than
+    // the C++, malformed-packet-only, and with no effect on well-formed
+    // traffic:
+    //   1. `header_len < IPV4_HDR_MIN_LEN` (i.e. ihl < 5): reject an IHL that
+    //      claims a header shorter than the fixed 20-byte minimum, instead of
+    //      trusting ihl unconditionally.
+    //   2. `bytes.len() < header_len`: reject a header claiming more bytes
+    //      than are actually present in the buffer.
+    //   3. parse_tcp_header below applies the analogous bounds check against
+    //      the buffer length it's handed, whereas the old C++ only checked
+    //      the fixed minimum TCP header length, not the claimed doff length.
     if header_len < IPV4_HDR_MIN_LEN || bytes.len() < header_len {
         return None;
     }
@@ -197,6 +215,10 @@ fn parse_tcp_header(bytes: &[u8]) -> Option<TcpHeader> {
     let seq = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
     let doff = (bytes[12] >> 4) as usize;
     let header_len = doff * 4;
+    // `bytes.len() < header_len` is deliberate deviation #3 documented on
+    // parse_ipv4_header above: reject a doff claiming more bytes than the
+    // buffer actually has, instead of only checking against the fixed
+    // TCP_HDR_MIN_LEN as the old C++ did.
     if header_len < TCP_HDR_MIN_LEN || bytes.len() < header_len {
         return None;
     }
@@ -215,6 +237,11 @@ struct ConnectionId {
     foreign_port: u16,
 }
 
+// `seq` and `server_side` are written but never read -- this mirrors the old
+// C++'s Tcb::seq_/server_side_, which are also write-only. A faithful port,
+// not a bug; kept for parity with the C++ TCB and for future use (e.g. if
+// sequence-number tracking is ever needed).
+#[allow(dead_code)]
 struct FlowState {
     seq: u32,
     server_side: bool,
@@ -222,7 +249,6 @@ struct FlowState {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum PacketKind {
-    Ignore,
     NewConnection,
     Closed,
     Data,

@@ -81,7 +81,10 @@ public:
     on_data_bytes_.assign(data.get_header(0, data.len()), data.len());
     return http::FilterStatus::Continue;
   }
-  http::FilterStatus onClose() override { return http::FilterStatus::Continue; }
+  http::FilterStatus onClose() override {
+    close_called_ = true;
+    return http::FilterStatus::Continue;
+  }
   size_t getConnectionID() const override { return 0; }
   void setTCPSegment(char* p, size_t size) override {
     tcp_segment_bytes_.assign(p, size);
@@ -91,6 +94,7 @@ public:
   std::string tcp_segment_bytes_;
   std::string on_data_bytes_;
   http::TCPSegment tcp_segment_{};
+  bool close_called_ = false;
 };
 
 // 20-byte IPv4 header (saddr=10.0.0.1, daddr=10.0.0.2, protocol=TCP) followed
@@ -107,6 +111,21 @@ std::vector<uint8_t> DataPacket(bool syn, const std::string& payload) {
   p[32] = 5 << 4;              // doff=5
   p[33] = syn ? 0x02 : 0x00;   // SYN flag iff requested
   p.insert(p.end(), payload.begin(), payload.end());
+  return p;
+}
+
+// Same 4-tuple as SynPacket()/DataPacket(), FIN flag set instead of SYN --
+// closes an already-established flow.
+std::vector<uint8_t> FinPacket() {
+  std::vector<uint8_t> p(40, 0);
+  p[0] = (4 << 4) | 5;  // version=4, ihl=5
+  p[9] = 6;             // protocol=TCP
+  p[12] = 10; p[13] = 0; p[14] = 0; p[15] = 1;   // saddr
+  p[16] = 10; p[17] = 0; p[18] = 0; p[19] = 2;   // daddr
+  p[20] = 0x04; p[21] = 0xD2;  // source port 1234
+  p[22] = 0x00; p[23] = 0x50;  // dest port 80
+  p[32] = 5 << 4;              // doff=5
+  p[33] = 0x01;                // FIN
   return p;
 }
 
@@ -150,4 +169,44 @@ TEST(ConnectionManagerCutoverTest, HandleDataPassesTcpHeaderStartNotIpHeaderStar
   // onData (after the second trim, past the TCP header too) must see exactly
   // the payload.
   EXPECT_EQ(captured_filter->on_data_bytes_, payload);
+}
+
+// Regression coverage for the connection-close and peer-creation paths in
+// net::ConnectionManager. Task 6's differential test harness used to exercise
+// these paths (FIN/close, peer-connection creation) against the real C++
+// implementation, but was correctly deleted in Task 7 once there was only one
+// implementation left to compare. Nothing replaced that coverage for the new
+// glue in HandleNewConnection/HandleClosed -- this test closes that gap by
+// checking, through the real net::ConnectionManager (not just the Rust
+// engine), that:
+//   1. A SYN creates BOTH the flow's own entry and its peer's entry in the
+//      C++-side connection table (HandleNewConnection's peer_is_new branch).
+//   2. A subsequent FIN invokes onClose() on the (shared) HttpFilterManager.
+//   3. That same FIN removes BOTH the flow's own entry and its peer's entry
+//      from the C++-side connection table (HandleClosed must not erase only
+//      its own ConnectionID).
+TEST(ConnectionManagerCutoverTest, HandleClosedInvokesOnCloseAndRemovesBothConnections) {
+  http::HttpFilterFactory factory;
+  auto captured_filter = std::make_shared<CapturingFilter>();
+  factory.registerFilter([captured_filter](size_t, uint32_t, uint32_t) {
+    return std::static_pointer_cast<http::HttpFilterBase>(captured_filter);
+  });
+
+  net::ConnectionManager mgr(factory);
+
+  auto syn = SynPacket();
+  ASSERT_EQ(mgr.receive(syn.data(), syn.size()), net::NetStatus::OK);
+  // Both the server-side (1234->80) and the auto-created peer (80->1234)
+  // entries must be present -- this is the check that would catch
+  // HandleNewConnection dropping its peer_is_new branch.
+  EXPECT_EQ(mgr.httpConnectionCount(), 2u);
+  EXPECT_FALSE(captured_filter->close_called_);
+
+  auto fin = FinPacket();
+  ASSERT_EQ(mgr.receive(fin.data(), fin.size()), net::NetStatus::OK);
+
+  EXPECT_TRUE(captured_filter->close_called_);
+  // Both entries must be gone -- this is the check that would catch
+  // HandleClosed erasing only its own ConnectionID and leaking its peer's.
+  EXPECT_EQ(mgr.httpConnectionCount(), 0u);
 }

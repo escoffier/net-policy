@@ -51,12 +51,12 @@ Five-Tuple extraction (src/dst IP, src/dst port, protocol)
 | Component | Files | Role |
 |-----------|-------|------|
 | **Policy Manager** | `net-policy.h`, `net-policy.cpp` | Main entrypoint; owns two `PolicyTree`s (InputTree/OutputTree for ingress/egress); manages NFQ resources per pod; drives EPOLL loop |
-| **Rule Matching** | `rule-detail.cpp`, `policy/engine.{h,cc}` | Converts 5-tuple to policy decision; CIDR-aware IP matching; supports DENY/ALLOW/MARK/ALLOW_REQ/ALLOW_RSP actions with priority |
+| **Rule Matching** | `rule-detail.cpp` | Converts 5-tuple to policy decision; CIDR-aware IP matching; supports DENY/ALLOW/MARK/ALLOW_REQ/ALLOW_RSP actions with priority |
 | **HTTP Layer** | `http/http_inspector.{h,cc}`, `http/filter.{h,cc}`, `http/http_filter_factory.{h,cc}` | Protocol detection, header parsing, per-connection HTTP filter chain |
 | **HTTP/1.1 Codec** | `http/http1/codec.{h,cc}`, `http/http1/http_parser.{h,c}` | llhttp-based HTTP/1.1 parsing |
 | **HTTP/2 Codec** | `http/http2/codec.{hh,cc}` | nghttp2-based HTTP/2 parsing |
 | **WAF System** | `waf/plugin.{h,cc}`, `waf/rule.{h,cc}` | PCRE2 regex pattern matching; `PluginRootContext` owns global rules, `PluginContext` is per-connection |
-| **Network Filters** | `net/filter.{h,cc}`, `net/filter_factory.{h,cc}`, `net/ip.{h,cc}`, `net/tcp.{h,cc}`, `net/udp.{h,cc}` | Packet-level filtering at IP/TCP/UDP layers |
+| **Network Filters** | `net/connection_manager.h`, `crates/net_flow_engine/` | IPv4/TCP header parsing and TCP connection (TCB) tracking, implemented in Rust and wired into C++ via a `cxx` FFI bridge |
 | **Connection Tracking** | `net/connection_manager.h` | Tracks active TCP/UDP connections |
 
 ### Core Data Structures (net-policy.h)

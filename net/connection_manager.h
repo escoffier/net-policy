@@ -30,7 +30,7 @@ public:
       case 0:  // Ignore
         return NetStatus::OK;
       case 1:  // NewConnection
-        return HandleNewConnection(decision, pkg, len);
+        return HandleNewConnection(decision);
       case 2:  // Closed
         return HandleClosed(decision);
       case 3:  // Data
@@ -52,12 +52,19 @@ public:
     return conns;
   }
 
+  // Exposes the size of the C++-side connection table (distinct from the Rust
+  // engine's own flow table reported by connections()/stat() above). Used by
+  // tests to verify HandleClosed/HandleNewConnection keep both the flow's own
+  // entry and its peer's entry in sync with the Rust engine's lifecycle
+  // decisions.
+  size_t httpConnectionCount() const { return http_conns_.size(); }
+
 private:
   static ConnectionID ToConnectionID(const net_flow::SharedConnectionId& id) {
     return ConnectionID{id.local_ip, id.foreign_ip, id.local_port, id.foreign_port};
   }
 
-  NetStatus HandleNewConnection(const net_flow::PacketDecision& decision, const uint8_t* pkg, size_t len) {
+  NetStatus HandleNewConnection(const net_flow::PacketDecision& decision) {
     auto id = ToConnectionID(decision.conn_id);
     auto peer_id = ToConnectionID(decision.peer_conn_id);
     auto hashFunc = ConnectionIDHash();
@@ -100,6 +107,15 @@ private:
       return NetStatus::OK;
     }
     auto p = seastar::net::packet::from_static_data(reinterpret_cast<const char*>(pkg), len);
+    // setTCPSegment's contract requires the packet to already start at the TCP
+    // header (see waf/plugin.cc's ModifyNetPackets, which casts the stored
+    // pointer directly to `struct tcphdr*`). This mirrors the old (deleted)
+    // ipv4::receive, which always stripped the IP header before Tcp::receive
+    // (and thus setTCPSegment) ever saw the packet. Trimming by the combined
+    // payload_offset before setTCPSegment -- or not trimming at all before it
+    // -- would feed it IP-header bytes and corrupt a live packet on the
+    // waf/plugin.cc ModifyNetPackets code path. Do NOT collapse this into a
+    // single trim_front(payload_offset) call.
     p.trim_front(decision.ip_header_len);
     it->second->httpFilterManager()->setTCPSegment(p);
     p.trim_front(decision.payload_offset - decision.ip_header_len);
