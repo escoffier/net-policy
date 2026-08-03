@@ -965,6 +965,38 @@ TEST(NetFlowEngineDifferentialTest, DataBeforeSynIsIgnoredByBoth) {
   EXPECT_TRUE(cpp_mgr.connections().empty());
   EXPECT_EQ(rust_engine->live_connection_count(), 0u);
 }
+
+TEST(NetFlowEngineDifferentialTest, ReverseDirectionSynOnPeerPlaceholderMatchesBothSides) {
+  // GenerateFlowLifecycle's flows are structurally incapable of producing
+  // this scenario (sport is always drawn from [1024, 65000), dport is always
+  // 80, and flows run one at a time to completion) -- this dedicated test
+  // exists because that generator alone would give false confidence: it
+  // could report zero discrepancies forever without ever exercising the one
+  // quirk this differential suite exists to guard (see Task 4's SYN/
+  // peer-placeholder fix). A forward SYN auto-creates a placeholder TCB for
+  // the reverse direction, keyed by the exact ConnectionID a genuine reverse
+  // SYN would use -- so a real SYN arriving in that direction must be
+  // treated as a data packet by both implementations, not a second new
+  // connection. Mirrors the Rust unit test
+  // syn_on_the_auto_created_peer_placeholder_is_treated_as_data (Task 4).
+  http::HttpFilterFactory filter_factory;
+  net::ConnectionManager cpp_mgr(filter_factory);
+  auto rust_engine = net_flow::new_flow_engine();
+
+  auto syn_fwd = BuildPacket(6, 0x0100000A, 0x0200000A, 1234, 80, 1000,
+                             /*syn=*/true, /*fin=*/false, /*rst=*/false, {});
+  cpp_mgr.receive(seastar::net::packet::from_static_data(
+      reinterpret_cast<char*>(syn_fwd.data()), syn_fwd.size()));
+  rust_engine->on_packet(syn_fwd.data(), syn_fwd.size());
+  EXPECT_EQ(SortedConnections(cpp_mgr), SortedConnections(*rust_engine));
+
+  auto syn_rev = BuildPacket(6, 0x0200000A, 0x0100000A, 80, 1234, 2000,
+                             /*syn=*/true, /*fin=*/false, /*rst=*/false, {});
+  cpp_mgr.receive(seastar::net::packet::from_static_data(
+      reinterpret_cast<char*>(syn_rev.data()), syn_rev.size()));
+  rust_engine->on_packet(syn_rev.data(), syn_rev.size());
+  EXPECT_EQ(SortedConnections(cpp_mgr), SortedConnections(*rust_engine));
+}
 ```
 Note: `net::ConnectionManager::receive` and `net::ConnectionManager::connections()` are called here at their *current* (pre-cutover) signatures — this test exercises the real, unmodified C++ path as the comparison oracle. Task 7's cutover changes `receive`'s signature; this differential test file is deleted as part of that same task, per the design spec (a comparison test stops making sense once there's only one implementation).
 
