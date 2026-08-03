@@ -269,3 +269,30 @@ TEST(ConnectionManagerCutoverTest, HandleClosedInvokesOnCloseAndRemovesBothConne
   // HandleClosed erasing only its own ConnectionID and leaking its peer's.
   EXPECT_EQ(mgr.httpConnectionCount(), 0u);
 }
+
+// End-to-end coverage for the full input_nfq_cb-shaped call sequence against
+// the real ConnectionManager: a non-TCP (UDP) packet must still come back
+// with a recognized five-tuple (L3-L4 policy matching needs this for every
+// packet, not just TCP), while `decision` stays untouched -- on_packet is
+// only ever invoked for TCP packets (see ReceiveResult::receive's doc
+// comment), so a UDP packet must never reach it, tracking or not.
+TEST(ConnectionManagerCutoverTest, ReceiveReturnsFiveTupleForUdpWithoutWafDispatch) {
+  http::HttpFilterFactory filter_factory;
+  net::ConnectionManager manager(filter_factory);
+
+  std::vector<uint8_t> udp_pkt(28, 0);
+  udp_pkt[0] = (4 << 4) | 5;
+  udp_pkt[9] = 17;  // UDP
+  udp_pkt[12] = 10; udp_pkt[13] = 0; udp_pkt[14] = 0; udp_pkt[15] = 1;
+  udp_pkt[16] = 10; udp_pkt[17] = 0; udp_pkt[18] = 0; udp_pkt[19] = 2;
+  udp_pkt[20] = 0x04; udp_pkt[21] = 0xD2;
+  udp_pkt[22] = 0x00; udp_pkt[23] = 0x50;
+
+  auto result = manager.receive(udp_pkt.data(), udp_pkt.size(), /*track_tcp=*/false);
+  EXPECT_TRUE(result.tuple.recognized);
+  EXPECT_EQ(result.tuple.proto, 17);
+  EXPECT_FALSE(result.is_tcp);
+  // decision.kind should be left default (0/Ignore) -- on_packet was never
+  // called for a non-TCP packet.
+  EXPECT_EQ(result.decision.kind, 0);
+}
