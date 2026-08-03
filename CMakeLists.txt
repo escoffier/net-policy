@@ -88,8 +88,6 @@ set(SOURCES
     http/http_inspector.cc
     http/connection.cc
     cjson.c
-    net/ip.cc
-    net/tcp.cc
     http/extension/log.cc
     admin/profile.cc
     main.cpp
@@ -277,8 +275,6 @@ gtest_discover_tests(net_rule_test)
 # alongside net-policy.cpp now that net-policy.cpp no longer defines main() (see main.cpp).
 add_executable(net_rule_grpc_test
     net/utility.cc
-    net/ip.cc
-    net/tcp.cc
     cjson.c
     http/header.cc
     http/codec.cc
@@ -304,7 +300,6 @@ add_executable(net_rule_grpc_test
     tests/grpc_rust_events_e2e_test.cc
     tests/waf_rules_test.cc
     tests/net_flow_engine_ffi_test.cc
-    tests/net_flow_engine_differential_test.cc
 )
 target_include_directories(net_rule_grpc_test PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/ ${CMAKE_CURRENT_BINARY_DIR}/proto-gen)
 target_link_libraries(net_rule_grpc_test

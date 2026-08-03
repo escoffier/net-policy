@@ -2,7 +2,6 @@
 #include "http/http_filter_factory.h"
 #include "http/packet.hh"
 #include "net/stream.h"
-#include "net/tcp.h"
 #include "net/utility.h"
 #include <algorithm>
 #include <cstddef>

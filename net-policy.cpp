@@ -679,8 +679,7 @@ static int input_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct 
   // tuple.src_port_, tuple.dst_addr_.c_str(), tuple.dst_port_, argv); LOG_D("input receive data: %p",
   // pkg);
   if (daemon->WafEnabled() && (tuple.proto_ == IPPROTO_TCP)) {
-    auto status =
-        daemon->ConnMgr().receive(seastar::net::packet::from_static_data((char*)pkg, data_len));
+    auto status = daemon->ConnMgr().receive(reinterpret_cast<const uint8_t*>(pkg), data_len);
     if (status == net::NetStatus::Drop) {
       return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllowReq), data_len, pkg);
     }
@@ -864,8 +863,7 @@ static int output_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct
   // tuple.src_port_, tuple.dst_addr_.c_str(), tuple.dst_port_, argv); LOG_D("input receive data: %p",
   // pkg);
   if (daemon->WafEnabled() && (tuple.proto_ == IPPROTO_TCP)) {
-    auto status =
-        daemon->ConnMgr().receive(seastar::net::packet::from_static_data((char*)pkg, data_len));
+    auto status = daemon->ConnMgr().receive(reinterpret_cast<const uint8_t*>(pkg), data_len);
     if (status == net::NetStatus::Drop) {
       // LOG_D("drop pkt: %p", pkg);
       return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllowRsp), data_len, pkg);
