@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 #include <arpa/inet.h>
 #include <cstring>
 #include <random>
@@ -42,10 +43,22 @@ struct SyntheticEvent {
   bool syn, fin, rst;
 };
 
+// Generates num_flows independent SYN/data/FIN lifecycles and interleaves
+// them round-robin (flow 0's SYN, flow 1's SYN, ..., flow 0's data, flow 1's
+// data, ...) rather than fully completing each flow before starting the
+// next. This keeps many flows concurrently live in tcbs_/self.tcbs at once,
+// which is closer to real traffic and exercises more of the hash-map
+// bookkeeping than a strictly sequential generate-and-tear-down pattern
+// would. Since sport is always drawn from [1024, 65000) and dport is always
+// 80, no two independently generated flows can ever collide on a reverse
+// 4-tuple here (that scenario is covered explicitly and deterministically by
+// ReverseDirectionSynOnPeerPlaceholderMatchesBothSides below), so
+// interleaving adds concurrency coverage without changing what's under test.
 std::vector<SyntheticEvent> GenerateFlowLifecycle(std::mt19937& rng, int num_flows) {
   std::uniform_int_distribution<int> octet(1, 254);
   std::uniform_int_distribution<int> port_dist(1024, 65000);
-  std::vector<SyntheticEvent> events;
+  std::vector<std::array<SyntheticEvent, 3>> per_flow;
+  per_flow.reserve(num_flows);
   for (int i = 0; i < num_flows; i++) {
     uint32_t saddr = 0, daddr = 0;
     auto* sb = reinterpret_cast<uint8_t*>(&saddr);
@@ -54,9 +67,18 @@ std::vector<SyntheticEvent> GenerateFlowLifecycle(std::mt19937& rng, int num_flo
     db[0] = 10; db[1] = 0; db[2] = 0; db[3] = static_cast<uint8_t>(octet(rng));
     uint16_t sport = static_cast<uint16_t>(port_dist(rng));
     uint16_t dport = 80;
-    events.push_back({saddr, daddr, sport, dport, true, false, false});   // SYN
-    events.push_back({saddr, daddr, sport, dport, false, false, false}); // data
-    events.push_back({saddr, daddr, sport, dport, false, true, false});  // FIN
+    per_flow.push_back({{
+        {saddr, daddr, sport, dport, true, false, false},   // SYN
+        {saddr, daddr, sport, dport, false, false, false},  // data
+        {saddr, daddr, sport, dport, false, true, false},   // FIN
+    }});
+  }
+  std::vector<SyntheticEvent> events;
+  events.reserve(per_flow.size() * 3);
+  for (size_t stage = 0; stage < 3; stage++) {
+    for (auto& flow : per_flow) {
+      events.push_back(flow[stage]);
+    }
   }
   return events;
 }
@@ -139,4 +161,46 @@ TEST(NetFlowEngineDifferentialTest, DataBeforeSynIsIgnoredByBoth) {
 
   EXPECT_TRUE(cpp_mgr.connections().empty());
   EXPECT_EQ(rust_engine->live_connection_count(), 0u);
+}
+
+// Mirrors the Rust unit test
+// syn_on_the_auto_created_peer_placeholder_is_treated_as_data
+// (crates/net_flow_engine/src/lib.rs:396, as of this commit) through the
+// full C++<->Rust differential path, not just in isolation. A verified
+// quirk of the real C++ Tcp::receive (net/tcp.cc): the forward SYN below
+// inserts a TCB for A(1234)->B(80) AND, since no B->A entry exists yet, an
+// auto-created placeholder TCB for B(80)->A(1234) too -- keyed by the EXACT
+// ConnectionID a genuine reverse-direction SYN (source port 80, dest port
+// 1234) would use. So that reverse SYN finds the placeholder already
+// present, takes the "known flow" branch (which only checks FIN/RST, never
+// SYN), and is treated as a Data packet -- NOT a second NewConnection. Both
+// C++ and Rust must agree on this at every step, or a regression of Task
+// 4's fix would silently break Task 7's cutover.
+TEST(NetFlowEngineDifferentialTest, ReverseDirectionSynOnPeerPlaceholderMatchesBothSides) {
+  http::HttpFilterFactory filter_factory;
+  net::ConnectionManager cpp_mgr(filter_factory);
+  auto rust_engine = net_flow::new_flow_engine();
+
+  // Forward SYN: creates a TCB for A->B and an auto-created placeholder for B->A.
+  auto syn_fwd = BuildPacket(6, /*saddr=*/0x0100000A, /*daddr=*/0x0200000A,
+                             /*sport=*/1234, /*dport=*/80, 1000,
+                             /*syn=*/true, /*fin=*/false, /*rst=*/false, {});
+  cpp_mgr.receive(seastar::net::packet::from_static_data(
+      reinterpret_cast<char*>(syn_fwd.data()), syn_fwd.size()));
+  rust_engine->on_packet(syn_fwd.data(), syn_fwd.size());
+  EXPECT_EQ(SortedConnections(cpp_mgr), SortedConnections(*rust_engine));
+  ASSERT_EQ(cpp_mgr.connections().size(), 2u) << "forward SYN should create both directions";
+
+  // Reverse-direction SYN: its own 4-tuple matches the placeholder's key exactly.
+  auto syn_rev = BuildPacket(6, /*saddr=*/0x0200000A, /*daddr=*/0x0100000A,
+                             /*sport=*/80, /*dport=*/1234, 2000,
+                             /*syn=*/true, /*fin=*/false, /*rst=*/false, {});
+  cpp_mgr.receive(seastar::net::packet::from_static_data(
+      reinterpret_cast<char*>(syn_rev.data()), syn_rev.size()));
+  rust_engine->on_packet(syn_rev.data(), syn_rev.size());
+  EXPECT_EQ(SortedConnections(cpp_mgr), SortedConnections(*rust_engine));
+  // The reverse SYN is swallowed as a data packet on the existing placeholder --
+  // it must NOT create a third/fourth TCB on either side.
+  EXPECT_EQ(cpp_mgr.connections().size(), 2u);
+  EXPECT_EQ(rust_engine->live_connection_count(), 2u);
 }
