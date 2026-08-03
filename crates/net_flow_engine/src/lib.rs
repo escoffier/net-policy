@@ -1,12 +1,79 @@
 #[cxx::bridge(namespace = "net_flow")]
 mod ffi {
+    #[derive(Default)]
+    struct SharedConnectionId {
+        local_ip: u32,
+        foreign_ip: u32,
+        local_port: u16,
+        foreign_port: u16,
+    }
+
+    #[derive(Default)]
+    struct PacketDecision {
+        /// 0 = Ignore, 1 = NewConnection, 2 = Closed, 3 = Data
+        kind: i32,
+        conn_id: SharedConnectionId,
+        peer_conn_id: SharedConnectionId,
+        peer_is_new: bool,
+        payload_offset: u32,
+    }
+
     extern "Rust" {
-        fn net_flow_engine_ffi_smoke() -> i32;
+        type FlowEngine;
+
+        fn new_flow_engine() -> Box<FlowEngine>;
+        unsafe fn on_packet(self: &mut FlowEngine, pkg: *const u8, len: usize) -> PacketDecision;
+        fn live_connection_count(self: &FlowEngine) -> usize;
+        fn connection_strings(self: &FlowEngine) -> Vec<String>;
     }
 }
 
-fn net_flow_engine_ffi_smoke() -> i32 {
-    42
+const KIND_IGNORE: i32 = 0;
+const KIND_NEW_CONNECTION: i32 = 1;
+const KIND_CLOSED: i32 = 2;
+const KIND_DATA: i32 = 3;
+
+impl From<ConnectionId> for ffi::SharedConnectionId {
+    fn from(id: ConnectionId) -> Self {
+        ffi::SharedConnectionId {
+            local_ip: id.local_ip,
+            foreign_ip: id.foreign_ip,
+            local_port: id.local_port,
+            foreign_port: id.foreign_port,
+        }
+    }
+}
+
+fn new_flow_engine() -> Box<FlowEngine> {
+    Box::new(FlowEngine::new())
+}
+
+impl FlowEngine {
+    /// # Safety
+    /// `pkg` must point to at least `len` readable bytes; the caller (the
+    /// still-C++ NFQ callback in net-policy.cpp) owns that buffer for the
+    /// duration of this call and does not mutate it concurrently.
+    unsafe fn on_packet(&mut self, pkg: *const u8, len: usize) -> ffi::PacketDecision {
+        let bytes = std::slice::from_raw_parts(pkg, len);
+        match self.on_packet_internal(bytes) {
+            None => ffi::PacketDecision { kind: KIND_IGNORE, ..Default::default() },
+            Some(d) => {
+                let kind = match d.kind {
+                    PacketKind::Ignore => KIND_IGNORE,
+                    PacketKind::NewConnection => KIND_NEW_CONNECTION,
+                    PacketKind::Closed => KIND_CLOSED,
+                    PacketKind::Data => KIND_DATA,
+                };
+                ffi::PacketDecision {
+                    kind,
+                    conn_id: d.conn_id.into(),
+                    peer_conn_id: d.peer_conn_id.into(),
+                    peer_is_new: d.peer_is_new,
+                    payload_offset: d.payload_offset,
+                }
+            }
+        }
+    }
 }
 
 const IPV4_HDR_MIN_LEN: usize = 20;
