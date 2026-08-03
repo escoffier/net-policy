@@ -232,9 +232,6 @@ target_link_libraries(net-rule
   net_policy_control_cxxbridge
   net_policy_events_cxxbridge
   net_flow_engine_cxxbridge
-
-# waf_rules_core_cxxbridge, net_policy_control_cxxbridge, net_policy_events_cxxbridge,
-# and net_flow_engine_cxxbridge are separate Rust staticlib crates that all depend
   net_policy_engine_cxxbridge
   net_iptables_cxxbridge
 )

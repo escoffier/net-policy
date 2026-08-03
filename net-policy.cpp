@@ -43,7 +43,6 @@ using std::vector;
 using std::make_pair;
 
 std::atomic<int> g_log_level{0};
-const char* PREFIX = "#%% pre";
 
 struct u32_mask {
   uint32_t value;
