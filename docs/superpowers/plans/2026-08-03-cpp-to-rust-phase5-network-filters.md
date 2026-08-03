@@ -14,6 +14,7 @@
 
 - `seastar::net::packet` (`http/packet.hh`/`.cc`) is never bridged to Rust and never appears in `net_flow_engine`'s FFI surface — Rust's `on_packet` takes a raw `(*const u8, usize)` pointer/length instead. C++ constructs a `seastar::net::packet` (via `seastar::net::packet::from_static_data`) only at the one remaining point that still needs it: handing payload bytes to the unchanged HTTP filter chain when `PacketDecision::kind == Data`.
 - `http::HttpFilterManager`, `http::Connection`, `http::HttpFilterFactory`, and everything under `http/`/`waf/` are OUT OF SCOPE — do not modify them beyond what's explicitly listed in a task's Files section. `ConnectionManager`'s new `ConnectionID → shared_ptr<http::Connection>` map calls the exact same HTTP-layer constructors/methods `Tcp::receive` calls today, in the same order, with the same arguments.
+- **`setTCPSegment`'s input packet MUST already start at the TCP header, never the IP header.** Confirmed by reading `http/filter.cc`'s `setTCPSegment` (stores the packet's raw data pointer) and `waf/plugin.cc`'s `ModifyNetPackets` (casts that pointer directly to `struct tcphdr*`, then writes a computed checksum into it) — this is a real code path reachable from production traffic (any WAF rule with `ACTION_DROP` and empty content-length), and feeding it a pointer that's actually still at the IP header corrupts a live packet in place before it's forwarded via `nfq_set_verdict2`. The old `ipv4::receive` always stripped the IP header (`packet.trim_front(ipHeaderLen)`) before `Tcp::receive` — and thus `setTCPSegment` — ever saw the packet. `PacketDecision` therefore carries `ip_header_len` (the IP-header-only length) *separately* from `payload_offset` (the combined IP+TCP header length) specifically so C++ can trim by `ip_header_len` *before* calling `setTCPSegment`, then by `payload_offset - ip_header_len` afterward — trimming by `payload_offset` alone before `setTCPSegment`, or not trimming at all before it, are both wrong. This was originally missed when this plan was written and caught by Task 7's task-reviewer, verified independently against the real C++ source before being folded back into Tasks 4/5/7's code below.
 - NFQ/netlink (`net-policy.cpp`'s main loop, epoll wiring, `admin/profile.cc`) is OUT OF SCOPE beyond the two `ConnMgr().receive(...)` call sites this plan's Task 7 updates.
 - `ConnectionID`'s address fields (`local_ip_`/`foreign_ip_`, and this crate's Rust equivalents `local_ip`/`foreign_ip`) are raw network-byte-order 32-bit values, exactly as `struct iphdr::saddr`/`daddr` are in C — never byte-swapped, only ever compared/hashed as opaque bits or formatted back to dotted-decimal. Read them in Rust via `u32::from_ne_bytes` (reinterpreting the 4 raw header bytes as a native `u32`, the same thing a C struct-member read does on a given build) — NOT `from_be_bytes` — and format them back via `.to_ne_bytes()` in `ipv4_to_string`, so the two operations round-trip consistently on whatever single platform builds and runs the binary. Port numbers (`local_port_`/`foreign_port_`) ARE host-byte-order (mirroring the C++ code's `ntohs(...)` calls) — read those via `u16::from_be_bytes`.
 - TCP flag/data-offset bits are read directly from the wire-format byte layout (RFC 793: byte 12 = data-offset in the high nibble + reserved bits in the low nibble; byte 13 = `CWR ECE URG ACK PSH RST SYN FIN`, FIN as the low bit), NOT by replicating `struct tcphdr`'s C bitfield layout — the RFC wire-format reading is portable and unambiguous, where a bitfield-layout port would depend on compiler-specific packing assumptions. Task 4's differential test is what actually confirms this produces identical flow-tracking behavior to the real C++ code's `tcp_hdr->doff`/`->fin`/`->syn`/`->rst` bitfield reads on this project's actual build platform — verify empirically, don't just trust the RFC reasoning in isolation.
@@ -362,6 +363,16 @@ struct PacketDecision {
     /// (only meaningful when kind == NewConnection).
     peer_is_new: bool,
     /// byte offset into the ORIGINAL (ip header included) buffer where the
+    /// IP header ends and the TCP header begins; only meaningful when kind
+    /// == Data. NOTE, added after a Critical review finding on Task 7: this
+    /// field must exist and be populated -- without it, C++'s HandleData
+    /// has no way to trim the IP header off before calling setTCPSegment,
+    /// and setTCPSegment's contract (verified against the deleted
+    /// Tcp::receive, which always saw the IP header already stripped by
+    /// ipv4::receive's trim_front) requires exactly that. See Global
+    /// Constraints.
+    ip_header_len: u32,
+    /// byte offset into the ORIGINAL (ip header included) buffer where the
     /// TCP payload begins; only meaningful when kind == Data.
     payload_offset: u32,
 }
@@ -405,6 +416,7 @@ impl FlowEngine {
             local_port: tcp.dest,
             foreign_port: tcp.source,
         };
+        let ip_header_len = ip.header_len as u32;
         let payload_offset = (ip.header_len + tcp.header_len) as u32;
 
         if self.tcbs.contains_key(&id) {
@@ -416,6 +428,7 @@ impl FlowEngine {
                     conn_id: id,
                     peer_conn_id: peer_id,
                     peer_is_new: false,
+                    ip_header_len: 0,
                     payload_offset: 0,
                 });
             }
@@ -424,6 +437,7 @@ impl FlowEngine {
                 conn_id: id,
                 peer_conn_id: peer_id,
                 peer_is_new: false,
+                ip_header_len,
                 payload_offset,
             });
         }
@@ -443,6 +457,7 @@ impl FlowEngine {
                 conn_id: id,
                 peer_conn_id: peer_id,
                 peer_is_new,
+                ip_header_len: 0,
                 payload_offset: 0,
             });
         }
@@ -560,6 +575,7 @@ mod flow_engine_tests {
         let tcp_data = tcp_segment(1234, 80, 1001, false, false, false, b"hello");
         let decision = engine.on_packet_internal(&packet(ip, tcp_data)).expect("should decide");
         assert_eq!(decision.kind, PacketKind::Data);
+        assert_eq!(decision.ip_header_len, 20);
         assert_eq!(decision.payload_offset, 40); // 20-byte IP + 20-byte TCP header
     }
 
@@ -665,6 +681,14 @@ mod ffi {
         conn_id: SharedConnectionId,
         peer_conn_id: SharedConnectionId,
         peer_is_new: bool,
+        /// only meaningful when kind == Data -- byte offset into the
+        /// original buffer where the TCP header begins (IP header length).
+        /// C++'s HandleData (Task 7) must trim by this amount BEFORE calling
+        /// setTCPSegment, matching setTCPSegment's contract that its input
+        /// packet already starts at the TCP header (the old ipv4::receive
+        /// always stripped the IP header before Tcp::receive ever saw the
+        /// packet) -- then trim by (payload_offset - ip_header_len) after.
+        ip_header_len: u32,
         payload_offset: u32,
     }
 
@@ -723,6 +747,7 @@ impl FlowEngine {
                     conn_id: d.conn_id.into(),
                     peer_conn_id: d.peer_conn_id.into(),
                     peer_is_new: d.peer_is_new,
+                    ip_header_len: d.ip_header_len,
                     payload_offset: d.payload_offset,
                 }
             }
@@ -1146,8 +1171,15 @@ private:
       return NetStatus::OK;
     }
     auto p = seastar::net::packet::from_static_data(reinterpret_cast<const char*>(pkg), len);
+    // setTCPSegment's contract (see waf/plugin.cc's ModifyNetPackets, which
+    // casts its base pointer directly to struct tcphdr*) requires the
+    // packet to already start at the TCP header -- exactly what the old
+    // ipv4::receive's trim_front(ipHeaderLen) guaranteed before Tcp::receive
+    // ever saw it. Trim the IP header off FIRST, before setTCPSegment, not
+    // after.
+    p.trim_front(decision.ip_header_len);
     it->second->httpFilterManager()->setTCPSegment(p);
-    p.trim_front(decision.payload_offset);
+    p.trim_front(decision.payload_offset - decision.ip_header_len);
     if (http::FilterStatus::StopIteration == it->second->httpFilterManager()->onData(p)) {
       return NetStatus::OK;
     }
