@@ -296,3 +296,46 @@ TEST(ConnectionManagerCutoverTest, ReceiveReturnsFiveTupleForUdpWithoutWafDispat
   // called for a non-TCP packet.
   EXPECT_EQ(result.decision.kind, 0);
 }
+
+// Regression coverage for receive()'s `track_tcp` gate, on the only input for
+// which that flag is actually the deciding factor: a TCP packet. (The UDP test
+// above cannot cover this -- for UDP, `is_tcp` is already false, so the
+// `&& track_tcp` conjunct in `if (result.is_tcp && track_tcp)` never decides
+// anything and dropping it would not fail that test.)
+//
+// The gate exists because net_flow_engine's FlowEngine has no timeout/reaper:
+// entries leave the TCB table only on a FIN/RST for an already-tracked flow.
+// net-policy.cpp passes daemon->WafEnabled() here, and waf_enable_ defaults to
+// false, so tracking TCP unconditionally would grow that table without bound in
+// the default deployment. Asserting on stat().tcp_conn_ (the Rust engine's live
+// TCB count) is what makes this test observe that actual resource-leak
+// scenario, rather than just restating the flag it was passed.
+TEST(ConnectionManagerCutoverTest, TcpPacketWithTrackingOffDoesNotEnterTcbTable) {
+  http::HttpFilterFactory filter_factory;
+  net::ConnectionManager manager(filter_factory);
+
+  auto syn = SynPacket();
+  auto result = manager.receive(syn.data(), syn.size(), /*track_tcp=*/false);
+
+  // The five-tuple parse and the is_tcp classification are deliberately NOT
+  // gated on track_tcp -- L3-L4 policy matching and net-policy.cpp's downstream
+  // microsegmentation TCP-tracking block need both on every packet, whatever
+  // the WAF's state.
+  EXPECT_TRUE(result.tuple.recognized);
+  EXPECT_TRUE(result.is_tcp);
+  EXPECT_EQ(result.tuple.proto, 6);
+  // on_packet was never called, so decision stays default-constructed.
+  EXPECT_EQ(result.decision.kind, 0);
+  // ...and, the point of the gate: no TCB entry was created.
+  EXPECT_EQ(manager.stat().tcp_conn_, 0u);
+
+  // Positive control on the same manager and the same packet: with tracking on,
+  // this SYN does create TCB state (the flow plus its peer -- see
+  // NetFlowEngineFfiTest.SynPacketCreatesNewConnection). Without this, the
+  // assertions above would also pass for a SYN that simply could not be
+  // tracked at all.
+  auto tracked = manager.receive(syn.data(), syn.size(), /*track_tcp=*/true);
+  EXPECT_TRUE(tracked.is_tcp);
+  EXPECT_EQ(tracked.decision.kind, 1);  // NewConnection
+  EXPECT_EQ(manager.stat().tcp_conn_, 2u);
+}
