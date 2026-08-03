@@ -32,7 +32,6 @@
 
 inline constexpr std::string_view kBasePath      = "/host";
 inline constexpr std::string_view kNetPolicyAddr = "127.0.0.1";
-inline constexpr uint16_t         kNetPolicyPort  = 9999;
 inline constexpr uint16_t         kPostNetPort    = 8888;
 inline constexpr int              kNfMatchRule    = 6;
 
@@ -54,27 +53,6 @@ extern void ClearIptabelsRule(int ipt_ver);
 extern int SetNs(int pid, char *basePath);
 /*daemon entrypoint; defined in net-policy.cpp, called from main.cpp*/
 extern int RunNetPolicyDaemon(int argc, char* argv[]);
-
-enum class NetDataType : int
-{
-    kPodPid      = 1,  // pod up
-    kPodDie      = 2,  // delete pod
-    kAddRule     = 3,  // add rule
-    kDelRule     = 4,  // delete rule
-    kRspAck      = 5,  // response
-    kPostNet     = 6,  // deny post
-    kAddWafRule  = 7,  // add waf rule
-    kDelWafRule  = 8,  // delete waf rule
-    kHeapDump    = 9,
-    kConfDump    = 10,
-    kConnDump    = 11,
-    kReset       = 12,
-    kNodeCfg     = 13,
-    kLogLevel    = 14,
-    kMax
-};
-// legacy alias
-using NET_DATA_TYPE = NetDataType;
 
 enum class NetPolicyRule : uint32_t
 {
@@ -190,7 +168,6 @@ struct NetCtrlInfo
     uint64_t pod_id_;
     std::string policy_key_;
     std::string uuid_;
-    NetDataType msg_type_; // 数据类型
 };
 using NET_CTRL_INFO = NetCtrlInfo; // legacy alias
 
@@ -320,19 +297,6 @@ private:
     std::unordered_map<std::string, std::vector<HTTP_RULE_INFO>>      output_http_policy_;
 };
 
-/*control-channel server — owns the connected client fd and registers it with epoll*/
-class CtrlServer
-{
-public:
-    ~CtrlServer() { if (client_fd_ > 0) close(client_fd_); }
-    /*accept a new client; closes any previously connected fd, registers new fd with epoll*/
-    int Accept(int epoll_fd, int client_fd, DaemonContext* daemon);
-
-private:
-    int client_fd_ = 0;
-    RcvEpollCb epoll_cb_;
-};
-
 /*post-notification server — owns the client fd and sends match/WAF events*/
 class PostServer
 {
@@ -368,7 +332,6 @@ public:
     MicroSegEngine&                     Microseg()   { return microseg_; }
     net::ConnectionManager&             ConnMgr()    { return connection_manager_; }
     PostServer&                         PostSrv()    { return post_server_; }
-    CtrlServer&                         CtrlSrv()    { return ctrl_server_; }
     http::extension::PluginRootContext& WafRoot()    { return waf_root_; }
     http::HttpFilterFactory&            HttpFilters(){ return http_filter_factory_; }
 
@@ -393,7 +356,6 @@ private:
     http::HttpFilterFactory              http_filter_factory_;      // must precede connection_manager_
     net::ConnectionManager               connection_manager_;
     MicroSegEngine                       microseg_;
-    CtrlServer                           ctrl_server_;
     PostServer                           post_server_;
     http::extension::PluginRootContext   waf_root_;
 

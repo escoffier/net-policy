@@ -327,33 +327,6 @@ int MicroSegEngine::AddHttpPolicy(FlowDir dir, const std::string& key, HTTP_RULE
   return 0;
 }
 
-/*forward declaration — defined later in this file*/
-int ParseRcvData(int32_t epoll_fd, int32_t fd, void* ptr);
-
-/*CtrlServer implementation*/
-int CtrlServer::Accept(int epoll_fd, int client_fd, DaemonContext* daemon) {
-  struct epoll_event ev;
-  if (client_fd_ > 0) {
-    if (client_fd != client_fd_)
-      close(client_fd_);
-    LOG_W("close old globe fd, old fd : %d, new fd : %d.", client_fd_, client_fd);
-  }
-  LOG_I("accept new unix socket link, fd : %d, log level : %d", client_fd, g_log_level.load());
-  client_fd_ = client_fd;
-  fcntl(client_fd, F_SETFL, fcntl(client_fd, F_GETFL) | O_NONBLOCK);
-  epoll_cb_.fd_ = client_fd_;
-  epoll_cb_.epoll_in_func_ = ParseRcvData;
-  epoll_cb_.daemon_ = daemon;
-  ev.data.ptr = &epoll_cb_;
-  ev.events = EPOLLIN;
-  int ret = epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &ev);
-  if (ret < 0) {
-    close(client_fd);
-    LOG_E("add new client to epoll failed, %s.", strerror(errno));
-  }
-  return 0;
-}
-
 /*PostServer implementation*/
 void PostServer::Accept(int client_fd) {
   if (post_link_fd_ > 0) {
@@ -1641,65 +1614,6 @@ err:
   return -1;
 }
 
-int ParseRcvJson(char* buf, NET_CTRL_INFO* ctrl) {
-  cJSON *root = NULL, *item;
-  if (!ctrl || !buf)
-    return -1;
-  // ctrl json
-  root = cJSON_Parse(buf);
-  if (!root)
-    RETURN_ERROR(-2, "parse json failed! original data : %s.", buf);
-  // get data type
-  item = cJSON_GetObjectItem(root, "msg_type");
-  if (!item)
-    GOTO_ERROR(err, "get message type item failed!");
-  ctrl->msg_type_ = static_cast<NET_DATA_TYPE>(item->valueint);
-  // get pid
-  item = cJSON_GetObjectItem(root, "pid");
-  if (item)
-    ctrl->pid_ = item->valueint;
-  // get pod id
-  item = cJSON_GetObjectItem(root, "pod_id");
-  if (item)
-    ctrl->pod_id_ = (uint64_t)item->valuedouble;
-  // get resource key
-  item = cJSON_GetObjectItem(root, "policy_name");
-  if (item)
-    ctrl->policy_key_ = item->valuestring;
-  // get uuid
-  item = cJSON_GetObjectItem(root, "uuid");
-  if (item)
-    ctrl->uuid_ = item->valuestring;
-  // get log level
-  item = cJSON_GetObjectItem(root, "level");
-  if (item)
-    ctrl->level_ = item->valueint;
-  // free resource
-  cJSON_Delete(root);
-  // check data
-  switch (ctrl->msg_type_) {
-  case NetDataType::kPodPid:
-  case NetDataType::kPodDie:
-    if (ctrl->pid_ == 0 || ctrl->pod_id_ == 0)
-      RETURN_ERROR(-1, "need pod pid, message type : %d.", static_cast<int>(ctrl->msg_type_));
-    break;
-  case NetDataType::kAddRule:
-  case NetDataType::kDelRule:
-    if (ctrl->policy_key_.length() == 0)
-      RETURN_ERROR(-1, "need policy name, message type : %d.", static_cast<int>(ctrl->msg_type_));
-    break;
-  default:
-    break;
-  }
-
-  return 0;
-
-err:
-  if (root)
-    cJSON_Delete(root);
-  return -1;
-}
-
 cJSON* dumpConnectons(std::string_view req, net::ConnectionManager& conn_mgr) {
   cJSON* root = cJSON_Parse(req.data());
   auto limitItem = cJSON_GetObjectItem(root, "limit");
@@ -1717,232 +1631,6 @@ cJSON* dumpConnectons(std::string_view req, net::ConnectionManager& conn_mgr) {
 
   cJSON_AddItemToObject(connections, "items", items);
   return connections;
-}
-
-char* ReadData(int epoll_fd, int fd) {
-  int zDataLen = 0, offset = 0;
-  char* pos = nullptr;
-  char* pcBuffer = nullptr;
-  char cDataBuf[1024] = {0};
-  int totalRead, remainingBytes, initialDataLen;
-  /*read data*/
-  int ret = read(fd, cDataBuf, sizeof(cDataBuf));
-  if (ret <= 0) {
-    if ((errno == EAGAIN) || (errno == EINTR))
-      RETURN_WARN(nullptr, "read data failed, fd : %d, %s.", fd, strerror(errno));
-    GOTO_ERROR(err, "read net policy data failed, fd : %d, %s.", fd, strerror(errno));
-  }
-  totalRead = ret;
-  if (ret <= ((int)strlen(PREFIX) + (int)sizeof(int)))
-    RETURN_ERROR(nullptr, "data length error, data len : %d.", ret);
-
-  pos = strstr(cDataBuf, PREFIX);
-  if (pos == nullptr)
-    RETURN_ERROR(nullptr, "can find message header.");
-
-  pos += strlen(PREFIX);
-  zDataLen = *(int*)pos;
-  if (zDataLen <= 0)
-    RETURN_ERROR(nullptr, "message length error, message len : %d.", zDataLen);
-  /*print debug log*/
-  LOG_D("message data length : %d", zDataLen);
-
-  zDataLen += 1;
-  pcBuffer = (char*)malloc(zDataLen);
-  if (pcBuffer == nullptr)
-    RETURN_WARN(nullptr, "malloc memory failed, fd : %d, %s.", fd, strerror(errno));
-  memset(pcBuffer, 0, zDataLen);
-  pos += sizeof(int);
-
-  offset = pos - cDataBuf;
-  // Copy initial data
-  initialDataLen = totalRead - offset;
-  if (initialDataLen > 0)
-    memcpy(pcBuffer, pos, initialDataLen);
-
-  // Read remaining data if necessary
-  remainingBytes = zDataLen - 1 - initialDataLen; // -1 to exclude null terminator
-  while (remainingBytes > 0) {
-    ret = read(fd, pcBuffer + totalRead - offset, remainingBytes);
-    if (ret <= 0) {
-      if ((errno == EAGAIN) || (errno == EINTR))
-        continue;
-      GOTO_ERROR(err, "read remaining data failed, fd : %d, %s.", fd, strerror(errno));
-    }
-    remainingBytes -= ret;
-    totalRead += ret;
-  }
-
-  return pcBuffer;
-
-err:
-  if (pcBuffer)
-    free(pcBuffer);
-  epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, nullptr);
-  close(fd);
-  return nullptr;
-}
-
-int ParseRcvData(int32_t epoll_fd, int32_t fd, void* ptr) {
-  bool found;
-  int ret = 400, length, offset = 0;
-  char* result = nullptr;
-  admin::Status status;
-  char* data_buf = nullptr;
-  cJSON* respBody = nullptr;
-  char buf[11] = {"#%% pre"};
-  NET_CTRL_INFO ctrl = {};
-  if ((fd <= 0) || (!ptr))
-    RETURN_ERROR(-2, "[net] parse failed by argumnet is error!");
-  RcvEpollCb* cb = (RcvEpollCb*)ptr;
-  DaemonContext* daemon = cb->daemon_;
-  /*read data*/
-  data_buf = ReadData(epoll_fd, fd);
-  if (data_buf == nullptr)
-    RETURN_ERROR(0, "read data faile.");
-  /*print debug log*/
-  LOG_V("receive msg, time : %s, data : %s", TimeToString().c_str(), data_buf);
-  /*parse json*/
-  ret = ParseRcvJson(data_buf, &ctrl);
-  if (ret < 0)
-    GOTO_ERROR(rsp, "[net] parse receive json failed!");
-  /*condition*/
-  switch (ctrl.msg_type_) {
-  case NetDataType::kPodPid:
-    // set ns
-    ret = SetNs(ctrl.pid_, const_cast<char*>(kBasePath.data()));
-    if (ret < 0)
-      GOTO_ERROR(rsp, "setns to %d failed.", ctrl.pid_);
-    // init nfqueue
-    ret = InitNfqueue(epoll_fd, ctrl, *daemon);
-    /*print error info*/
-    if (ret != 0)
-      GOTO_ERROR(rsp, "init %d nfqueue failed, ret : %d.", ctrl.pid_, ret);
-    // write iptables rule
-    WriteIptableRule(1, 1, daemon->IptablesVersion(), daemon->WafEnabled());
-    /*goto*/
-    goto rsp;
-
-  case NetDataType::kPodDie:
-    ret = daemon->Microseg().DeleteNfQueRes(epoll_fd, ctrl.pod_id_);
-    goto rsp;
-
-  case NetDataType::kAddRule:
-    ret = ParseNetPolicy(data_buf, *daemon);
-    /*print rule size*/
-    daemon->Microseg().PrintPolicyLog();
-    goto rsp;
-
-  case NetDataType::kDelRule:
-    ret = DeletePolicy(ctrl.policy_key_, *daemon);
-    goto rsp;
-
-  case NetDataType::kAddWafRule:
-    found = daemon->WafRoot().ParseConfiguration(data_buf);
-    ret = (found == true) ? 0 : 1;
-    goto rsp;
-
-  case NetDataType::kDelWafRule:
-    // delete waf config
-    found = daemon->WafRoot().RemoveWafRule(data_buf);
-    ret = (found == true) ? 0 : 1;
-    goto rsp;
-
-  case NetDataType::kHeapDump:
-    status = admin::Heap::handleHeapProfile(std::string_view{data_buf, strlen(data_buf)});
-    ret = (status == admin::Status::OK) ? 0 : 1;
-    goto rsp;
-
-  case NetDataType::kConfDump:
-    respBody = daemon->Microseg().GetAllConfig(ctrl.policy_key_, daemon->ConnMgr());
-    goto rsp;
-
-  case NetDataType::kConnDump:
-    respBody = dumpConnectons(std::string_view{data_buf, strlen(data_buf)}, daemon->ConnMgr());
-    goto rsp;
-
-  case NetDataType::kReset:
-    ret = daemon->Microseg().ClearCfg();
-    ;
-    goto rsp;
-
-  case NetDataType::kNodeCfg:
-    ret = ParseNodeCfg(data_buf, *daemon);
-    goto rsp;
-
-  case NetDataType::kLogLevel:
-    g_log_level = ctrl.level_;
-    LOG_I("set log level : %d", g_log_level.load());
-    goto rsp;
-
-  default:
-    LOG_E("data type is error, datatype : %d.", static_cast<int>(ctrl.msg_type_));
-    break;
-  }
-
-rsp:
-  /*释放内存*/
-  if (data_buf != nullptr)
-    free(data_buf);
-  /*切换network namespace*/
-  SetLocalNetNs(daemon->LocalNetNsFd());
-  /*response data*/
-  cJSON* response = cJSON_CreateObject();
-  if (response == nullptr) {
-    if (respBody)
-      cJSON_Delete(respBody);
-    RETURN_ERROR(0, "Create json object failed, error msg : %s", strerror(errno));
-  }
-
-  cJSON_AddNumberToObject(response, "status", ret);
-  cJSON_AddNumberToObject(response, "msg_type", static_cast<int>(NetDataType::kRspAck));
-  cJSON_AddStringToObject(response, "uuid", ctrl.uuid_.c_str());
-  if (respBody != nullptr)
-    cJSON_AddItemToObject(response, "body", respBody);
-  /*format reponse data*/
-  if (ctrl.msg_type_ == NetDataType::kConfDump) {
-    result = cJSON_Print(response);
-    /*data len*/
-    length = (int)strlen(result);
-    /*print response data*/
-    LOG_V("rsp dump msg, time : %s, all data length : %d.", TimeToString().c_str(), length);
-    /*send data*/
-    buf[7] = length & 0xff;
-    buf[8] = (length >> 8) & 0xff;
-    buf[9] = (length >> 16) & 0xff;
-    buf[10] = (length >> 24) & 0xff;
-    /*send message header*/
-    auto n = write(fd, buf, 11);
-    LOG_V("write message header %ld bytes", n);
-  } else {
-    result = cJSON_PrintUnformatted(response);
-    /*print response data*/
-    LOG_V("rsp msg, time : %s, data : %s.", TimeToString().c_str(), result);
-  }
-  // send response data
-  length = strlen(result);
-  do {
-    ret = write(fd, result + offset, length);
-    /*print debug log*/
-    if (ctrl.msg_type_ == NetDataType::kConfDump)
-      LOG_D("send rsp msg, time : %s, ret: %d, data len %d, offset : %d.", TimeToString().c_str(),
-            ret, length, offset);
-    if (ret < 0)
-      LOG_E("write data err : %s", strerror(errno));
-    if ((ret <= 0) || (ret == length))
-      break;
-    /*repeat write data*/
-    length -= ret;
-    offset += ret;
-  } while (1);
-
-  /*free json memory*/
-  cJSON_Delete(response);
-  /*free memory*/
-  if (result != nullptr)
-    free(result);
-  /*return*/
-  return 0;
 }
 
 /*Rust-facing dispatch functions -- see grpc/control_dispatch.h. The Rust
@@ -2368,18 +2056,6 @@ int32_t DispatchGrpcRustQueueEvent(int32_t epoll_fd, int32_t fd, void* ptr) {
 
 } // namespace grpc_bridge
 
-int ProcAcceptEvent(int32_t epoll_fd, int32_t fd, void* ptr) {
-  int zClientFd;
-  socklen_t cliAddrLen;
-  struct sockaddr_in address;
-  RcvEpollCb* cb = (RcvEpollCb*)ptr;
-  cliAddrLen = sizeof(struct sockaddr_in);
-  zClientFd = accept(fd, (struct sockaddr*)&address, &cliAddrLen);
-  if (zClientFd <= 0)
-    RETURN_ERROR(0, "accept a new client failed, %s.", strerror(errno));
-  return cb->daemon_->CtrlSrv().Accept(epoll_fd, zClientFd, cb->daemon_);
-}
-
 int ProcAcceptPostLinkEvent(int32_t epoll_fd, int32_t fd, void* ptr) {
   int zClientFd;
   socklen_t cliAddrLen;
@@ -2508,10 +2184,9 @@ int RunNetPolicyDaemon(int argc, char* argv[]) {
 
   char* log_level_env = NULL;
   struct epoll_event ev, events[20];
-  int zListenFd = 0, epfd = 0, zLinkFd;
-  int ret, nfds, i, opt = 1;
-  struct sockaddr_in address;
-  RCV_EPOLL_CB unixEvent, postEvent, rustDispatchWakeEvent, *pstCbEv;
+  int epfd = 0, zLinkFd;
+  int ret, nfds, i;
+  RCV_EPOLL_CB postEvent, rustDispatchWakeEvent, *pstCbEv;
   // print start log
   LOG_I("policy process start......");
   /*get log level env*/
@@ -2536,28 +2211,6 @@ int RunNetPolicyDaemon(int argc, char* argv[]) {
   ret = CreatePostServer(epfd, &postEvent, &daemon);
   if (ret != 0)
     GOTO_ERROR(err, "create post server failed.");
-  // create socket
-  zListenFd = socket(AF_INET, SOCK_STREAM, 0);
-  if (zListenFd <= 0)
-    GOTO_ERROR(err, "create unix socket failed! %s.", strerror(errno));
-  // noblock
-  fcntl(zListenFd, F_SETFL, fcntl(zListenFd, F_GETFL) | O_NONBLOCK);
-  // socket address
-  ret = setsockopt(zListenFd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof(opt));
-  if (ret != 0)
-    GOTO_ERROR(err, "set socket opt failed, %s", strerror(errno));
-  // 设置服务器地址和端口
-  address.sin_family = AF_INET;
-  address.sin_port = htons(kNetPolicyPort);
-  address.sin_addr.s_addr = inet_addr(kNetPolicyAddr.data());
-  // bind socket address
-  ret = bind(zListenFd, (struct sockaddr*)&address, sizeof(address));
-  if (ret < 0)
-    GOTO_ERROR(err, "bind server unix socket failed, %s!", strerror(errno));
-  // listen sockfd
-  ret = listen(zListenFd, 10);
-  if (ret < 0)
-    GOTO_ERROR(err, "listen the client connect request! err : %s.", strerror(errno));
   //
   daemon.Microseg().SetEfd(epfd);
 
@@ -2577,17 +2230,6 @@ int RunNetPolicyDaemon(int argc, char* argv[]) {
   ret = epoll_ctl(epfd, EPOLL_CTL_ADD, rust_dispatch_wake_fd, &ev);
   if (ret < 0)
     GOTO_ERROR(err, "epoll ctl failed for rust control dispatch wake fd, %s.", strerror(errno));
-
-  //
-  unixEvent.fd_ = zListenFd;
-  unixEvent.epoll_in_func_ = ProcAcceptEvent;
-  unixEvent.daemon_ = &daemon;
-  // register epoll event
-  ev.data.ptr = &unixEvent;
-  ev.events = EPOLLIN;
-  ret = epoll_ctl(epfd, EPOLL_CTL_ADD, zListenFd, &ev);
-  if (ret < 0)
-    GOTO_ERROR(err, "epoll ctl failed, %s.", strerror(errno));
 
   // --- Rust EventService (production event stream, port 50052) ---
   // Started before start_control_server below: it has no DaemonContext/epoll_fd
@@ -2627,8 +2269,6 @@ int RunNetPolicyDaemon(int argc, char* argv[]) {
   }
 
 err:
-  if (zListenFd > 0)
-    close(zListenFd);
   if (epfd > 0)
     close(epfd);
   return -1;
