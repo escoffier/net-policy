@@ -28,41 +28,11 @@
 #include <sys/un.h>
 #include <unistd.h>
 #include <gflags/gflags.h>
+#include "common/utf8_check.h"
 #include "net-policy.h"
 
 using std::make_pair;
 using std::string;
-
-/*parse CIDR string "a.b.c.d/n" → {network_ip, mask}; bare IPs default to /32*/
-static std::pair<std::string, int> ParseCidr(const std::string& cidr) {
-  struct in_addr addr;
-  uint32_t uzIpaddr, uzMask;
-  std::string sip = cidr;
-  int mask = 32;
-  auto index = cidr.find('/');
-  if (index != std::string::npos) {
-    sip  = cidr.substr(0, index);
-    mask = std::stoi(cidr.substr(index + 1));
-  }
-  uzIpaddr = ntohl(inet_addr(sip.c_str()));
-  uzMask   = ~0u << (32 - mask);
-  uzIpaddr &= uzMask;
-  addr.s_addr = htonl(uzIpaddr);
-  char buf[INET_ADDRSTRLEN];
-  return { inet_ntop(AF_INET, &addr, buf, sizeof(buf)), mask };
-}
-
-std::string Ipv4CidrToIp(std::string ip, int mask) {
-  struct in_addr addr;
-  uint32_t uzIpaddr, uzMask;
-  uzIpaddr = ntohl(inet_addr(ip.c_str()));
-  uzMask = ~0u << (32 - mask);
-  /*count network address*/
-  uzIpaddr &= uzMask;
-  addr.s_addr = htonl(uzIpaddr);
-  char buf[INET_ADDRSTRLEN];
-  return inet_ntop(AF_INET, &addr, buf, sizeof(buf));
-}
 
 FiveTuple::FiveTuple() { this->InitTuple(); }
 FiveTuple::~FiveTuple() {}
@@ -176,397 +146,88 @@ void NFQ_RES_INFO::FreeResource(int efd) {
   LOG_I("free nfqueue resource, pid : %d", this->pid_);
 }
 
-RuleDetail::RuleDetail() {}
-RuleDetail::~RuleDetail() {}
-
-/*添加端口*/
-void RuleDetail::AddPortsCfg(RULE_PORT& port) { this->ports_.push_back(port); }
-/*清除端口配置*/
-void RuleDetail::ClearPortsCfg() { this->ports_.clear(); }
-/*生成用于匹配的策略*/
-RuleKeyResult RuleDetail::CreateRuleKey() {
-  char buff[128] = {0};
-  switch (this->direction_) {
-  case FlowDir::kIngress: {
-    auto [ip, mask] = ParseCidr(this->src_ip_);
-    snprintf(buff, sizeof(buff), "%d-%d-%s/%d-%s",
-             this->priority_, this->proto_, ip.c_str(), mask, this->dst_ip_.c_str());
-    return { buff, mask };
-  }
-  default: {
-    auto [ip, mask] = ParseCidr(this->dst_ip_);
-    snprintf(buff, sizeof(buff), "%d-%d-%s-%s/%d",
-             this->priority_, this->proto_, this->src_ip_.c_str(), ip.c_str(), mask);
-    return { buff, mask };
-  }
-  }
-}
-
-/*匹配策略详情*/
-bool RuleDetail::MatchRuleDetail(FiveTuple &tuple, FlowDir dir)
-{
-    int p = 0;
-    bool bIsMatch = false;
-    uint8_t protocol = tuple.proto_;
-    /*处理ICMP协议*/
-    if(protocol == IPPROTO_ICMP) protocol = this->proto_;
-    /*匹配协议*/
-    if(!((this->proto_ == 0) || (protocol == this->proto_))) return false;
-    /*匹配ICMP协议*/
-    if((this->ports_.size() == 0) || (tuple.proto_ == IPPROTO_ICMP)) bIsMatch = true;
-    /*匹配端口*/
-    for(p = 0; p < (int)this->ports_.size(); p++)
-    {
-        if(this->ports_.at(p).end_port_ == 0)
-        {
-            bIsMatch = true;
-            break;
-        }
-        /*check port rang*/
-        if(tuple.dst_port_ > this->ports_.at(p).end_port_) continue;
-        /*check min port*/
-        if(tuple.dst_port_ < this->ports_.at(p).port_) continue;
-        /*set match true*/
-        bIsMatch = true;
-        break;
-    }
-    /*判断是否匹配成功*/
-    if(!bIsMatch) return false;
-    /*过滤DNS*/
-    if((tuple.src_port_ == 53) || (tuple.dst_port_ == 53)) return true;
-    /*print debug log*/
-    LOG_D("flow dir %s, match name : %s, dir : %d, action : %d, priority : %d, proto : %d, ip : %s <--> %s port : %d ~ %d",
-        (dir == FlowDir::kIngress) ? "ingress" : "egress", this->policy_key_.c_str(), static_cast<int>(this->direction_), static_cast<int>(this->action_), this->priority_,
-        this->proto_, this->src_ip_.c_str(), this->dst_ip_.c_str(), this->ports_.at(p).port_, this->ports_.at(p).end_port_);
-    /*return*/
-    return true;
-}
-
-/*打印策略详情*/
-void RuleDetail::PrintRuleDetail(std::string desc)
-{
-    char buf[128];
-    std::string ports = "";
-    /*log level*/
-    if(g_log_level < 2) return;
-    /*format port*/
-    for(int i = 0; i < (int)this->ports_.size(); i++)
-    {
-        memset(buf, 0, sizeof(buf));
-        sprintf(buf, "%d ~ %d", this->ports_.at(i).port_, this->ports_.at(i).end_port_);
-        ports += buf;
-        if((i + 1) < (int)this->ports_.size()) ports += ",";
-    }
-    LOG_V("%s detail -> proto : %d, priority : %d, dir : %d, action : %d, name : %s, addr : %s -> %s, ports : %s",
-        desc.c_str(), this->proto_, this->priority_, static_cast<int>(this->direction_), static_cast<int>(this->action_), this->policy_key_.c_str(), this->src_ip_.c_str(), this->dst_ip_.c_str(), ports.c_str());
-}
-
-RuleGroup::RuleGroup() { this->rules_.clear(); }
-RuleGroup::~RuleGroup() {}
-
-/*增加策略详情信息*/
-bool RuleGroup::AddRuleDetail(RuleDetail rule, RULE_PORT& stPort) {
-  /*clear ports*/
-  rule.ClearPortsCfg();
-  /*查询策略是否已经存在*/
-  auto it = this->rules_.find(rule.policy_key_);
-  if (it == this->rules_.end()) {
-    /*print debug log*/
-    LOG_D("create policy name : %s, action : %d, mutil port : %d ~ %d.", rule.policy_key_.c_str(),
-          rule.action_, stPort.port_, stPort.end_port_);
-    /*save policy port*/
-    rule.AddPortsCfg(stPort);
-    /*make shared*/
-    auto detail = std::make_shared<RuleDetail>(rule);
-    /*新增数据*/
-    this->rules_[rule.policy_key_] = detail;
-    /*return*/
-    return true;
-  }
-  /*value*/
-  auto detail = it->second;
-  /*add port config*/
-  detail->AddPortsCfg(stPort);
-  /*print debug log*/
-  LOG_D("add policy name : %s, dir : %d, action : %d, mutil port : %d ~ %d, port num : %d",
-        rule.policy_key_.c_str(), rule.direction_, rule.action_, stPort.port_, stPort.end_port_,
-        (int)detail->ports_.size());
-  /*print debug log*/
-  detail->PrintRuleDetail("add");
-  /*return*/
-  return true;
-}
-
-/*删除匹配策略*/
-void RuleGroup::DeleteRule(std::string policyName) {
-  auto it = this->rules_.find(policyName);
-  if (it == this->rules_.end())
-    return;
-  /*删除策略*/
-  auto detail = it->second;
-  /*打印需要删除的策略详情*/
-  detail->PrintRuleDetail("delete");
-  /*删除该策略*/
-  this->rules_.erase(it);
-}
-
-/*匹配策略*/
-std::optional<RuleDetail> RuleGroup::MatchRule(FiveTuple &tuple, FlowDir dir)
-{
-    for (auto& [key, rule_ptr] : this->rules_) {
-        if (rule_ptr->MatchRuleDetail(tuple, dir))
-            return *rule_ptr;
-    }
-    return std::nullopt;
-}
-
-/*获取规则数*/
-size_t RuleGroup::GetRulesSize() { return this->rules_.size(); }
-
-RuleChain::RuleChain() { this->chain_.clear(); }
-RuleChain::~RuleChain() {}
-
-/*获取规则表数据量*/
-size_t RuleChain::RuleSize() { return this->chain_.size(); }
-
-/*set dir*/
-void RuleChain::SetRuleDir(FlowDir direction) { this->dir_ = direction; }
-
-/*清空规则*/
-void RuleChain::RuleChainClear() { this->chain_.clear(); }
-
-/*匹配规则*/
-std::optional<RuleDetail> RuleChain::MatchRuleGroup(std::string& key, FiveTuple& tuple) {
-  auto it = this->chain_.find(key);
-  if (it == this->chain_.end())
-    return std::nullopt;
-  tuple.PrintData(key);
-  return it->second->MatchRule(tuple, this->dir_);
-}
-
-/*生成匹配规则,并保持到链上*/
-int RuleChain::AddRuleToChain(std::string key, RuleDetail& policy, RULE_PORT& stPort) {
-  /*check key*/
-  auto it = this->chain_.find(key);
-  if (it == this->chain_.end()) {
-    auto rg = std::make_shared<RuleGroup>();
-    if (rg == nullptr)
-      RETURN_ERROR(2, "new memory failed by rule group.");
-    /*print debug log*/
-    LOG_D("create group to chain, policy name : %s, rule key : %s", policy.policy_key_.c_str(),
-          key.c_str());
-    /*add rule*/
-    auto ok = rg->AddRuleDetail(policy, stPort);
-    if (!ok)
-      RETURN_ERROR(5, "add policy detail failed.");
-    /*add rule group*/
-    this->chain_[key] = rg;
-  } else {
-    auto rg = it->second;
-    if (rg == nullptr)
-      RETURN_ERROR(8, "rule group is null, key : %s", key.c_str());
-    /*add rule*/
-    auto ok = rg->AddRuleDetail(policy, stPort);
-    if (!ok)
-      RETURN_ERROR(5, "update policy detail failed.");
-    /*print debug log*/
-    LOG_D("add group to chain, policy name : %s, rule key : %s, group size : %d",
-          policy.policy_key_.c_str(), key.c_str(), (int)rg->GetRulesSize());
-  }
-  /*return*/
-  return 0;
-}
-
-/*从链上删除规则*/
-void RuleChain::DeleteRuleFromChain(std::string pname, std::string ruleKey) {
-  auto it = this->chain_.find(ruleKey);
-  if (it == this->chain_.end())
-    return;
-  /*获取规则组*/
-  auto group = it->second;
-  if (group == nullptr)
-    return;
-  /*删除规则*/
-  group->DeleteRule(pname);
-  /*重新将规则添加到链上*/
-  if (group->GetRulesSize() == 0) {
-    /*打印调试日志*/
-    LOG_D("delete group, policy name : %s, rule key : %s, dir : %d", pname.c_str(), ruleKey.c_str(),
-          static_cast<int>(this->dir_));
-    /*从新将规则添加到链上*/
-    this->chain_.erase(it);
-  }
-}
-
-PolicyTree::PolicyTree() { this->Clear(); }
-PolicyTree::~PolicyTree() {}
-
-/*get size*/
-int PolicyTree::GetTreeSize() { return (int)this->tree_.size(); }
-
-/*clear*/
-int PolicyTree::Clear() {
-  this->tree_.clear();  // unique_ptrs handle deletion
-  this->RuleChainClear();
-  return 0;
-}
-
-/*delete policy*/
-int PolicyTree::DeletePolicyFromTree(std::string& name) {
-  /*find*/
-  auto pit = this->tree_.find(name);
-  if (pit == this->tree_.end())
-    RETURN_INFO(0, "can not find this key : [%s], dir : %d", name.c_str(),
-                static_cast<int>(this->dir_));
-  /*take ownership before erasing so we can iterate*/
-  auto rules = std::move(pit->second);
-  this->tree_.erase(pit);
-  /*print debug log*/
-  LOG_D("policy name : %s, rule numbers : %lu, dir : %d.", name.c_str(), rules->size(),
-        static_cast<int>(this->dir_));
-  /*delete rule*/
-  for (auto& [key, dir] : *rules) {
-    LOG_D("delete policy, flow dir : %s, key : %s.",
-          (dir == FlowDir::kIngress) ? "ingress" : "egress", key.c_str());
-    this->DeleteRuleFromChain(name, key);
-  }
-  /*clear all*/
-  if (this->tree_.empty())
-    return this->Clear();
-  /*print debug log*/
-  LOG_D("delete net policy name : %s, dir : %d", name.c_str(), static_cast<int>(this->dir_));
-  /*return*/
-  return 0;
-}
-
-/*将规则添加到链上*/
-int PolicyTree::AddPolicyToChain(RuleDetail& policy, RULE_PORT& stPort) {
-  /*query or create the per-policy key map*/
-  auto it = this->tree_.find(policy.policy_key_);
-  if (it == this->tree_.end()) {
-    auto [ins, ok] = this->tree_.emplace(
-        policy.policy_key_,
-        std::make_unique<std::unordered_map<std::string, FlowDir>>());
-    if (!ok)
-      RETURN_ERROR(3, "insert policy name to map failed when add policy.");
-    it = ins;
-    LOG_D("create new policy : [%s]", policy.policy_key_.c_str());
-  }
-  auto& ruleMap = *it->second;
-  /*create policy rule key — mask extracted by caller via CreateRuleKey()*/
-  auto [key, mask_unused] = policy.CreateRuleKey();
-  /*写入匹配规则*/
-  auto ret = this->AddRuleToChain(key, policy, stPort);
-  if (ret != 0)
-    return ret;
-  /*insert key*/
-  ruleMap.insert(std::make_pair(key, policy.direction_));
-  /*return*/
-  return 0;
-}
-
-PolicyRule::PolicyRule() { this->ClearCfg(); }
+PolicyRule::PolicyRule() : engine_(policy_engine::new_policy_engine()) {}
 PolicyRule::~PolicyRule() {}
 
-/*清除优先级和子网掩码*/
 int PolicyRule::ClearCfg() {
-  this->mask_cidr_.clear();
-  this->priority_.clear();
-  this->mask_cidr_.insert(32);
-  /*init map*/
-  this->input_tree_.Clear();
-  this->output_tree_.Clear();
-  /*set rule direction*/
-  this->input_tree_.SetRuleDir(FlowDir::kIngress);
-  this->output_tree_.SetRuleDir(FlowDir::kEgress);
+  engine_->clear_cfg();
   return 0;
 }
 
-/*通过五元组生成规则*/
-std::vector<std::string> PolicyRule::CreateRuleKeyByTuple(FiveTuple& tuple, FlowDir dir) {
-  std::vector<std::string> value;
-  /*exact capacity: per priority — 2 wildcard keys + 2 CIDR keys per mask*/
-  value.reserve(this->priority_.size() * 2 * (1 + this->mask_cidr_.size()));
-
-  const bool     ingress   = (dir == FlowDir::kIngress);
-  /*the address that gets CIDR-masked depends on direction and is fixed per packet*/
-  const std::string& cidr_addr  = ingress ? tuple.src_addr_ : tuple.dst_addr_;
-  /*the address used verbatim (no masking) in the key*/
-  const std::string& exact_addr = ingress ? tuple.dst_addr_ : tuple.src_addr_;
-  const std::string  proto_str  = std::to_string(tuple.proto_);
-
-  for (const auto priority : this->priority_) {
-    /*cache the two key prefixes — reused for every key in this priority*/
-    const std::string proto_pfx  = std::to_string(priority) + "-" + proto_str   + "-";
-    const std::string proto0_pfx = std::to_string(priority) + "-0-";
-
-    /*wildcard key: any-source (ingress) or any-dest (egress).
-     * does NOT depend on CIDR mask — generate once per priority, not M times.*/
-    const std::string wildcard_suffix = ingress
-        ? "0.0.0.0/32-" + exact_addr
-        :  exact_addr   + "-0.0.0.0/32";
-    value.push_back(proto_pfx  + wildcard_suffix);
-    value.push_back(proto0_pfx + wildcard_suffix);
-
-    /*CIDR-masked keys: one pair (proto-specific + proto=0) per mask*/
-    for (const auto mask : this->mask_cidr_) {
-      const std::string cidr        = Ipv4CidrToIp(cidr_addr, mask) + "/" + std::to_string(mask);
-      const std::string cidr_suffix = ingress
-          ? cidr       + "-" + exact_addr
-          : exact_addr + "-" + cidr;
-      value.push_back(proto_pfx  + cidr_suffix);
-      value.push_back(proto0_pfx + cidr_suffix);
-    }
+std::optional<RuleDetail> PolicyRule::MatchFiveTuple(FiveTuple& tuple, FlowDir dir) {
+  if (!IsValidUtf8(tuple.src_addr_) || !IsValidUtf8(tuple.dst_addr_)) {
+    LOG_W("skipped policy match: invalid UTF-8 in five-tuple address");
+    return std::nullopt;
   }
+  int32_t dir_int = (dir == FlowDir::kIngress) ? 0 : 1;
+  auto result = engine_->match_five_tuple(tuple.proto_, tuple.dst_port_, tuple.src_port_,
+                                            tuple.src_addr_, tuple.dst_addr_, dir_int);
+  if (!result.matched)
+    return std::nullopt;
 
-  LOG_T("create rule key num : %lu, priority size : %lu, mark size : %lu.", value.size(),
-        this->priority_.size(), this->mask_cidr_.size());
-  return value;
+  RuleDetail rd;
+  rd.proto_ = result.detail.proto;
+  rd.priority_ = result.detail.priority;
+  rd.addr_type_ = result.detail.addr_type;
+  rd.direction_ = (result.detail.direction == 0) ? FlowDir::kIngress : FlowDir::kEgress;
+  rd.action_ = static_cast<NetPolicyRule>(result.detail.action);
+  rd.action_dsc_ = std::string(result.detail.action_dsc);
+  rd.policy_key_ = std::string(result.detail.policy_key);
+  rd.src_ip_ = std::string(result.detail.src_ip);
+  rd.dst_ip_ = std::string(result.detail.dst_ip);
+  for (const auto& p : result.detail.ports) {
+    RULE_PORT port{};
+    port.end_port_ = p.end_port;
+    port.port_ = p.port;
+    port.proto_ = p.proto;
+    rd.ports_.push_back(port);
+  }
+  return rd;
 }
 
-/*获取策略map*/
-PolicyTree* PolicyRule::GetPolicyTree(FlowDir dir) {
-  return (dir == FlowDir::kIngress) ? &this->input_tree_ : &this->output_tree_;
-}
-
-/*打印日志*/
-void PolicyRule::PrintPolicyLog() {
-  LOG_D("NetInput : %d, NetOutput : %d, input tree : %d, output tree : %d",
-        (int)this->input_tree_.RuleSize(), (int)this->output_tree_.RuleSize(),
-        this->input_tree_.GetTreeSize(), this->output_tree_.GetTreeSize());
-}
-
-/*添加优先级和子网掩码*/
-void PolicyRule::AddMaskAndPriority(int priority, int mask) {
-  /*save priority*/
-  this->priority_.insert(priority);
-  /*save cidr*/
-  if ((mask > 0) && (mask <= 32))
-    this->mask_cidr_.insert(mask);
-}
-
-/*将规则添加到链上*/
 int PolicyRule::AddPolicyToTree(RuleDetail& policy, RULE_PORT& stPort) {
-  /*extract mask from CIDR in policy before inserting into chain*/
-  auto [key_unused, mask] = policy.CreateRuleKey();
-  /*get policy tree*/
-  auto tree = this->GetPolicyTree(policy.direction_);
-  auto ret = tree->AddPolicyToChain(policy, stPort);
-  if (ret != 0)
-    RETURN_ERROR(ret, "add policy to chain failed.");
-  /*save priority and mask for future key generation*/
-  this->AddMaskAndPriority(policy.priority_, mask);
+  if (!IsValidUtf8(policy.policy_key_) || !IsValidUtf8(policy.src_ip_) ||
+      !IsValidUtf8(policy.dst_ip_) || !IsValidUtf8(policy.action_dsc_)) {
+    RETURN_ERROR(-1, "invalid UTF-8 in policy fields, refusing to add.");
+  }
+  policy_engine::SharedRuleDetail rd{};
+  rd.proto = policy.proto_;
+  rd.priority = policy.priority_;
+  rd.addr_type = policy.addr_type_;
+  rd.direction = (policy.direction_ == FlowDir::kIngress) ? 0 : 1;
+  rd.action = static_cast<uint32_t>(policy.action_);
+  rd.action_dsc = policy.action_dsc_;
+  rd.policy_key = policy.policy_key_;
+  rd.src_ip = policy.src_ip_;
+  rd.dst_ip = policy.dst_ip_;
+
+  policy_engine::SharedRulePort rp{};
+  rp.end_port = stPort.end_port_;
+  rp.port = stPort.port_;
+  rp.proto = stPort.proto_;
+
+  engine_->add_policy(rd, rp);
   return 0;
 }
 
-/*删除指定策略*/
 int PolicyRule::DeletePolicy(FlowDir dir, std::string name) {
-  auto tree = this->GetPolicyTree(dir);
-  /*return*/
-  return tree->DeletePolicyFromTree(name);
+  if (!IsValidUtf8(name)) {
+    RETURN_ERROR(-1, "invalid UTF-8 in policy name, refusing to delete.");
+  }
+  int32_t dir_int = (dir == FlowDir::kIngress) ? 0 : 1;
+  engine_->delete_policy(dir_int, name);
+  return 0;
 }
 
-/*获取所有规则配置*/
+void PolicyRule::PrintPolicyLog() {
+  auto in_rules = engine_->all_rules(0);
+  auto out_rules = engine_->all_rules(1);
+  LOG_D("NetInput : %lu, NetOutput : %lu", in_rules.size(), out_rules.size());
+}
+
+/*获取所有规则配置 -- linear scan over all_rules() rather than the old O(1)
+ *unordered_map::find per group; deliberate, acceptable simplification for
+ *this admin/debug config-dump path (not the packet-matching hot path).*/
 cJSON* PolicyRule::GetAllConfig(std::string name, net::ConnectionManager& conn_mgr) {
   NFQ_RES_INFO* res;
   cJSON *containers = nullptr, *tcp = nullptr, *r = nullptr, *item;
@@ -581,46 +242,27 @@ cJSON* PolicyRule::GetAllConfig(std::string name, net::ConnectionManager& conn_m
   if (!config || !outrule || !inrule || !tcp || !containers)
     GOTO_ERROR(err, "create json object failed.");
 
-  /*iterate one tree and append matching rules to arr
-   * when name is non-empty: O(1) lookup per group (rules_ keyed by policy_key_)
-   * when name is empty: iterate all rules in every group*/
   for (int dir_idx = 0; dir_idx < 2; dir_idx++) {
-    PolicyTree& tree  = (dir_idx == 0) ? this->input_tree_ : this->output_tree_;
-    cJSON*      arr   = (dir_idx == 0) ? inrule            : outrule;
-    const char* label = (dir_idx == 0) ? "inbound_rules"   : "outbound_rules";
+    auto rules = engine_->all_rules(dir_idx);
+    cJSON* arr = (dir_idx == 0) ? inrule : outrule;
+    const char* label = (dir_idx == 0) ? "inbound_rules" : "outbound_rules";
 
-    for (auto& [chain_key, rule_group] : tree.chain_) {
-      if (!rule_group) continue;
-      if (!name.empty()) {
-        auto it = rule_group->rules_.find(name);
-        if (it == rule_group->rules_.end()) continue;
-        const auto& rd = it->second;
-        r = cJSON_CreateObject();
-        if (!r) GOTO_ERROR(err, "create json object failed.");
-        cJSON_AddStringToObject(r, "policy_name", rd->policy_key_.c_str());
-        cJSON_AddNumberToObject(r, "priority", rd->priority_);
-        cJSON_AddStringToObject(r, "direction", utility::directionString(rd->direction_).data());
-        cJSON_AddStringToObject(r, "action", utility::actionString(rd->action_).data());
-        cJSON_AddStringToObject(r, "protocol", utility::protocolString(rd->proto_).data());
-        cJSON_AddNumberToObject(r, "protocol_int", rd->proto_);
-        cJSON_AddStringToObject(r, "from_address", rd->src_ip_.c_str());
-        cJSON_AddStringToObject(r, "to_address", rd->dst_ip_.c_str());
-        cJSON_AddItemToArray(arr, r);
-      } else {
-        for (auto& [pname, rd] : rule_group->rules_) {
-          r = cJSON_CreateObject();
-          if (!r) GOTO_ERROR(err, "create json object failed.");
-          cJSON_AddStringToObject(r, "policy_name", rd->policy_key_.c_str());
-          cJSON_AddNumberToObject(r, "priority", rd->priority_);
-          cJSON_AddStringToObject(r, "direction", utility::directionString(rd->direction_).data());
-          cJSON_AddStringToObject(r, "action", utility::actionString(rd->action_).data());
-          cJSON_AddStringToObject(r, "protocol", utility::protocolString(rd->proto_).data());
-          cJSON_AddNumberToObject(r, "protocol_int", rd->proto_);
-          cJSON_AddStringToObject(r, "from_address", rd->src_ip_.c_str());
-          cJSON_AddStringToObject(r, "to_address", rd->dst_ip_.c_str());
-          cJSON_AddItemToArray(arr, r);
-        }
-      }
+    for (const auto& rd : rules) {
+      if (!name.empty() && std::string(rd.policy_key) != name)
+        continue;
+      r = cJSON_CreateObject();
+      if (!r) GOTO_ERROR(err, "create json object failed.");
+      cJSON_AddStringToObject(r, "policy_name", std::string(rd.policy_key).c_str());
+      cJSON_AddNumberToObject(r, "priority", rd.priority);
+      cJSON_AddStringToObject(r, "direction",
+          utility::directionString(rd.direction == 0 ? FlowDir::kIngress : FlowDir::kEgress).data());
+      cJSON_AddStringToObject(r, "action",
+          utility::actionString(static_cast<NetPolicyRule>(rd.action)).data());
+      cJSON_AddStringToObject(r, "protocol", utility::protocolString(rd.proto).data());
+      cJSON_AddNumberToObject(r, "protocol_int", rd.proto);
+      cJSON_AddStringToObject(r, "from_address", std::string(rd.src_ip).c_str());
+      cJSON_AddStringToObject(r, "to_address", std::string(rd.dst_ip).c_str());
+      cJSON_AddItemToArray(arr, r);
     }
     cJSON_AddItemToObject(config, label, arr);
   }
@@ -632,7 +274,6 @@ cJSON* PolicyRule::GetAllConfig(std::string name, net::ConnectionManager& conn_m
     res = it->second.get();
     if (res == nullptr)
       continue;
-
     item = cJSON_CreateObject();
     if (!item)
       GOTO_ERROR(err, "create json object failed.");
@@ -648,16 +289,11 @@ cJSON* PolicyRule::GetAllConfig(std::string name, net::ConnectionManager& conn_m
   return config;
 
 err:
-  if (tcp)
-    cJSON_Delete(tcp);
-  if (config)
-    cJSON_Delete(config);
-  if (inrule)
-    cJSON_Delete(inrule);
-  if (outrule)
-    cJSON_Delete(outrule);
-  if (containers)
-    cJSON_Delete(containers);
+  if (tcp) cJSON_Delete(tcp);
+  if (config) cJSON_Delete(config);
+  if (inrule) cJSON_Delete(inrule);
+  if (outrule) cJSON_Delete(outrule);
+  if (containers) cJSON_Delete(containers);
   return nullptr;
 }
 

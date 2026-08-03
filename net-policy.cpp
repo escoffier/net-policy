@@ -426,15 +426,7 @@ static NET_POLICY_RULE MatchHttpPolicyRule(const std::vector<HTTP_RULE_INFO>& ht
 static std::optional<RuleDetail> MatchNetPolicyRule(FiveTuple& tuple, FLOW_DIR dir, DaemonContext& daemon) {
   if (daemon.Microseg().IsNodeIp(tuple.src_addr_u32_))
     return std::nullopt;
-  auto rules = daemon.Microseg().GetPolicyTree(dir);
-  if (rules->RuleSize() == 0)
-    return std::nullopt;
-  auto rule_keys = daemon.Microseg().CreateRuleKeyByTuple(tuple, dir);
-  for (auto& key : rule_keys) {
-    if (auto matched = rules->MatchRuleGroup(key, tuple))
-      return matched;
-  }
-  return std::nullopt;
+  return daemon.Microseg().MatchFiveTuple(tuple, dir);
 }
 
 /*match micro policy rule*/
