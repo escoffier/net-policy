@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <arpa/inet.h>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -338,4 +339,42 @@ TEST(ConnectionManagerCutoverTest, TcpPacketWithTrackingOffDoesNotEnterTcbTable)
   EXPECT_TRUE(tracked.is_tcp);
   EXPECT_EQ(tracked.decision.kind, 1);  // NewConnection
   EXPECT_EQ(manager.stat().tcp_conn_, 2u);
+}
+
+TEST(NetFlowEngineFfiTest, DuplicateSegmentReturnsKind4) {
+  auto engine = net_flow::new_flow_engine();
+  auto syn = SynPacket();
+  engine->on_packet(syn.data(), syn.size());
+
+  // DataPacket helper doesn't set sequence numbers (defaults to 0), so we
+  // manually set it to 1 to follow the SYN (which has seq=0, leaving state.seq=1).
+  auto data = DataPacket(/*syn=*/false, "hello");
+  // TCP sequence number is at bytes 4-7 of the TCP header (20 bytes into the packet).
+  uint32_t seq_be = htonl(1);  // seq=1 in network byte order
+  std::memcpy(data.data() + 24, &seq_be, sizeof(seq_be));
+
+  auto d1 = engine->on_packet(data.data(), data.size());
+  ASSERT_EQ(d1.kind, 3);  // Data
+  auto d2 = engine->on_packet(data.data(), data.size());  // replay with same seq
+  EXPECT_EQ(d2.kind, 4);  // Duplicate
+}
+
+TEST(NetFlowEngineFfiTest, NonSynNonRstOnUnknownFlowReturnsKind5) {
+  auto engine = net_flow::new_flow_engine();
+  auto data = DataPacket(/*syn=*/false, "GET / HTTP/1.1\r\n");  // no prior SYN
+  auto decision = engine->on_packet(data.data(), data.size());
+  EXPECT_EQ(decision.kind, 5);  // UnknownData
+  EXPECT_GT(decision.payload_offset, 0u);
+}
+
+TEST(NetFlowEngineFfiTest, EvictStaleConnectionsIsCallableAndReturnsEmptyForFreshFlows) {
+  auto engine = net_flow::new_flow_engine();
+  auto syn = SynPacket();
+  engine->on_packet(syn.data(), syn.size());
+  // Freshly created -- nothing should be evicted yet (the FFI entry point
+  // uses a fixed multi-minute production timeout; this test only confirms
+  // the call is wired correctly end-to-end, not the timeout value itself,
+  // which is exercised by Task 2's Rust unit tests with an injected clock).
+  auto evicted = engine->evict_stale_connections();
+  EXPECT_TRUE(evicted.empty());
 }
