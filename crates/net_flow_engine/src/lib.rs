@@ -9,6 +9,18 @@ mod ffi {
     }
 
     #[derive(Default)]
+    struct SharedFiveTuple {
+        proto: u8,
+        tot_len: u16,
+        ip_header_len: u32,
+        src_port: u16,
+        dst_port: u16,
+        src_addr: u32,
+        dst_addr: u32,
+        recognized: bool,
+    }
+
+    #[derive(Default)]
     struct PacketDecision {
         /// 0 = Ignore, 1 = NewConnection, 2 = Closed, 3 = Data
         kind: i32,
@@ -36,6 +48,8 @@ mod ffi {
         unsafe fn on_packet(self: &mut FlowEngine, pkg: *const u8, len: usize) -> PacketDecision;
         fn live_connection_count(self: &FlowEngine) -> usize;
         fn connection_strings(self: &FlowEngine) -> Vec<String>;
+
+        unsafe fn parse_five_tuple(pkg: *const u8, len: usize) -> SharedFiveTuple;
     }
 }
 
@@ -57,6 +71,25 @@ impl From<ConnectionId> for ffi::SharedConnectionId {
 
 fn new_flow_engine() -> Box<FlowEngine> {
     Box::new(FlowEngine::new())
+}
+
+/// # Safety
+/// `pkg` must point to at least `len` readable bytes; the caller owns that
+/// buffer for the duration of this call. Mirrors on_packet's existing
+/// safety contract (Phase 5) -- same raw-pointer FFI precedent.
+unsafe fn parse_five_tuple(pkg: *const u8, len: usize) -> ffi::SharedFiveTuple {
+    let bytes = std::slice::from_raw_parts(pkg, len);
+    let result = parse_five_tuple_internal(bytes);
+    ffi::SharedFiveTuple {
+        proto: result.proto,
+        tot_len: result.tot_len,
+        ip_header_len: result.ip_header_len,
+        src_port: result.src_port,
+        dst_port: result.dst_port,
+        src_addr: result.src_addr,
+        dst_addr: result.dst_addr,
+        recognized: result.recognized,
+    }
 }
 
 impl FlowEngine {
@@ -94,6 +127,7 @@ struct Ipv4Header {
     protocol: u8,
     saddr: u32,
     daddr: u32,
+    tot_len: u16,
 }
 
 fn parse_ipv4_header(bytes: &[u8]) -> Option<Ipv4Header> {
@@ -120,7 +154,8 @@ fn parse_ipv4_header(bytes: &[u8]) -> Option<Ipv4Header> {
     let protocol = bytes[9];
     let saddr = u32::from_ne_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]);
     let daddr = u32::from_ne_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
-    Some(Ipv4Header { header_len, protocol, saddr, daddr })
+    let tot_len = u16::from_be_bytes([bytes[2], bytes[3]]);
+    Some(Ipv4Header { header_len, protocol, saddr, daddr, tot_len })
 }
 
 fn ipv4_to_string(ip: u32) -> String {
@@ -227,6 +262,75 @@ fn parse_tcp_header(bytes: &[u8]) -> Option<TcpHeader> {
     let syn = flags & 0x02 != 0;
     let rst = flags & 0x04 != 0;
     Some(TcpHeader { header_len, source, dest, seq, syn, fin, rst })
+}
+
+const IPPROTO_UDP: u8 = 17;
+const IPPROTO_ICMP: u8 = 1;
+const UDP_HDR_LEN: usize = 8;
+
+struct FiveTupleResult {
+    proto: u8,
+    tot_len: u16,
+    ip_header_len: u32,
+    src_port: u16,
+    dst_port: u16,
+    src_addr: u32,
+    dst_addr: u32,
+    recognized: bool,
+}
+
+impl Default for FiveTupleResult {
+    fn default() -> Self {
+        FiveTupleResult {
+            proto: 0,
+            tot_len: 0,
+            ip_header_len: 0,
+            src_port: 0,
+            dst_port: 0,
+            src_addr: 0,
+            dst_addr: 0,
+            recognized: false,
+        }
+    }
+}
+
+/// Mirrors parse_package (net-policy.cpp): extracts a five-tuple for any of
+/// TCP, UDP, or ICMP. Unlike on_packet_internal (Phase 5, TCP-only, stateful
+/// TCB tracking), this is a stateless, protocol-agnostic parse for L3-L4
+/// policy matching -- no connection-tracking side effects, no `&mut self`.
+fn parse_five_tuple_internal(bytes: &[u8]) -> FiveTupleResult {
+    let Some(ip) = parse_ipv4_header(bytes) else {
+        return FiveTupleResult::default();
+    };
+    let payload = &bytes[ip.header_len..];
+    let (src_port, dst_port) = match ip.protocol {
+        IPPROTO_TCP => {
+            let Some(tcp) = parse_tcp_header(payload) else {
+                return FiveTupleResult::default();
+            };
+            (tcp.source, tcp.dest)
+        }
+        IPPROTO_UDP => {
+            if payload.len() < UDP_HDR_LEN {
+                return FiveTupleResult::default();
+            }
+            let source = u16::from_be_bytes([payload[0], payload[1]]);
+            let dest = u16::from_be_bytes([payload[2], payload[3]]);
+            (source, dest)
+        }
+        IPPROTO_ICMP => (0, 0),
+        _ => return FiveTupleResult::default(),
+    };
+    FiveTupleResult {
+        proto: ip.protocol,
+        tot_len: ip.tot_len,
+        ip_header_len: ip.header_len as u32,
+        src_port,
+        dst_port,
+        src_addr: ip.saddr,
+        dst_addr: ip.daddr,
+        recognized: true,
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -512,5 +616,95 @@ mod flow_engine_tests {
         let mut conns = engine.connection_strings();
         conns.sort();
         assert_eq!(conns, vec!["10.0.0.1:1234,10.0.0.2:80", "10.0.0.2:80,10.0.0.1:1234"]);
+    }
+}
+
+#[cfg(test)]
+mod five_tuple_tests {
+    use super::*;
+
+    fn ipv4_header_with_tot_len(protocol: u8, saddr: [u8; 4], daddr: [u8; 4], tot_len: u16) -> Vec<u8> {
+        let mut b = vec![0u8; 20];
+        b[0] = (4 << 4) | 5;
+        b[2..4].copy_from_slice(&tot_len.to_be_bytes());
+        b[9] = protocol;
+        b[12..16].copy_from_slice(&saddr);
+        b[16..20].copy_from_slice(&daddr);
+        b
+    }
+
+    fn udp_header(source: u16, dest: u16, length: u16) -> Vec<u8> {
+        let mut b = vec![0u8; 8];
+        b[0..2].copy_from_slice(&source.to_be_bytes());
+        b[2..4].copy_from_slice(&dest.to_be_bytes());
+        b[4..6].copy_from_slice(&length.to_be_bytes());
+        // bytes 6..8 (checksum) left zero -- unused by parsing
+        b
+    }
+
+    #[test]
+    fn parses_udp_five_tuple() {
+        let ip = ipv4_header_with_tot_len(17 /* UDP */, [10, 0, 0, 1], [10, 0, 0, 2], 28);
+        let udp = udp_header(1234, 80, 8);
+        let mut packet = ip;
+        packet.extend_from_slice(&udp);
+
+        let result = parse_five_tuple_internal(&packet);
+        assert!(result.recognized);
+        assert_eq!(result.proto, 17);
+        assert_eq!(result.tot_len, 28);
+        assert_eq!(result.ip_header_len, 20);
+        assert_eq!(result.src_port, 1234);
+        assert_eq!(result.dst_port, 80);
+        assert_eq!(ipv4_to_string(result.src_addr), "10.0.0.1");
+        assert_eq!(ipv4_to_string(result.dst_addr), "10.0.0.2");
+    }
+
+    #[test]
+    fn parses_icmp_five_tuple_with_zero_ports() {
+        // ICMP has no ports -- parse_package's precedent sets both to 0,
+        // not derived from any header field. No ICMP-specific body bytes
+        // needed; only the IP header's protocol field matters.
+        let ip = ipv4_header_with_tot_len(1 /* ICMP */, [10, 0, 0, 1], [10, 0, 0, 2], 20);
+
+        let result = parse_five_tuple_internal(&ip);
+        assert!(result.recognized);
+        assert_eq!(result.proto, 1);
+        assert_eq!(result.src_port, 0);
+        assert_eq!(result.dst_port, 0);
+    }
+
+    #[test]
+    fn parses_tcp_five_tuple_too() {
+        // Task 4's caller needs a five-tuple for TCP as well as UDP/ICMP
+        // (policy matching runs for every protocol) -- this function must
+        // handle TCP even though on_packet_internal's separate TCB-tracking
+        // path also parses TCP headers for a different purpose.
+        let ip = ipv4_header_with_tot_len(6 /* TCP */, [10, 0, 0, 1], [10, 0, 0, 2], 40);
+        let mut packet = ip;
+        let mut tcp = vec![0u8; 20];
+        tcp[0..2].copy_from_slice(&1234u16.to_be_bytes());
+        tcp[2..4].copy_from_slice(&80u16.to_be_bytes());
+        tcp[12] = 5 << 4;
+        packet.extend_from_slice(&tcp);
+
+        let result = parse_five_tuple_internal(&packet);
+        assert!(result.recognized);
+        assert_eq!(result.proto, 6);
+        assert_eq!(result.src_port, 1234);
+        assert_eq!(result.dst_port, 80);
+    }
+
+    #[test]
+    fn unrecognized_protocol_is_not_recognized() {
+        let ip = ipv4_header_with_tot_len(47 /* GRE, arbitrary unhandled proto */, [10, 0, 0, 1], [10, 0, 0, 2], 20);
+        let result = parse_five_tuple_internal(&ip);
+        assert!(!result.recognized);
+    }
+
+    #[test]
+    fn truncated_buffer_is_not_recognized() {
+        let result = parse_five_tuple_internal(&[0u8; 5]);
+        assert!(!result.recognized);
     }
 }

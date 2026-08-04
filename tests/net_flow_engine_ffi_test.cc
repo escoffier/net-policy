@@ -52,6 +52,57 @@ TEST(NetFlowEngineFfiTest, ConnectionStringsFormatsBothDirections) {
 
 namespace {
 
+std::vector<uint8_t> UdpPacket() {
+  std::vector<uint8_t> p(28, 0);  // 20-byte IP + 8-byte UDP
+  p[0] = (4 << 4) | 5;
+  p[2] = 0x00; p[3] = 0x1C;  // tot_len = 28
+  p[9] = 17;  // UDP
+  p[12] = 10; p[13] = 0; p[14] = 0; p[15] = 1;
+  p[16] = 10; p[17] = 0; p[18] = 0; p[19] = 2;
+  p[20] = 0x04; p[21] = 0xD2;  // source port 1234
+  p[22] = 0x00; p[23] = 0x50;  // dest port 80
+  return p;
+}
+
+std::vector<uint8_t> IcmpPacket() {
+  std::vector<uint8_t> p(20, 0);
+  p[0] = (4 << 4) | 5;
+  p[9] = 1;  // ICMP
+  p[12] = 10; p[13] = 0; p[14] = 0; p[15] = 1;
+  p[16] = 10; p[17] = 0; p[18] = 0; p[19] = 2;
+  return p;
+}
+
+}  // namespace
+
+TEST(NetFlowEngineFfiTest, ParseFiveTupleRecognizesUdp) {
+  auto pkt = UdpPacket();
+  auto tuple = net_flow::parse_five_tuple(pkt.data(), pkt.size());
+  EXPECT_TRUE(tuple.recognized);
+  EXPECT_EQ(tuple.proto, 17);
+  EXPECT_EQ(tuple.ip_header_len, 20);
+  EXPECT_EQ(tuple.src_port, 1234);
+  EXPECT_EQ(tuple.dst_port, 80);
+}
+
+TEST(NetFlowEngineFfiTest, ParseFiveTupleRecognizesIcmpWithZeroPorts) {
+  auto pkt = IcmpPacket();
+  auto tuple = net_flow::parse_five_tuple(pkt.data(), pkt.size());
+  EXPECT_TRUE(tuple.recognized);
+  EXPECT_EQ(tuple.proto, 1);
+  EXPECT_EQ(tuple.src_port, 0);
+  EXPECT_EQ(tuple.dst_port, 0);
+}
+
+TEST(NetFlowEngineFfiTest, ParseFiveTupleRecognizesTcpToo) {
+  auto pkt = SynPacket();  // existing helper, already defined in this file
+  auto tuple = net_flow::parse_five_tuple(pkt.data(), pkt.size());
+  EXPECT_TRUE(tuple.recognized);
+  EXPECT_EQ(tuple.proto, 6);
+}
+
+namespace {
+
 // Regression test for a bug the reviewer of Task 7 (the ConnectionManager/
 // FlowEngine cutover) caught: HandleData used to call setTCPSegment() on the
 // packet BEFORE trimming off the IP header, so the HTTP filter chain (and
@@ -141,7 +192,9 @@ TEST(ConnectionManagerCutoverTest, HandleDataPassesTcpHeaderStartNotIpHeaderStar
   net::ConnectionManager mgr(factory);
 
   auto syn = DataPacket(/*syn=*/true, "");
-  ASSERT_EQ(mgr.receive(syn.data(), syn.size()), net::NetStatus::OK);
+  auto syn_result = mgr.receive(syn.data(), syn.size(), /*track_tcp=*/true);
+  ASSERT_TRUE(syn_result.is_tcp);
+  ASSERT_EQ(mgr.DispatchWaf(syn_result.decision, syn.data(), syn.size()), net::NetStatus::OK);
 
   const std::string payload = "GET /x";
   auto data_pkt = DataPacket(/*syn=*/false, payload);
@@ -154,7 +207,9 @@ TEST(ConnectionManagerCutoverTest, HandleDataPassesTcpHeaderStartNotIpHeaderStar
   // ip_header_len/setTCPSegment fix this test exists to check. Both
   // setTCPSegment and onData (below) run unconditionally before that
   // HTTP-parse-dependent branch, so they're unaffected either way.
-  mgr.receive(data_pkt.data(), data_pkt.size());
+  auto data_result = mgr.receive(data_pkt.data(), data_pkt.size(), /*track_tcp=*/true);
+  ASSERT_TRUE(data_result.is_tcp);
+  mgr.DispatchWaf(data_result.decision, data_pkt.data(), data_pkt.size());
 
   // setTCPSegment must see the TCP header first -- source port 1234 (wire
   // bytes 0x04 0xD2) -- NOT the IP header (which would start with 0x45, the
@@ -195,7 +250,9 @@ TEST(ConnectionManagerCutoverTest, HandleClosedInvokesOnCloseAndRemovesBothConne
   net::ConnectionManager mgr(factory);
 
   auto syn = SynPacket();
-  ASSERT_EQ(mgr.receive(syn.data(), syn.size()), net::NetStatus::OK);
+  auto syn_result = mgr.receive(syn.data(), syn.size(), /*track_tcp=*/true);
+  ASSERT_TRUE(syn_result.is_tcp);
+  ASSERT_EQ(mgr.DispatchWaf(syn_result.decision, syn.data(), syn.size()), net::NetStatus::OK);
   // Both the server-side (1234->80) and the auto-created peer (80->1234)
   // entries must be present -- this is the check that would catch
   // HandleNewConnection dropping its peer_is_new branch.
@@ -203,10 +260,82 @@ TEST(ConnectionManagerCutoverTest, HandleClosedInvokesOnCloseAndRemovesBothConne
   EXPECT_FALSE(captured_filter->close_called_);
 
   auto fin = FinPacket();
-  ASSERT_EQ(mgr.receive(fin.data(), fin.size()), net::NetStatus::OK);
+  auto fin_result = mgr.receive(fin.data(), fin.size(), /*track_tcp=*/true);
+  ASSERT_TRUE(fin_result.is_tcp);
+  ASSERT_EQ(mgr.DispatchWaf(fin_result.decision, fin.data(), fin.size()), net::NetStatus::OK);
 
   EXPECT_TRUE(captured_filter->close_called_);
   // Both entries must be gone -- this is the check that would catch
   // HandleClosed erasing only its own ConnectionID and leaking its peer's.
   EXPECT_EQ(mgr.httpConnectionCount(), 0u);
+}
+
+// End-to-end coverage for the full input_nfq_cb-shaped call sequence against
+// the real ConnectionManager: a non-TCP (UDP) packet must still come back
+// with a recognized five-tuple (L3-L4 policy matching needs this for every
+// packet, not just TCP), while `decision` stays untouched -- on_packet is
+// only ever invoked for TCP packets (see ReceiveResult::receive's doc
+// comment), so a UDP packet must never reach it, tracking or not.
+TEST(ConnectionManagerCutoverTest, ReceiveReturnsFiveTupleForUdpWithoutWafDispatch) {
+  http::HttpFilterFactory filter_factory;
+  net::ConnectionManager manager(filter_factory);
+
+  std::vector<uint8_t> udp_pkt(28, 0);
+  udp_pkt[0] = (4 << 4) | 5;
+  udp_pkt[9] = 17;  // UDP
+  udp_pkt[12] = 10; udp_pkt[13] = 0; udp_pkt[14] = 0; udp_pkt[15] = 1;
+  udp_pkt[16] = 10; udp_pkt[17] = 0; udp_pkt[18] = 0; udp_pkt[19] = 2;
+  udp_pkt[20] = 0x04; udp_pkt[21] = 0xD2;
+  udp_pkt[22] = 0x00; udp_pkt[23] = 0x50;
+
+  auto result = manager.receive(udp_pkt.data(), udp_pkt.size(), /*track_tcp=*/false);
+  EXPECT_TRUE(result.tuple.recognized);
+  EXPECT_EQ(result.tuple.proto, 17);
+  EXPECT_FALSE(result.is_tcp);
+  // decision.kind should be left default (0/Ignore) -- on_packet was never
+  // called for a non-TCP packet.
+  EXPECT_EQ(result.decision.kind, 0);
+}
+
+// Regression coverage for receive()'s `track_tcp` gate, on the only input for
+// which that flag is actually the deciding factor: a TCP packet. (The UDP test
+// above cannot cover this -- for UDP, `is_tcp` is already false, so the
+// `&& track_tcp` conjunct in `if (result.is_tcp && track_tcp)` never decides
+// anything and dropping it would not fail that test.)
+//
+// The gate exists because net_flow_engine's FlowEngine has no timeout/reaper:
+// entries leave the TCB table only on a FIN/RST for an already-tracked flow.
+// net-policy.cpp passes daemon->WafEnabled() here, and waf_enable_ defaults to
+// false, so tracking TCP unconditionally would grow that table without bound in
+// the default deployment. Asserting on stat().tcp_conn_ (the Rust engine's live
+// TCB count) is what makes this test observe that actual resource-leak
+// scenario, rather than just restating the flag it was passed.
+TEST(ConnectionManagerCutoverTest, TcpPacketWithTrackingOffDoesNotEnterTcbTable) {
+  http::HttpFilterFactory filter_factory;
+  net::ConnectionManager manager(filter_factory);
+
+  auto syn = SynPacket();
+  auto result = manager.receive(syn.data(), syn.size(), /*track_tcp=*/false);
+
+  // The five-tuple parse and the is_tcp classification are deliberately NOT
+  // gated on track_tcp -- L3-L4 policy matching and net-policy.cpp's downstream
+  // microsegmentation TCP-tracking block need both on every packet, whatever
+  // the WAF's state.
+  EXPECT_TRUE(result.tuple.recognized);
+  EXPECT_TRUE(result.is_tcp);
+  EXPECT_EQ(result.tuple.proto, 6);
+  // on_packet was never called, so decision stays default-constructed.
+  EXPECT_EQ(result.decision.kind, 0);
+  // ...and, the point of the gate: no TCB entry was created.
+  EXPECT_EQ(manager.stat().tcp_conn_, 0u);
+
+  // Positive control on the same manager and the same packet: with tracking on,
+  // this SYN does create TCB state (the flow plus its peer -- see
+  // NetFlowEngineFfiTest.SynPacketCreatesNewConnection). Without this, the
+  // assertions above would also pass for a SYN that simply could not be
+  // tracked at all.
+  auto tracked = manager.receive(syn.data(), syn.size(), /*track_tcp=*/true);
+  EXPECT_TRUE(tracked.is_tcp);
+  EXPECT_EQ(tracked.decision.kind, 1);  // NewConnection
+  EXPECT_EQ(manager.stat().tcp_conn_, 2u);
 }

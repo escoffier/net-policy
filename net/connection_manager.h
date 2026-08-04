@@ -1,6 +1,7 @@
 #pragma once
 
 #include <glog/logging.h>
+#include <netinet/in.h>  // IPPROTO_TCP, for receive()'s is_tcp classification
 #include <memory>
 #include <unordered_map>
 #include <utility>
@@ -21,11 +22,57 @@ namespace net {
 
 class ConnectionManager {
 public:
+  // `tuple` is populated for every recognized protocol (TCP/UDP/ICMP), and
+  // `is_tcp` is always accurate for a recognized packet -- the downstream
+  // microsegmentation TCP-tracking block in net-policy.cpp needs both
+  // regardless of WAF state. `decision` is only meaningful when `is_tcp` is
+  // true AND the caller asked for TCB tracking (receive's `track_tcp`);
+  // otherwise it stays default-constructed, i.e. kind 0 (Ignore).
+  struct ReceiveResult {
+    // Deliberately the raw FFI struct, NOT net-policy.h's FiveTuple:
+    // net-policy.h already includes this header, so including it back here
+    // for FiveTuple would be circular. ConnectionManager only hands back the
+    // raw parsed fields; net-policy.cpp (which includes both headers safely)
+    // constructs the policy-matching FiveTuple from them.
+    net_flow::SharedFiveTuple tuple;
+    net_flow::PacketDecision decision;
+    bool is_tcp;
+  };
+
   explicit ConnectionManager(http::HttpFilterFactory& filter_factory)
       : filter_factory_(filter_factory), engine_(net_flow::new_flow_engine()) {}
 
-  NetStatus receive(const uint8_t* pkg, size_t len) {
-    auto decision = engine_->on_packet(pkg, len);
+  // Parses the packet's five-tuple (all of TCP/UDP/ICMP) -- always, since L3-L4
+  // policy matching needs it on every packet -- and, when `track_tcp` is set
+  // and the packet is TCP, additionally advances the Rust engine's TCB state
+  // machine. Deliberately does NOT dispatch to the WAF; the caller decides
+  // whether to, via DispatchWaf below.
+  //
+  // `track_tcp` exists to preserve a resource-lifetime property that predates
+  // this phase: net_flow_engine's FlowEngine has no timeout/reaper, so entries
+  // are only removed when a FIN/RST is seen for an already-tracked flow.
+  // Before the receive/DispatchWaf split, on_packet was only ever reached
+  // behind net-policy.cpp's `daemon->WafEnabled()` guard, and waf_enable_
+  // defaults to false. Calling on_packet unconditionally would make the TCB
+  // table grow without bound (half-open connections, drops, timeouts) in the
+  // default WAF-off deployment. Callers pass WafEnabled() here; do NOT gate
+  // the five-tuple parse or `is_tcp` on it.
+  ReceiveResult receive(const uint8_t* pkg, size_t len, bool track_tcp) {
+    ReceiveResult result{};
+    result.tuple = net_flow::parse_five_tuple(pkg, len);
+    result.is_tcp = result.tuple.recognized && (result.tuple.proto == IPPROTO_TCP);
+    if (result.is_tcp && track_tcp) {
+      result.decision = engine_->on_packet(pkg, len);
+    }
+    return result;
+  }
+
+  // Unchanged logic from the old internal Handle{NewConnection,Data,Closed}
+  // dispatch -- only the call site moved, from inside receive() to here, an
+  // explicitly-invoked public method. Callers should only call this for TCP
+  // (ReceiveResult::is_tcp); a default-constructed decision (kind 0, Ignore)
+  // is handled as a no-op regardless.
+  NetStatus DispatchWaf(const net_flow::PacketDecision& decision, const uint8_t* pkg, size_t len) {
     switch (decision.kind) {
       case 0:  // Ignore
         return NetStatus::OK;
