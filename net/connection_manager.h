@@ -50,15 +50,20 @@ public:
   // machine. Deliberately does NOT dispatch to the WAF; the caller decides
   // whether to, via DispatchWaf below.
   //
-  // `track_tcp` exists to preserve a resource-lifetime property that predates
-  // this phase: net_flow_engine's FlowEngine has no timeout/reaper, so entries
-  // are only removed when a FIN/RST is seen for an already-tracked flow.
-  // Before the receive/DispatchWaf split, on_packet was only ever reached
-  // behind net-policy.cpp's `daemon->WafEnabled()` guard, and waf_enable_
-  // defaults to false. Calling on_packet unconditionally would make the TCB
-  // table grow without bound (half-open connections, drops, timeouts) in the
-  // default WAF-off deployment. Callers pass WafEnabled() here; do NOT gate
-  // the five-tuple parse or `is_tcp` on it.
+  // `track_tcp` originally existed to preserve a resource-lifetime property:
+  // FlowEngine had no timeout/reaper, entries left the TCB table only on a
+  // FIN/RST for an already-tracked flow, and on_packet was only ever reached
+  // behind net-policy.cpp's `daemon->WafEnabled()` guard (waf_enable_ defaults
+  // to false), so tracking unconditionally would have grown that table without
+  // bound in the default deployment.
+  //
+  // Both halves of that rationale are now gone: FlowEngine has a timeout
+  // reaper, and microsegmentation's per-connection HTTP tracking is driven by
+  // the same PacketDecision the WAF is, so gating it on the WAF would silently
+  // disable L7 microsegmentation policy whenever the WAF is off. Production
+  // callers (input_nfq_cb/output_nfq_cb) therefore pass `true`; the flag stays
+  // on the signature because tests still use it to assert the untracked
+  // behavior. Do NOT gate the five-tuple parse or `is_tcp` on it either way.
   ReceiveResult receive(const uint8_t* pkg, size_t len, bool track_tcp) {
     ReceiveResult result{};
     result.tuple = net_flow::parse_five_tuple(pkg, len);
@@ -124,6 +129,33 @@ public:
     return it->second->getRuleKey();
   }
 
+  // Starts tracking this decision's flow for microsegmentation, if it is not
+  // already tracked. Mirrors the old C++'s two explicit inserts --
+  // `TcpCt{Input,Output}().insert({ct_key, Connection(rule_key)})` on a SYN,
+  // and the same insert on the first data packet of a flow with an applicable
+  // HTTP policy -- including their insert-if-absent semantics (`std::map::
+  // insert` does nothing when the key exists, so a repeat SYN never reset a
+  // live entry's parser state).
+  //
+  // Deliberately inserts ONLY `conn_id`, never `peer_conn_id`, unlike
+  // http_conns_ (WAF), where both directions legitimately share one
+  // HttpFilterManager. Microsegmentation's rule keys are direction-specific:
+  // the ingress direction's key is looked up in InputHttpPolicy() and the
+  // egress direction's in OutputHttpPolicy(), and the old code kept two
+  // separate direction-keyed maps for exactly that reason. Seeding the peer
+  // here with this direction's key would hand output_nfq_cb an ingress key to
+  // look up in OutputHttpPolicy() -- a near-certain miss, silently disabling
+  // egress L7 policy. Each direction binds its own entry, with its own
+  // MatchMicroPolicyRule result, when its own callback first sees a packet for
+  // it; the merged ConnectionID-keyed map stays equivalent to the old two maps
+  // because the two directions have distinct ConnectionIDs.
+  void MicrosegTrack(const net_flow::PacketDecision& decision, const std::string& rule_key) {
+    auto id = ToConnectionID(decision.conn_id);
+    if (microseg_conns_.find(id) == microseg_conns_.end()) {
+      microseg_conns_[id] = std::make_unique<http::Connection>(rule_key);
+    }
+  }
+
   // Mirrors the old C++ microseg block's per-kind handling, keyed by
   // ConnectionID instead of a queue-direction-specific TcpFourTupleV4 map.
   // `rule_key` is only consulted for NewConnection/UnknownData (the caller
@@ -148,21 +180,16 @@ public:
         return std::nullopt;
       case 1: {  // NewConnection (SYN): insert only. A SYN never carries
                  // payload worth extracting, so this case -- unlike case 5
-                 // below -- never attempts onData(). `microseg_conns_[id] =`
-                 // unconditionally overwrites any stale entry that might
-                 // already exist for this id: this is only possible if an
-                 // earlier UnknownData-triggered late-binding (case 5)
-                 // created an entry for a flow Rust's OWN tcbs table never
-                 // held (since Rust only creates entries on SYN -- see Task
-                 // 1), and a genuinely new SYN later reuses the same
-                 // five-tuple. Starting fresh on a real SYN is correct in
-                 // that scenario; do not try to "merge" with the stale
-                 // entry.
-        microseg_conns_[id] = std::make_unique<http::Connection>(rule_key);
-        auto peer_id = ToConnectionID(decision.peer_conn_id);
-        if (decision.peer_is_new) {
-          microseg_conns_[peer_id] = std::make_unique<http::Connection>(rule_key);
-        }
+                 // below -- never attempts onData().
+                 //
+                 // Note the callbacks do NOT reach this case for their SYN
+                 // handling: they test the decision's `syn` flag and call
+                 // MicrosegTrack directly, because SYN-ACKs and SYN
+                 // retransmissions are SYN-flagged but arrive as kind 3/4,
+                 // not kind 1 (see PacketDecision::syn's doc comment). This
+                 // case exists so that kind-1 dispatch is complete and
+                 // equivalent to that path.
+        MicrosegTrack(decision, rule_key);
         return std::nullopt;  // SYN itself never produces a Header.
       }
       case 5: {  // UnknownData: late-binding. UNLIKE case 1, this packet DOES
@@ -184,11 +211,9 @@ public:
                  // kind 1 sometimes is).
         auto it = microseg_conns_.find(id);
         if (it == microseg_conns_.end()) {
-          microseg_conns_[id] = std::make_unique<http::Connection>(rule_key);
-          auto peer_id = ToConnectionID(decision.peer_conn_id);
-          if (microseg_conns_.find(peer_id) == microseg_conns_.end()) {
-            microseg_conns_[peer_id] = std::make_unique<http::Connection>(rule_key);
-          }
+          // Own direction only -- see MicrosegTrack for why the peer is not
+          // seeded with this direction's rule_key.
+          MicrosegTrack(decision, rule_key);
           it = microseg_conns_.find(id);
         }
         auto data = std::string_view(reinterpret_cast<const char*>(pkg) + decision.payload_offset,
@@ -207,10 +232,19 @@ public:
       case 3: {  // Data
         auto it = microseg_conns_.find(id);
         if (it == microseg_conns_.end()) {
-          return std::nullopt;  // untracked -- caller's MicrosegTracked check
-                                 // should have already routed around calling
-                                 // this with a rule_key in this situation;
-                                 // defensive no-op if reached anyway.
+          return std::nullopt;  // Untracked. Unlike case 5, this case never
+                                 // late-binds: the caller is responsible for
+                                 // calling MicrosegTrack first once it has a
+                                 // policy-matched rule_key (mirroring the old
+                                 // C++'s explicit `if (tcp_it == end())
+                                 // insert(...)` immediately before its
+                                 // onData() call). A miss here therefore means
+                                 // no HTTP policy applied to this flow, and
+                                 // extracting would be pointless -- not that
+                                 // the caller "routed around" this call, which
+                                 // it does not: !MicrosegTracked + Data + an
+                                 // applicable policy reaches this case
+                                 // routinely, having just tracked the flow.
         }
         auto data = std::string_view(reinterpret_cast<const char*>(pkg) + decision.payload_offset,
                                       len - decision.payload_offset);

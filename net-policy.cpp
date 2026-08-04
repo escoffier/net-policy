@@ -659,28 +659,33 @@ static int input_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct 
   // hand-rolled SYN/FIN/RST/sequence-number detection.
   //
   // IMPORTANT: DispatchMicroseg is called EXACTLY ONCE per packet. There are
-  // exactly three call sites below and no execution path reaches two of them:
+  // exactly two call sites below and no execution path reaches both:
   //   (a) the tracked-flow `Closed` branch (returns immediately),
-  //   (b) the untracked-flow `NewConnection` branch (returns immediately) --
-  //       a SYN's own insert must not also attempt extraction, which is why
-  //       DispatchMicroseg's case 1 never calls onData(),
-  //   (c) the single shared call at the bottom, reached by everything else.
-  // In particular kind 5 (UnknownData) must NOT be dispatched in the untracked
-  // branch and again at the bottom: case 5 does both the late-binding insert
-  // and the extraction in one call, so a second call would run onData() twice
-  // over the same bytes. An early draft of this phase's plan had exactly that
-  // bug.
+  //   (b) the single shared call at the bottom, reached by everything else.
+  // SYN handling does not use DispatchMicroseg at all -- it calls
+  // MicrosegTrack (a pure insert, never onData) and returns, because a SYN
+  // carries no payload worth inspecting. In particular kind 5 (UnknownData)
+  // must not be dispatched in the untracked branch and again at the bottom:
+  // case 5 does both the late-binding insert and the extraction in one call,
+  // so a second call would run onData() twice over the same bytes. An early
+  // draft of this phase's plan had exactly that bug.
   const auto& decision = result.decision;
   const bool tracked   = daemon->ConnMgr().MicrosegTracked(decision);
   // Replaces the old `data_len <= offset` payload-presence test, which gated
   // TWO of the old function's return points (one per found/!found branch) and
   // is why a bare ACK never reached policy matching or HTTP extraction.
-  // payload_offset is only populated for kinds 3/4/5; kinds 0/1/2 are
-  // classified by their flags before payload presence can matter (a SYN is
-  // handled as a SYN whether or not it carries data, and Closed means the
-  // FIN/RST the old code tested first inside its `found` branch).
+  // payload_offset is only populated for kinds 3/4/5; kinds 1/2 are classified
+  // by their flags before payload presence can matter.
   const bool has_payload = ((decision.kind == 3) || (decision.kind == 4) || (decision.kind == 5)) &&
                            (data_len > static_cast<int>(decision.payload_offset));
+  // Reconstructs the old `tcphdr.syn != 0` / `tcphdr.syn == 1` tests. It must
+  // be the raw flag, NOT `kind == 1`: NewConnection additionally requires the
+  // flow to be absent from the TCB table, so a SYN-ACK arrives as kind 3 and a
+  // SYN retransmission as kind 4 (see PacketDecision::syn). Testing kind here
+  // would let both escape policy matching entirely -- under a DENY rule the
+  // first SYN would be dropped but its retransmit accepted, completing the
+  // handshake the rule was meant to block.
+  const bool syn = decision.syn;
 
   if (decision.kind == 0) {
     // Ignore. For a recognized TCP packet this now means exactly one thing: a
@@ -702,8 +707,19 @@ static int input_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct 
             tuple.src_addr_.c_str(), tuple.src_port_, tuple.dst_addr_.c_str(), tuple.dst_port_);
       return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllow), 0, NULL);
     }
-    if ((decision.kind != 1) && !has_payload) {
-      // Old: `found`, not FIN/RST, `data_len <= offset` -- a bare ACK.
+    if (!has_payload) {
+      // Old: `found`, not FIN/RST, `data_len <= offset` -- a bare ACK. Note
+      // the old code's found-path payload test had NO SYN exemption (unlike
+      // its !found path, where the SYN test came first), so a payload-less
+      // SYN on a tracked flow returns here; `syn` is deliberately not
+      // consulted.
+      return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllowReq), 0, NULL);
+    }
+    if (syn) {
+      // Old L726's `if (tcphdr.syn == 1)`, reachable in the found path only
+      // for a payload-bearing SYN: its insert was a std::map::insert on an
+      // already-present key, i.e. a no-op, and it returned kAllowReq without
+      // extracting. Reproduced exactly -- no re-tracking, no onData.
       return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllowReq), 0, NULL);
     }
     if (decision.kind == 4) {  // Old: `tcp_seq < tcp_it->second->getTcpSeq()`.
@@ -717,8 +733,9 @@ static int input_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct 
     rule_key = daemon->ConnMgr().MicrosegRuleKey(decision).value_or(std::string());
   } else {
     // Old `found == false` branch, in the same order it tested things: SYN
-    // first, then payload presence, then the shared match block.
-    if ((decision.kind != 1) && !has_payload) {
+    // first (`if (tcphdr.syn != 0) break;`), then payload presence, then the
+    // shared match block.
+    if (!syn && !has_payload) {
       // Old: not found, not SYN, `data_len <= offset`. Note this also swallows
       // kind 2 (FIN/RST on a TCB-tracked flow microseg never tracked), which
       // the old code likewise accepted here since such packets carry no
@@ -747,29 +764,38 @@ static int input_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct 
       return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllow), 0, NULL);
     }
     // An HTTP policy applies to this flow.
-    if (decision.kind == 1) {
-      // SYN: insert only and return -- DispatchMicroseg's case 1 never
-      // extracts. This is the ONLY DispatchMicroseg call for a NewConnection
-      // reached from here; do not let it fall through to the bottom one too.
+    if (syn) {
+      // Old L726-733: start tracking with the key just matched, and return
+      // without extracting (a SYN carries no payload worth inspecting). Covers
+      // SYN, SYN-ACK and SYN retransmissions alike, exactly as the old
+      // `tcphdr.syn == 1` did.
       LOG_D("microseg-dp  input sync, src: %s, dest : %s, data len : %d", tuple.src_addr_.c_str(),
             tuple.dst_addr_.c_str(), data_len);
-      daemon->ConnMgr().DispatchMicroseg(decision, reinterpret_cast<const uint8_t*>(pkg), data_len, rule_key);
+      daemon->ConnMgr().MicrosegTrack(decision, rule_key);
       return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllowReq), 0, NULL);
     }
-    // kind 3/4/5 with an applicable HTTP policy: fall through to the single
-    // shared dispatch below. For kind 5 that one call performs both the
-    // late-binding insert and the extraction (old code's "not sync, new
-    // conntrack" insert followed by onData()).
+    // Non-SYN, payload-bearing, HTTP policy applies: start tracking this flow
+    // with the key just matched, then fall through to the single shared
+    // dispatch. This is old L739-747's explicit `if (tcp_it == end())
+    // insert(Connection(rule_key))` immediately before its onData() call, and
+    // it is what makes late-binding work for kind 3 (Data) -- e.g. the first
+    // response packet of a flow whose SYN-ACK found no egress policy, or any
+    // flow an AddPolicyRule started applying to mid-connection. Only kind 5
+    // late-binds inside DispatchMicroseg; kinds 3 and 4 do not, by design.
+    // Doing the insert here rather than inside DispatchMicroseg keeps that one
+    // call the sole owner of onData() (for kind 5 this insert simply makes
+    // case 5's own insert-on-miss a no-op -- it does not double-parse).
+    daemon->ConnMgr().MicrosegTrack(decision, rule_key);
   }
 
   /*print debug log*/
   LOG_D("microseg-dp  input data, src: %s, dest : %s, data len : %d", tuple.src_addr_.c_str(),
         tuple.dst_addr_.c_str(), data_len);
-  // Reached by: kind 3/5 carrying payload (tracked or freshly policy-matched),
-  // kind 4 on an untracked flow, and the practically-unreachable
-  // NewConnection-on-an-already-tracked-flow case (case 1 re-inserts and
-  // returns nullopt, so this returns kAllowReq for it -- the same verdict the
-  // old code gave a bare SYN on a tracked flow).
+  // Reached by exactly: a non-SYN, payload-bearing kind 3/4/5 packet that is
+  // either already tracked or was just tracked by the MicrosegTrack call
+  // above. Every SYN-flagged packet and every payload-less one has returned by
+  // now, so kind 1 can never reach here (it is always SYN-flagged) and neither
+  // can kind 2.
   auto header = daemon->ConnMgr().DispatchMicroseg(decision, reinterpret_cast<const uint8_t*>(pkg),
                                                    data_len, rule_key);
   LOG_D("input method : %s, path : %s, host : %s, state : %d",
@@ -885,12 +911,16 @@ static int output_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct
 
   // ---- TCP from here on. See input_nfq_cb for the full commentary on the
   // kind-based dispatch, the exactly-one-DispatchMicroseg-call invariant (the
-  // same three mutually exclusive call sites appear below), and how
-  // `has_payload` reproduces the retired `data_len <= offset` test.
+  // same two mutually exclusive call sites appear below), how `has_payload`
+  // reproduces the retired `data_len <= offset` test, and why the SYN test
+  // must be the raw flag rather than `kind == 1` (a SYN-ACK -- the first
+  // egress packet of every peer-initiated connection, and so this direction's
+  // normal entry point -- arrives as kind 3, never kind 1).
   const auto& decision = result.decision;
   const bool tracked   = daemon->ConnMgr().MicrosegTracked(decision);
   const bool has_payload = ((decision.kind == 3) || (decision.kind == 4) || (decision.kind == 5)) &&
                            (data_len > static_cast<int>(decision.payload_offset));
+  const bool syn = decision.syn;
 
   if (decision.kind == 0) {
     // RST on a flow the TCB tracker never saw a SYN for -- old code's
@@ -905,8 +935,14 @@ static int output_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct
             tuple.src_addr_.c_str(), tuple.src_port_, tuple.dst_addr_.c_str(), tuple.dst_port_);
       return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllow), 0, NULL);
     }
-    if ((decision.kind != 1) && !has_payload) {
-      // Old: `found`, not FIN/RST, `data_len <= offset` -- a bare ACK.
+    if (!has_payload) {
+      // Old: `found`, not FIN/RST, `data_len <= offset` -- a bare ACK. The old
+      // found-path payload test had no SYN exemption; see input_nfq_cb.
+      return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllowRsp), 0, NULL);
+    }
+    if (syn) {
+      // Old L943's `if (tcphdr.syn == 1)` on an already-tracked flow: its
+      // insert was a no-op and it returned without extracting.
       return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllowRsp), 0, NULL);
     }
     if (decision.kind == 4) {  // Old: `tcp_seq < tcp_it->second->getTcpSeq()`.
@@ -917,7 +953,7 @@ static int output_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct
     // branch never ran MatchMicroPolicyRule, so the local rule_key is empty.
     rule_key = daemon->ConnMgr().MicrosegRuleKey(decision).value_or(std::string());
   } else {
-    if ((decision.kind != 1) && !has_payload) {
+    if (!syn && !has_payload) {
       // Old: not found, not SYN, `data_len <= offset`.
       return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllowRsp), 0, NULL);
     }
@@ -941,14 +977,19 @@ static int output_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct
       return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllow), 0, NULL);
     }
     // An HTTP policy applies to this flow.
-    if (decision.kind == 1) {
-      // SYN: insert only and return -- the ONLY DispatchMicroseg call for a
-      // NewConnection reached from here.
+    if (syn) {
+      // Old L943-950. For this direction the common case is a SYN-ACK, which
+      // is where the egress side of a peer-initiated connection gets tracked
+      // with its OWN OutputHttpPolicy key -- the ingress SYN must not seed it
+      // (see ConnectionManager::MicrosegTrack).
       LOG_D("microseg-dp output sync, rule key : %s, src: %s, dest : %s, data len : %d",
             rule_key.c_str(), tuple.src_addr_.c_str(), tuple.dst_addr_.c_str(), data_len);
-      daemon->ConnMgr().DispatchMicroseg(decision, reinterpret_cast<const uint8_t*>(pkg), data_len, rule_key);
+      daemon->ConnMgr().MicrosegTrack(decision, rule_key);
       return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllowRsp), 0, NULL);
     }
+    // Non-SYN, payload-bearing, HTTP policy applies: late-bind before the
+    // shared dispatch -- old L956-964's explicit insert. See input_nfq_cb.
+    daemon->ConnMgr().MicrosegTrack(decision, rule_key);
   }
 
   /*print debug log*/

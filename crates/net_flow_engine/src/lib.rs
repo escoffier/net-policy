@@ -42,6 +42,20 @@ mod ffi {
         /// or not trimming at all before it, corrupts live packets.
         ip_header_len: u32,
         payload_offset: u32,
+        /// Whether this packet has the TCP SYN flag set. Populated for every
+        /// kind that carries a parsed TCP header (1-5); false for kind 0
+        /// (Ignore), where no decision fields are meaningful at all.
+        ///
+        /// This is NOT redundant with `kind == NewConnection`. NewConnection
+        /// additionally requires the flow to be absent from the TCB table, so
+        /// two very common SYN-flagged packet classes are not kind 1: a
+        /// SYN-ACK (its direction's entry was already seeded by the initiating
+        /// SYN, so it arrives as Data) and a SYN retransmission (same seq as
+        /// the tracked one, so it arrives as Duplicate). The C++ callbacks'
+        /// microsegmentation path must treat all three alike -- it is
+        /// reconstructing the old `tcphdr.syn != 0` test, which was blind to
+        /// TCB state.
+        syn: bool,
     }
 
     extern "Rust" {
@@ -122,6 +136,7 @@ impl FlowEngine {
                     peer_is_new: d.peer_is_new,
                     ip_header_len: d.ip_header_len,
                     payload_offset: d.payload_offset,
+                    syn: d.syn,
                 }
             }
         }
@@ -395,6 +410,9 @@ struct PacketDecision {
     /// byte offset into the ORIGINAL (ip header included) buffer where the
     /// TCP payload begins; only meaningful when kind == Data.
     payload_offset: u32,
+    /// the packet's raw TCP SYN flag -- see ffi::PacketDecision::syn for why
+    /// this is distinct from `kind == NewConnection`.
+    syn: bool,
 }
 
 pub struct FlowEngine {
@@ -446,6 +464,7 @@ impl FlowEngine {
                     peer_is_new: false,
                     ip_header_len: 0,
                     payload_offset: 0,
+                    syn: tcp.syn,
                 });
             }
             if tcp.seq < state.seq {
@@ -461,6 +480,7 @@ impl FlowEngine {
                     peer_is_new: false,
                     ip_header_len,
                     payload_offset,
+                    syn: tcp.syn,
                 });
             }
             let payload_len = (bytes.len() - payload_offset as usize) as u32;
@@ -474,6 +494,7 @@ impl FlowEngine {
                 peer_is_new: false,
                 ip_header_len,
                 payload_offset,
+                syn: tcp.syn,
             });
         }
 
@@ -499,6 +520,7 @@ impl FlowEngine {
                 peer_is_new,
                 ip_header_len: 0,
                 payload_offset: 0,
+                syn: true,
             });
         }
         // Neither RST nor SYN on an unknown flow -- previously a silent
@@ -512,6 +534,7 @@ impl FlowEngine {
             conn_id: id,
             peer_conn_id: peer_id,
             peer_is_new: false,
+            syn: tcp.syn,
             ip_header_len,
             payload_offset,
         })
@@ -648,6 +671,58 @@ mod flow_engine_tests {
         let decision =
             engine.on_packet_internal(&packet(ip_rev, tcp_rev), now).expect("should decide");
         assert_eq!(decision.kind, PacketKind::Data);
+        // ...but it IS still a SYN-flagged packet, and consumers reconstructing
+        // the old C++ microseg path's `tcphdr.syn != 0` test must be able to
+        // see that. Checking `kind == NewConnection` instead would classify
+        // every SYN-ACK in the system as an ordinary data segment.
+        assert!(decision.syn);
+    }
+
+    #[test]
+    fn syn_retransmission_is_duplicate_but_still_reports_syn() {
+        // A retransmitted SYN carries the same seq as the original, which the
+        // duplicate check (tcp.seq < state.seq, state.seq being seq+1) catches
+        // before anything looks at flags -- so it arrives as Duplicate, not
+        // NewConnection. Same rationale as the SYN-ACK case above: a consumer
+        // reconstructing `tcphdr.syn != 0` must still see the flag, otherwise
+        // a DENY policy that blocked the first SYN would silently let the
+        // retransmit through and the handshake would complete.
+        let mut engine = FlowEngine::new();
+        let now = Instant::now();
+        let ip = ipv4_header(6, [10, 0, 0, 1], [10, 0, 0, 2]);
+        let syn = tcp_segment(1234, 80, 1000, true, false, false, &[]);
+
+        let first = engine
+            .on_packet_internal(&packet(ip.clone(), syn.clone()), now)
+            .expect("should decide");
+        assert_eq!(first.kind, PacketKind::NewConnection);
+        assert!(first.syn);
+
+        let retransmit =
+            engine.on_packet_internal(&packet(ip, syn), now).expect("should decide");
+        assert_eq!(retransmit.kind, PacketKind::Duplicate);
+        assert!(retransmit.syn);
+    }
+
+    #[test]
+    fn non_syn_packets_do_not_report_syn() {
+        // Negative control for the two tests above -- without this, `syn: true`
+        // hard-coded everywhere would pass them both.
+        let mut engine = FlowEngine::new();
+        let now = Instant::now();
+        let ip = ipv4_header(6, [10, 0, 0, 1], [10, 0, 0, 2]);
+        let syn = tcp_segment(1234, 80, 1000, true, false, false, &[]);
+        engine.on_packet_internal(&packet(ip.clone(), syn), now).unwrap();
+
+        let data = tcp_segment(1234, 80, 1001, false, false, false, b"hello");
+        let d = engine.on_packet_internal(&packet(ip.clone(), data), now).expect("should decide");
+        assert_eq!(d.kind, PacketKind::Data);
+        assert!(!d.syn);
+
+        let fin = tcp_segment(1234, 80, 1006, false, true, false, &[]);
+        let d = engine.on_packet_internal(&packet(ip, fin), now).expect("should decide");
+        assert_eq!(d.kind, PacketKind::Closed);
+        assert!(!d.syn);
     }
 
     #[test]
