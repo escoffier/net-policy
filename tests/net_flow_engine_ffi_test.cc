@@ -367,6 +367,61 @@ TEST(NetFlowEngineFfiTest, NonSynNonRstOnUnknownFlowReturnsKind5) {
   EXPECT_GT(decision.payload_offset, 0u);
 }
 
+TEST(ConnectionManagerMicrosegTest, NewConnectionThenDataProducesHeaderWhenTracked) {
+  http::HttpFilterFactory factory;
+  net::ConnectionManager mgr(factory);
+
+  auto syn = SynPacket();
+  auto syn_result = mgr.receive(syn.data(), syn.size(), /*track_tcp=*/true);
+  ASSERT_EQ(syn_result.decision.kind, 1);  // NewConnection
+  EXPECT_FALSE(mgr.MicrosegTracked(syn_result.decision));  // not tracked yet
+  auto header1 = mgr.DispatchMicroseg(syn_result.decision, syn.data(), syn.size(), "some-rule-key");
+  EXPECT_FALSE(header1.has_value());  // SYN itself never produces a Header
+
+  auto data = DataPacket(/*syn=*/false, "GET /x HTTP/1.1\r\nHost: example.com\r\n\r\n");
+  // DataPacket() defaults its TCP sequence number to 0, same as SynPacket()'s
+  // SYN -- which would make the engine treat this as a retransmission of the
+  // SYN (Duplicate, kind 4) rather than the next segment (Data, kind 3). The
+  // SYN consumes sequence number 0, so the next real segment must carry
+  // seq=1. TCP sequence number is at byte offset 24 (20-byte IP header + 4
+  // bytes into the TCP header).
+  uint32_t seq_be = htonl(1);
+  std::memcpy(data.data() + 24, &seq_be, sizeof(seq_be));
+  auto data_result = mgr.receive(data.data(), data.size(), /*track_tcp=*/true);
+  ASSERT_EQ(data_result.decision.kind, 3);  // Data
+  ASSERT_TRUE(mgr.MicrosegTracked(data_result.decision));  // now tracked, from the SYN above
+  auto header2 = mgr.DispatchMicroseg(data_result.decision, data.data(), data.size(), /*unused, already tracked*/"");
+  ASSERT_TRUE(header2.has_value());
+  EXPECT_EQ(header2->host_, "example.com");
+}
+
+TEST(ConnectionManagerMicrosegTest, ClosedErasesBothSides) {
+  http::HttpFilterFactory factory;
+  net::ConnectionManager mgr(factory);
+
+  auto syn = SynPacket();
+  auto syn_result = mgr.receive(syn.data(), syn.size(), /*track_tcp=*/true);
+  mgr.DispatchMicroseg(syn_result.decision, syn.data(), syn.size(), "some-rule-key");
+  ASSERT_TRUE(mgr.MicrosegTracked(syn_result.decision));
+
+  auto fin = FinPacket();
+  auto fin_result = mgr.receive(fin.data(), fin.size(), /*track_tcp=*/true);
+  ASSERT_EQ(fin_result.decision.kind, 2);  // Closed
+  mgr.DispatchMicroseg(fin_result.decision, fin.data(), fin.size(), "");
+  EXPECT_FALSE(mgr.MicrosegTracked(fin_result.decision));
+}
+
+TEST(ConnectionManagerMicrosegTest, UntrackedFlowReportsNotTracked) {
+  // A flow this ConnectionManager has never seen a NewConnection/UnknownData
+  // dispatch for -- MicrosegTracked must report false so the caller knows to
+  // run MatchMicroPolicyRule again (mirrors the old C++'s `found` semantics).
+  http::HttpFilterFactory factory;
+  net::ConnectionManager mgr(factory);
+  auto data = DataPacket(/*syn=*/false, "irrelevant");
+  auto result = mgr.receive(data.data(), data.size(), /*track_tcp=*/true);
+  EXPECT_FALSE(mgr.MicrosegTracked(result.decision));
+}
+
 TEST(NetFlowEngineFfiTest, EvictStaleConnectionsIsCallableAndReturnsEmptyForFreshFlows) {
   auto engine = net_flow::new_flow_engine();
   auto syn = SynPacket();

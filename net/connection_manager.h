@@ -3,6 +3,8 @@
 #include <glog/logging.h>
 #include <netinet/in.h>  // IPPROTO_TCP, for receive()'s is_tcp classification
 #include <memory>
+#include <optional>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 
@@ -82,8 +84,131 @@ public:
         return HandleClosed(decision);
       case 3:  // Data
         return HandleData(decision, pkg, len);
+      case 4:  // Duplicate -- new for WAF: a retransmission guard it didn't
+               // have before this phase (see plan Task 1's commit message).
+        return NetStatus::OK;
+      case 5:  // UnknownData -- matches WAF's pre-existing implicit behavior
+               // for this case exactly (previously fell into `default:` via
+               // kind 0/Ignore; now explicit).
+        return NetStatus::OK;
       default:
         return NetStatus::OK;
+    }
+  }
+
+  // Pure lookup: does a tracked microseg Connection already exist for this
+  // decision's conn_id? Mirrors the old C++'s `tcp_it != TcpCtInput().end()`
+  // check (renamed `found`). Callers use this BEFORE deciding whether to
+  // re-run policy matching (see net-policy.cpp's input_nfq_cb/output_nfq_cb,
+  // Task 5) -- a flow can be fully tracked by the TCB state machine while
+  // having no tracked microseg Connection, if no HTTP policy applied to it
+  // at NewConnection/UnknownData time. Never mutates state.
+  bool MicrosegTracked(const net_flow::PacketDecision& decision) const {
+    return microseg_conns_.find(ToConnectionID(decision.conn_id)) != microseg_conns_.end();
+  }
+
+  // Mirrors the old C++ microseg block's per-kind handling, keyed by
+  // ConnectionID instead of a queue-direction-specific TcpFourTupleV4 map.
+  // `rule_key` is only consulted for NewConnection/UnknownData (the caller
+  // must have already run MatchMicroPolicyRule for those -- see Task 5);
+  // for Data/Duplicate/Closed on an already-tracked entry, the entry's own
+  // stored rule_key (via Connection::getRuleKey()) is authoritative and the
+  // passed-in rule_key is ignored, mirroring the old
+  // `rule_key = tcp_it->second->getRuleKey();` overwrite.
+  //
+  // Returns the reconstructed HTTP header once a Data- or UnknownData-kind
+  // packet completes an HTTP parse (ParseState::Done), for the caller to run
+  // MatchHttpPolicyRule against -- std::nullopt for every other case
+  // (NewConnection, Closed, Duplicate, an incomplete parse, or a Data-kind
+  // packet with no matching entry -- Data never inserts on a miss, only
+  // UnknownData does; see case 3 vs case 5 below).
+  std::optional<http::Header> DispatchMicroseg(const net_flow::PacketDecision& decision,
+                                                const uint8_t* pkg, size_t len,
+                                                const std::string& rule_key) {
+    auto id = ToConnectionID(decision.conn_id);
+    switch (decision.kind) {
+      case 0:  // Ignore -- should not be reached for TCP; defensive no-op.
+        return std::nullopt;
+      case 1: {  // NewConnection (SYN): insert only. A SYN never carries
+                 // payload worth extracting, so this case -- unlike case 5
+                 // below -- never attempts onData(). `microseg_conns_[id] =`
+                 // unconditionally overwrites any stale entry that might
+                 // already exist for this id: this is only possible if an
+                 // earlier UnknownData-triggered late-binding (case 5)
+                 // created an entry for a flow Rust's OWN tcbs table never
+                 // held (since Rust only creates entries on SYN -- see Task
+                 // 1), and a genuinely new SYN later reuses the same
+                 // five-tuple. Starting fresh on a real SYN is correct in
+                 // that scenario; do not try to "merge" with the stale
+                 // entry.
+        microseg_conns_[id] = std::make_unique<http::Connection>(rule_key);
+        auto peer_id = ToConnectionID(decision.peer_conn_id);
+        if (decision.peer_is_new) {
+          microseg_conns_[peer_id] = std::make_unique<http::Connection>(rule_key);
+        }
+        return std::nullopt;  // SYN itself never produces a Header.
+      }
+      case 5: {  // UnknownData: late-binding. UNLIKE case 1, this packet DOES
+                 // carry real payload (there was no separate SYN packet to
+                 // "use up" first), so this case inserts on first sight AND
+                 // always attempts extraction in the same call -- including
+                 // on every SUBSEQUENT packet of this same flow, since
+                 // on_packet_internal has no way to ever promote an
+                 // untracked-by-Rust flow to a "known" state (only a SYN
+                 // creates a tcbs entry -- Task 1) -- every later packet on
+                 // a flow that started this way keeps arriving as
+                 // UnknownData too, forever, not Data. This single case must
+                 // therefore handle both "first sight" and "already
+                 // late-bound, here's more data" without the caller needing
+                 // to distinguish them (see Task 5's dispatch, which for
+                 // this exact reason calls DispatchMicroseg for kind 5
+                 // EXACTLY ONCE, the same as every other kind -- never
+                 // paired with a separate insert-only pre-call the way
+                 // kind 1 sometimes is).
+        auto it = microseg_conns_.find(id);
+        if (it == microseg_conns_.end()) {
+          microseg_conns_[id] = std::make_unique<http::Connection>(rule_key);
+          auto peer_id = ToConnectionID(decision.peer_conn_id);
+          if (microseg_conns_.find(peer_id) == microseg_conns_.end()) {
+            microseg_conns_[peer_id] = std::make_unique<http::Connection>(rule_key);
+          }
+          it = microseg_conns_.find(id);
+        }
+        auto data = std::string_view(reinterpret_cast<const char*>(pkg) + decision.payload_offset,
+                                      len - decision.payload_offset);
+        const auto& header = it->second->onData(data);
+        if (header.parseState_ != ParseState::Done) {
+          return std::nullopt;
+        }
+        return header;
+      }
+      case 2: {  // Closed
+        microseg_conns_.erase(id);
+        microseg_conns_.erase(ToConnectionID(decision.peer_conn_id));
+        return std::nullopt;
+      }
+      case 3: {  // Data
+        auto it = microseg_conns_.find(id);
+        if (it == microseg_conns_.end()) {
+          return std::nullopt;  // untracked -- caller's MicrosegTracked check
+                                 // should have already routed around calling
+                                 // this with a rule_key in this situation;
+                                 // defensive no-op if reached anyway.
+        }
+        auto data = std::string_view(reinterpret_cast<const char*>(pkg) + decision.payload_offset,
+                                      len - decision.payload_offset);
+        const auto& header = it->second->onData(data);
+        if (header.parseState_ != ParseState::Done) {
+          return std::nullopt;
+        }
+        return header;  // copies out of the Connection-owned reference -- safe
+                         // past this call regardless of the Connection's lifetime.
+      }
+      case 4:  // Duplicate -- retransmitted segment, skip (mirrors the old
+               // `tcp_seq < getTcpSeq()` early return).
+        return std::nullopt;
+      default:
+        return std::nullopt;
     }
   }
 
@@ -179,6 +304,7 @@ private:
   http::HttpFilterFactory& filter_factory_;
   rust::Box<net_flow::FlowEngine> engine_;
   std::unordered_map<ConnectionID, std::shared_ptr<http::Connection>, ConnectionIDHash> http_conns_;
+  std::unordered_map<ConnectionID, http::ConnectionPtr, ConnectionIDHash> microseg_conns_;
 };
 
 }  // namespace net
