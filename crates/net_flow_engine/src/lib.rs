@@ -66,6 +66,7 @@ mod ffi {
         fn live_connection_count(self: &FlowEngine) -> usize;
         fn connection_strings(self: &FlowEngine) -> Vec<String>;
         fn evict_stale_connections(self: &mut FlowEngine) -> Vec<SharedConnectionId>;
+        fn stale_connection_timeout_secs() -> u64;
 
         unsafe fn parse_five_tuple(pkg: *const u8, len: usize) -> SharedFiveTuple;
     }
@@ -600,6 +601,22 @@ impl FlowEngine {
 /// constant if it proves wrong in practice, not via a design change.
 const STALE_CONNECTION_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// The entry-age threshold `evict_stale_connections` applies, in seconds.
+///
+/// Exposed over FFI because the C++ side has to age out flow state this
+/// engine's `tcbs` table can never contain: a flow the daemon never saw a SYN
+/// for is never inserted into `tcbs` (only the SYN branch of
+/// `on_packet_internal` inserts), so every packet on it arrives as
+/// `UnknownData` forever and it can never appear in `evict_stale_connections`'
+/// output -- yet C++'s microsegmentation map late-binds an entry for exactly
+/// that flow. That sweep lives in C++ (net/connection_manager.h's
+/// `ConnectionManager::EvictStale`) because the state being swept is C++'s;
+/// this getter exists so it applies the SAME timeout rather than a second,
+/// independently-drifting copy of the number.
+fn stale_connection_timeout_secs() -> u64 {
+    STALE_CONNECTION_TIMEOUT.as_secs()
+}
+
 #[cfg(test)]
 mod flow_engine_tests {
     use super::*;
@@ -896,6 +913,19 @@ mod flow_engine_tests {
         let mut conns = engine.connection_strings();
         conns.sort();
         assert_eq!(conns, vec!["10.0.0.3:5555,10.0.0.4:80", "10.0.0.4:80,10.0.0.3:5555"]);
+    }
+
+    // The C++ side's own sweep of late-bound microsegmentation entries (flows
+    // that were never in `tcbs`, so `evict_stale_connections` can never report
+    // them) reads its timeout from this getter rather than hardcoding a second
+    // copy of the number. Assert it reports the SAME timeout
+    // `evict_stale_connections` actually applies, in the unit the FFI name
+    // promises -- an `as_millis`/`as_secs` slip here would silently make the
+    // C++ sweep 1000x too eager or too lazy.
+    #[test]
+    fn stale_connection_timeout_secs_matches_the_applied_timeout() {
+        assert_eq!(stale_connection_timeout_secs(), STALE_CONNECTION_TIMEOUT.as_secs());
+        assert_eq!(stale_connection_timeout_secs(), 300);
     }
 
     #[test]

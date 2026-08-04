@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <arpa/inet.h>
+#include <chrono>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -611,4 +612,131 @@ TEST(NetFlowEngineFfiTest, EvictStaleConnectionsIsCallableAndReturnsEmptyForFres
   // which is exercised by Task 2's Rust unit tests with an injected clock).
   auto evicted = engine->evict_stale_connections();
   EXPECT_TRUE(evicted.empty());
+}
+
+// --- Reaper (Task 6) -------------------------------------------------------
+//
+// The gap these cover: a LATE-BOUND flow -- one the daemon never saw a SYN for,
+// because it attached to a pod mid-connection or was restarted while
+// connections were live. on_packet_internal only ever inserts into the Rust
+// engine's `tcbs` on a SYN, so such a flow has NO TCB entry, every packet on it
+// arrives as kind 5 (UnknownData) forever, and its ID can therefore NEVER be
+// returned by evict_stale_connections(). Yet DispatchMicroseg's case 5
+// late-binds a microseg_conns_ entry for it. An engine-driven-only reaper
+// (erase whatever evict_stale_connections() reports) can never reach that
+// entry: it leaks for the lifetime of the daemon, unboundedly, in exactly the
+// deployments where late-binding is normal. Hence EvictStale's second,
+// timestamp-driven sweep, which these tests pin down.
+
+TEST(ConnectionManagerReaperTest, LateBoundFlowIsEvictedAfterTheTimeout) {
+  http::HttpFilterFactory factory;
+  net::ConnectionManager mgr(factory);
+
+  // No SYN -- straight to data, so this arrives as UnknownData and late-binds.
+  auto data = DataPacket(/*syn=*/false, "GET /x HTTP/1.1\r\nHost: example.com\r\n\r\n");
+  auto result = mgr.receive(data.data(), data.size(), /*track_tcp=*/true);
+  ASSERT_EQ(result.decision.kind, 5);  // UnknownData
+  ASSERT_TRUE(mgr.DispatchMicroseg(result.decision, data.data(), data.size(), "k").has_value());
+  ASSERT_TRUE(mgr.MicrosegTracked(result.decision));
+  ASSERT_EQ(mgr.microsegConnectionCount(), 1u);
+
+  // The premise: this flow is invisible to the engine's own reaper. Not an
+  // incidental assertion -- if a future change made UnknownData insert into
+  // `tcbs`, this test would no longer be testing the late-bound case at all.
+  ASSERT_EQ(mgr.stat().tcp_conn_, 0u);
+
+  // A sweep now must NOT evict it -- the entry was just touched.
+  auto t0 = std::chrono::steady_clock::now();
+  mgr.EvictStale(t0, std::chrono::seconds(300));
+  EXPECT_TRUE(mgr.MicrosegTracked(result.decision));
+
+  // ...and a sweep past the timeout must, even though the engine reported
+  // nothing. This is the leak the engine-driven sweep alone cannot close.
+  mgr.EvictStale(t0 + std::chrono::seconds(301), std::chrono::seconds(300));
+  EXPECT_FALSE(mgr.MicrosegTracked(result.decision));
+  EXPECT_EQ(mgr.microsegConnectionCount(), 0u);
+}
+
+TEST(ConnectionManagerReaperTest, MicrosegTouchKeepsALiveLateBoundFlowFromBeingEvicted) {
+  // Without a per-packet touch, "still alive" would be decided by the last
+  // payload-bearing packet only -- and the callbacks return early on
+  // payload-less ACKs, so a keepalive-heavy connection would have its rule_key
+  // and half-parsed request reaped out from under it.
+  http::HttpFilterFactory factory;
+  net::ConnectionManager mgr(factory);
+
+  auto data = DataPacket(/*syn=*/false, "GET /x HTTP/1.1\r\n");  // header not finished
+  auto result = mgr.receive(data.data(), data.size(), /*track_tcp=*/true);
+  ASSERT_EQ(result.decision.kind, 5);
+  mgr.DispatchMicroseg(result.decision, data.data(), data.size(), "k");
+  ASSERT_TRUE(mgr.MicrosegTracked(result.decision));
+
+  auto t0 = std::chrono::steady_clock::now();
+  // A bare ACK 200s in: the callbacks touch on every packet, before their
+  // payload-presence early return.
+  mgr.MicrosegTouch(result.decision, t0 + std::chrono::seconds(200));
+
+  // 400s after t0 is well past the timeout measured from the DATA packet, but
+  // only 200s past the touch -- the entry must survive.
+  mgr.EvictStale(t0 + std::chrono::seconds(400), std::chrono::seconds(300));
+  EXPECT_TRUE(mgr.MicrosegTracked(result.decision));
+  EXPECT_EQ(mgr.MicrosegRuleKey(result.decision).value_or(""), "k");
+
+  // 501s after t0 is 301s after the touch -- now it goes.
+  mgr.EvictStale(t0 + std::chrono::seconds(501), std::chrono::seconds(300));
+  EXPECT_FALSE(mgr.MicrosegTracked(result.decision));
+}
+
+TEST(ConnectionManagerReaperTest, MicrosegTouchDoesNotInsertOrRefreshOnDuplicates) {
+  http::HttpFilterFactory factory;
+  net::ConnectionManager mgr(factory);
+
+  // Touching a flow with no entry must not create one (it is a pure refresh --
+  // the callbacks call it on every TCP packet, including flows no policy
+  // applies to).
+  auto data = DataPacket(/*syn=*/false, "GET / HTTP/1.1\r\n\r\n");
+  auto result = mgr.receive(data.data(), data.size(), /*track_tcp=*/true);
+  mgr.MicrosegTouch(result.decision);
+  EXPECT_EQ(mgr.microsegConnectionCount(), 0u);
+  EXPECT_FALSE(mgr.MicrosegTracked(result.decision));
+
+  // A kind-4 (Duplicate) touch must not refresh either, mirroring
+  // on_packet_internal, which leaves a TCB's last_seen alone on a
+  // retransmission. Forge the kind rather than replaying a real duplicate:
+  // what is under test is MicrosegTouch's own kind filter.
+  mgr.MicrosegTrack(result.decision, "k");
+  auto t0 = std::chrono::steady_clock::now();
+  auto dup = result.decision;
+  dup.kind = 4;
+  mgr.MicrosegTouch(dup, t0 + std::chrono::seconds(1000));
+  mgr.EvictStale(t0 + std::chrono::seconds(301), std::chrono::seconds(300));
+  EXPECT_FALSE(mgr.MicrosegTracked(result.decision));
+}
+
+// A flow the engine DOES track still ages out of microseg_conns_ on its own
+// timestamp -- the two sweeps are independent, and neither depends on the
+// other having run.
+TEST(ConnectionManagerReaperTest, TrackedFlowsMicrosegEntryAlsoAgesOut) {
+  http::HttpFilterFactory factory;
+  net::ConnectionManager mgr(factory);
+
+  auto syn = SynPacket();
+  auto syn_result = mgr.receive(syn.data(), syn.size(), /*track_tcp=*/true);
+  ASSERT_EQ(syn_result.decision.kind, 1);
+  mgr.MicrosegTrack(syn_result.decision, "k");
+  ASSERT_EQ(mgr.microsegConnectionCount(), 1u);
+
+  auto t0 = std::chrono::steady_clock::now();
+  mgr.EvictStale(t0 + std::chrono::seconds(301), std::chrono::seconds(300));
+  EXPECT_EQ(mgr.microsegConnectionCount(), 0u);
+  // The engine's own table is untouched by the C++ sweep -- it evicts on its
+  // own real-time clock and its own compiled-in timeout, which this fresh flow
+  // is nowhere near.
+  EXPECT_EQ(mgr.stat().tcp_conn_, 2u);
+}
+
+// The C++ sweep must apply the SAME timeout the Rust engine does, not a second
+// hand-maintained copy of the number.
+TEST(NetFlowEngineFfiTest, StaleConnectionTimeoutIsExposedOverFfi) {
+  EXPECT_EQ(net_flow::stale_connection_timeout_secs(), 300u);
 }

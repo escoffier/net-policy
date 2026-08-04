@@ -28,6 +28,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <sys/timerfd.h>
 #include <sys/un.h>
 #include <unistd.h>
 #include <gflags/gflags.h>
@@ -671,6 +672,14 @@ static int input_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct 
   // draft of this phase's plan had exactly that bug.
   const auto& decision = result.decision;
   const bool tracked   = daemon->ConnMgr().MicrosegTracked(decision);
+  // Tell the reaper this flow is still alive. Must happen here, before any of
+  // the early returns below, not down at the DispatchMicroseg call: a live
+  // connection can go minutes between payload-bearing packets while still
+  // exchanging ACKs (which return early at `!has_payload`), and its microseg
+  // entry -- rule_key and half-parsed request alike -- must not age out from
+  // under it. Purely a timestamp refresh: never inserts, so it cannot change
+  // `tracked` above, and it is a no-op for kinds 0 and 4 (see MicrosegTouch).
+  daemon->ConnMgr().MicrosegTouch(decision);
   // Replaces the old `data_len <= offset` payload-presence test, which gated
   // TWO of the old function's return points (one per found/!found branch) and
   // is why a bare ACK never reached policy matching or HTTP extraction.
@@ -918,6 +927,14 @@ static int output_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct
   // normal entry point -- arrives as kind 3, never kind 1).
   const auto& decision = result.decision;
   const bool tracked   = daemon->ConnMgr().MicrosegTracked(decision);
+  // Tell the reaper this flow is still alive. Must happen here, before any of
+  // the early returns below, not down at the DispatchMicroseg call: a live
+  // connection can go minutes between payload-bearing packets while still
+  // exchanging ACKs (which return early at `!has_payload`), and its microseg
+  // entry -- rule_key and half-parsed request alike -- must not age out from
+  // under it. Purely a timestamp refresh: never inserts, so it cannot change
+  // `tracked` above, and it is a no-op for kinds 0 and 4 (see MicrosegTouch).
+  daemon->ConnMgr().MicrosegTouch(decision);
   const bool has_payload = ((decision.kind == 3) || (decision.kind == 4) || (decision.kind == 5)) &&
                            (data_len > static_cast<int>(decision.payload_offset));
   const bool syn = decision.syn;
@@ -1991,6 +2008,24 @@ int ProcAcceptPostLinkEvent(int32_t epoll_fd, int32_t fd, void* ptr) {
   return 0;
 }
 
+/*Periodic reaper (Phase 6b-2). Fires on the timerfd armed in
+ *RunNetPolicyDaemon and sweeps stale per-flow state -- both the Rust engine's
+ *TCB table and ConnectionManager's own late-bound microsegmentation entries
+ *(see ConnectionManager::EvictStale). Runs on the epoll thread like every
+ *other callback, so it needs no locking against the packet path.*/
+static int32_t ReaperTimerEvent(int32_t epoll_fd, int32_t fd, void* ptr) {
+  (void)epoll_fd;
+  uint64_t expirations;
+  /*Required for a timerfd: the read() is what clears its readable state.
+   *Without it, level-triggered epoll would re-fire on every epoll_wait and
+   *spin the loop.*/
+  if (read(fd, &expirations, sizeof(expirations)) != (ssize_t)sizeof(expirations))
+    RETURN_ERROR(0, "read reaper timerfd failed, %s.", strerror(errno));
+  RcvEpollCb* cb = (RcvEpollCb*)ptr;
+  cb->daemon_->ConnMgr().EvictStale();
+  return 0;
+}
+
 int CreatePostServer(int efd, RCV_EPOLL_CB* pstPostEv, DaemonContext* daemon) {
   int fd = 0, ret, opt = 1;
   struct epoll_event ev;
@@ -2075,7 +2110,7 @@ int RunNetPolicyDaemon(int argc, char* argv[]) {
   struct epoll_event ev, events[20];
   int epfd = 0, zLinkFd;
   int ret, nfds, i;
-  RCV_EPOLL_CB postEvent, rustDispatchWakeEvent, *pstCbEv;
+  RCV_EPOLL_CB postEvent, rustDispatchWakeEvent, reaperEvent, *pstCbEv;
   // print start log
   LOG_I("policy process start......");
   /*get log level env*/
@@ -2119,6 +2154,42 @@ int RunNetPolicyDaemon(int argc, char* argv[]) {
   ret = epoll_ctl(epfd, EPOLL_CTL_ADD, rust_dispatch_wake_fd, &ev);
   if (ret < 0)
     GOTO_ERROR(err, "epoll ctl failed for rust control dispatch wake fd, %s.", strerror(errno));
+
+  // --- Reaper timer (Phase 6b-2): periodic sweep of stale TCB/microseg state ---
+  // This is what bounds the memory the TCP-tracking path consumes. It became
+  // load-bearing rather than merely tidy when the microsegmentation cutover
+  // dropped the old WafEnabled() gate on receive()'s track_tcp: TCB tracking
+  // now runs on every TCP connection in every deployment, including the default
+  // WAF-off one (see input_nfq_cb's comment on that argument), so without this
+  // timer both the Rust engine's TCB table and ConnectionManager's own per-flow
+  // maps would grow without bound for the daemon's lifetime.
+  int reaper_timer_fd;
+  reaper_timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
+  if (reaper_timer_fd < 0)
+    GOTO_ERROR(err, "create reaper timerfd failed, %s.", strerror(errno));
+  {
+    // The sweep INTERVAL is independent of the entry TIMEOUT (5 minutes,
+    // net_flow_engine's STALE_CONNECTION_TIMEOUT, which is also what
+    // EvictStale applies to its own microseg entries). A shorter interval only
+    // bounds how far past the timeout an evictable entry can linger before it
+    // is actually swept; it never evicts anything early. 60s is a reasonable
+    // default -- tune it here, independently of the timeout.
+    struct itimerspec its = {};
+    its.it_value.tv_sec = 60;     // first expiry
+    its.it_interval.tv_sec = 60;  // and every 60s after
+    ret = timerfd_settime(reaper_timer_fd, 0, &its, nullptr);
+    if (ret < 0)
+      GOTO_ERROR(err, "arm reaper timerfd failed, %s.", strerror(errno));
+  }
+  reaperEvent.fd_ = reaper_timer_fd;
+  reaperEvent.epoll_in_func_ = ReaperTimerEvent;
+  reaperEvent.nfq_res_ = nullptr;
+  reaperEvent.daemon_ = &daemon;
+  ev.data.ptr = &reaperEvent;
+  ev.events = EPOLLIN;
+  ret = epoll_ctl(epfd, EPOLL_CTL_ADD, reaper_timer_fd, &ev);
+  if (ret < 0)
+    GOTO_ERROR(err, "epoll ctl failed for reaper timer fd, %s.", strerror(errno));
 
   // --- Rust EventService (production event stream, port 50052) ---
   // Started before start_control_server below: it has no DaemonContext/epoll_fd

@@ -2,6 +2,7 @@
 
 #include <glog/logging.h>
 #include <netinet/in.h>  // IPPROTO_TCP, for receive()'s is_tcp classification
+#include <chrono>
 #include <memory>
 #include <optional>
 #include <string_view>
@@ -126,7 +127,35 @@ public:
     if (it == microseg_conns_.end()) {
       return std::nullopt;
     }
-    return it->second->getRuleKey();
+    return it->second.conn->getRuleKey();
+  }
+
+  // Refreshes the reaper clock on this decision's microsegmentation entry, if
+  // one exists (a no-op otherwise -- this NEVER inserts). The callbacks call it
+  // once per TCP packet, before any of their early returns, so that "this flow
+  // is still alive" is decided by packet arrival and NOT by whether the packet
+  // happened to reach DispatchMicroseg: a keepalive-heavy or long-idle-between-
+  // requests connection sends plenty of payload-less ACKs that the callbacks
+  // return on early (`!has_payload`), and without this its entry would age out
+  // from under a live flow, losing its rule_key and any half-parsed request.
+  //
+  // Kinds 0 (Ignore) and 4 (Duplicate) deliberately do NOT refresh, mirroring
+  // net_flow_engine's on_packet_internal, which likewise leaves `last_seen`
+  // untouched on a duplicate ("an entry that only ever receives retransmits of
+  // old data is not active for reaper purposes") and never reaches a flow's
+  // state at all for kind 0.
+  void MicrosegTouch(const net_flow::PacketDecision& decision) {
+    MicrosegTouch(decision, std::chrono::steady_clock::now());
+  }
+
+  // Test seam: same, with the clock injected. Mirrors the split net_flow_engine
+  // already uses between evict_stale(now, timeout) and evict_stale_connections().
+  void MicrosegTouch(const net_flow::PacketDecision& decision,
+                     std::chrono::steady_clock::time_point now) {
+    if ((decision.kind == 0) || (decision.kind == 4)) {
+      return;
+    }
+    TouchMicroseg(ToConnectionID(decision.conn_id), now);
   }
 
   // Starts tracking this decision's flow for microsegmentation, if it is not
@@ -152,7 +181,8 @@ public:
   void MicrosegTrack(const net_flow::PacketDecision& decision, const std::string& rule_key) {
     auto id = ToConnectionID(decision.conn_id);
     if (microseg_conns_.find(id) == microseg_conns_.end()) {
-      microseg_conns_[id] = std::make_unique<http::Connection>(rule_key);
+      microseg_conns_[id] =
+          MicrosegEntry{std::make_unique<http::Connection>(rule_key), std::chrono::steady_clock::now()};
     }
   }
 
@@ -216,9 +246,10 @@ public:
           MicrosegTrack(decision, rule_key);
           it = microseg_conns_.find(id);
         }
+        it->second.last_seen = std::chrono::steady_clock::now();
         auto data = std::string_view(reinterpret_cast<const char*>(pkg) + decision.payload_offset,
                                       len - decision.payload_offset);
-        const auto& header = it->second->onData(data);
+        const auto& header = it->second.conn->onData(data);
         if (header.parseState_ != ParseState::Done) {
           return std::nullopt;
         }
@@ -246,9 +277,10 @@ public:
                                  // applicable policy reaches this case
                                  // routinely, having just tracked the flow.
         }
+        it->second.last_seen = std::chrono::steady_clock::now();
         auto data = std::string_view(reinterpret_cast<const char*>(pkg) + decision.payload_offset,
                                       len - decision.payload_offset);
-        const auto& header = it->second->onData(data);
+        const auto& header = it->second.conn->onData(data);
         if (header.parseState_ != ParseState::Done) {
           return std::nullopt;
         }
@@ -260,6 +292,72 @@ public:
         return std::nullopt;
       default:
         return std::nullopt;
+    }
+  }
+
+  // Called periodically (net-policy.cpp's RunNetPolicyDaemon arms a timerfd on
+  // the epoll loop for it) to sweep stale per-flow state. Runs on the epoll
+  // thread, like every other callback -- no threads, no locking.
+  //
+  // There are TWO independent sources of staleness, and both are needed:
+  //
+  //  1. The Rust engine's own TCB table. `evict_stale_connections()` drops
+  //     entries whose last packet is older than the timeout and hands back
+  //     their IDs; whatever this class holds for those IDs goes with them, so
+  //     neither map keeps a Connection referencing a flow the engine no longer
+  //     tracks.
+  //
+  //  2. `microseg_conns_` entries the engine can never report. A flow the
+  //     daemon never saw a SYN for (it attached to a pod mid-connection, or was
+  //     restarted while connections were live) is NEVER inserted into the
+  //     engine's `tcbs` -- only the SYN branch of on_packet_internal inserts --
+  //     so every packet on it arrives as UnknownData forever and its ID can
+  //     never appear in evict_stale_connections()' output. But DispatchMicroseg
+  //     case 5 late-binds a microseg_conns_ entry for exactly that flow. Source
+  //     1 alone therefore leaks every late-bound flow permanently, for the
+  //     lifetime of the daemon. Hence the second loop: microseg entries carry
+  //     their own last_seen (refreshed by MicrosegTouch on every packet) and
+  //     age out on it, whether or not the engine ever knew about them.
+  //
+  // `http_conns_` (WAF) deliberately gets no equivalent age sweep, because it
+  // has no late-bound entries to leak: it is only ever inserted into by
+  // HandleNewConnection, i.e. kind 1, whose conn_id and peer_conn_id are BOTH
+  // in `tcbs` by construction (the SYN branch inserts both -- peer_is_new is
+  // false precisely when the peer was already there). Source 1 covers all of
+  // them. DispatchWaf's case 5 is a no-op and never inserts.
+  void EvictStale() {
+    EvictStale(std::chrono::steady_clock::now(),
+               std::chrono::seconds(net_flow::stale_connection_timeout_secs()));
+  }
+
+  // Test seam: same, with the clock and timeout injected -- the timeout the
+  // no-arg overload uses is 5 minutes, which no test can wait out. Mirrors the
+  // split net_flow_engine already uses between evict_stale(now, timeout) and
+  // evict_stale_connections(). Note `now`/`timeout` govern the C++-side sweep
+  // only; the engine's own eviction (below) always runs against the real clock
+  // and its own compiled-in timeout, since its Instants are not reachable from
+  // here.
+  void EvictStale(std::chrono::steady_clock::time_point now,
+                  std::chrono::steady_clock::duration timeout) {
+    for (const auto& shared_id : engine_->evict_stale_connections()) {
+      ConnectionID id{shared_id.local_ip, shared_id.foreign_ip, shared_id.local_port,
+                      shared_id.foreign_port};
+      // Same teardown a FIN/RST gets (HandleClosed): the WAF's onClose is what
+      // emits a connection's accumulated attack report, so erasing the entry
+      // without it would silently drop that report for any connection that
+      // timed out instead of closing cleanly. Erasing the peer alongside it --
+      // also HandleClosed's behavior -- is additionally what keeps onClose to
+      // exactly ONE call per connection when both directions go stale in the
+      // same sweep, since the two directions share one HttpFilterManager.
+      CloseHttpConn(id, PeerOf(id));
+      microseg_conns_.erase(id);
+    }
+    for (auto it = microseg_conns_.begin(); it != microseg_conns_.end();) {
+      if ((now - it->second.last_seen) >= timeout) {
+        it = microseg_conns_.erase(it);
+      } else {
+        ++it;
+      }
     }
   }
 
@@ -282,9 +380,47 @@ public:
   // decisions.
   size_t httpConnectionCount() const { return http_conns_.size(); }
 
+  // Same, for the microsegmentation map. Used by the reaper tests to observe
+  // that an evicted entry is really gone rather than merely unreachable.
+  size_t microsegConnectionCount() const { return microseg_conns_.size(); }
+
 private:
+  // A tracked microsegmentation flow: its HTTP parse/rule-key state, plus when
+  // a packet for it was last seen. The timestamp is NOT redundant with the Rust
+  // engine's per-TCB last_seen: a late-bound flow (no SYN ever seen, so no
+  // `tcbs` entry -- see EvictStale) has an entry here and none there, and this
+  // is the only thing that can ever age it out.
+  struct MicrosegEntry {
+    http::ConnectionPtr conn;
+    std::chrono::steady_clock::time_point last_seen;
+  };
+
   static ConnectionID ToConnectionID(const net_flow::SharedConnectionId& id) {
     return ConnectionID{id.local_ip, id.foreign_ip, id.local_port, id.foreign_port};
+  }
+
+  // The reverse-direction ID: local and foreign swapped, exactly how
+  // on_packet_internal derives peer_conn_id from conn_id.
+  static ConnectionID PeerOf(const ConnectionID& id) {
+    return ConnectionID{id.foreign_ip_, id.local_ip_, id.foreign_port_, id.local_port_};
+  }
+
+  void TouchMicroseg(const ConnectionID& id, std::chrono::steady_clock::time_point now) {
+    auto it = microseg_conns_.find(id);
+    if (it != microseg_conns_.end()) {
+      it->second.last_seen = now;
+    }
+  }
+
+  // Shared by HandleClosed (FIN/RST) and EvictStale (idle timeout): run the
+  // WAF's connection-close hook once, then drop both directions' entries.
+  void CloseHttpConn(const ConnectionID& id, const ConnectionID& peer_id) {
+    auto it = http_conns_.find(id);
+    if (it != http_conns_.end()) {
+      it->second->httpFilterManager()->onClose();
+      http_conns_.erase(it);
+    }
+    http_conns_.erase(peer_id);
   }
 
   NetStatus HandleNewConnection(const net_flow::PacketDecision& decision) {
@@ -312,14 +448,7 @@ private:
   }
 
   NetStatus HandleClosed(const net_flow::PacketDecision& decision) {
-    auto id = ToConnectionID(decision.conn_id);
-    auto peer_id = ToConnectionID(decision.peer_conn_id);
-    auto it = http_conns_.find(id);
-    if (it != http_conns_.end()) {
-      it->second->httpFilterManager()->onClose();
-      http_conns_.erase(it);
-    }
-    http_conns_.erase(peer_id);
+    CloseHttpConn(ToConnectionID(decision.conn_id), ToConnectionID(decision.peer_conn_id));
     return NetStatus::OK;
   }
 
@@ -355,7 +484,7 @@ private:
   http::HttpFilterFactory& filter_factory_;
   rust::Box<net_flow::FlowEngine> engine_;
   std::unordered_map<ConnectionID, std::shared_ptr<http::Connection>, ConnectionIDHash> http_conns_;
-  std::unordered_map<ConnectionID, http::ConnectionPtr, ConnectionIDHash> microseg_conns_;
+  std::unordered_map<ConnectionID, MicrosegEntry, ConnectionIDHash> microseg_conns_;
 };
 
 }  // namespace net
