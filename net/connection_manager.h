@@ -107,6 +107,23 @@ public:
     return microseg_conns_.find(ToConnectionID(decision.conn_id)) != microseg_conns_.end();
   }
 
+  // The rule_key stored on the tracked microseg Connection for this decision,
+  // or std::nullopt when no entry exists. Mirrors the old C++'s
+  // `rule_key = tcp_it->second->getRuleKey();` overwrite, which is what made
+  // the *tracked* path's `InputHttpPolicy().find(rule_key)` lookup work at
+  // all: on a tracked flow the caller skips MatchMicroPolicyRule entirely
+  // (see MicrosegTracked above), so its local rule_key is still empty and the
+  // entry's own stored key -- captured when the flow was first tracked -- is
+  // the only authoritative source. DispatchMicroseg deliberately returns only
+  // a Header, so callers that need the key must ask for it here (Task 5).
+  std::optional<std::string> MicrosegRuleKey(const net_flow::PacketDecision& decision) const {
+    auto it = microseg_conns_.find(ToConnectionID(decision.conn_id));
+    if (it == microseg_conns_.end()) {
+      return std::nullopt;
+    }
+    return it->second->getRuleKey();
+  }
+
   // Mirrors the old C++ microseg block's per-kind handling, keyed by
   // ConnectionID instead of a queue-direction-specific TcpFourTupleV4 map.
   // `rule_key` is only consulted for NewConnection/UnknownData (the caller
