@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 #[cxx::bridge(namespace = "net_flow")]
 mod ffi {
     #[derive(Default)]
@@ -22,7 +24,8 @@ mod ffi {
 
     #[derive(Default)]
     struct PacketDecision {
-        /// 0 = Ignore, 1 = NewConnection, 2 = Closed, 3 = Data
+        /// 0 = Ignore, 1 = NewConnection, 2 = Closed, 3 = Data, 4 = Duplicate,
+        /// 5 = UnknownData
         kind: i32,
         conn_id: SharedConnectionId,
         peer_conn_id: SharedConnectionId,
@@ -57,6 +60,8 @@ const KIND_IGNORE: i32 = 0;
 const KIND_NEW_CONNECTION: i32 = 1;
 const KIND_CLOSED: i32 = 2;
 const KIND_DATA: i32 = 3;
+const KIND_DUPLICATE: i32 = 4;
+const KIND_UNKNOWN_DATA: i32 = 5;
 
 impl From<ConnectionId> for ffi::SharedConnectionId {
     fn from(id: ConnectionId) -> Self {
@@ -99,13 +104,15 @@ impl FlowEngine {
     /// duration of this call and does not mutate it concurrently.
     unsafe fn on_packet(&mut self, pkg: *const u8, len: usize) -> ffi::PacketDecision {
         let bytes = std::slice::from_raw_parts(pkg, len);
-        match self.on_packet_internal(bytes) {
+        match self.on_packet_internal(bytes, Instant::now()) {
             None => ffi::PacketDecision { kind: KIND_IGNORE, ..Default::default() },
             Some(d) => {
                 let kind = match d.kind {
                     PacketKind::NewConnection => KIND_NEW_CONNECTION,
                     PacketKind::Closed => KIND_CLOSED,
                     PacketKind::Data => KIND_DATA,
+                    PacketKind::Duplicate => KIND_DUPLICATE,
+                    PacketKind::UnknownData => KIND_UNKNOWN_DATA,
                 };
                 ffi::PacketDecision {
                     kind,
@@ -341,14 +348,15 @@ struct ConnectionId {
     foreign_port: u16,
 }
 
-// `seq` and `server_side` are written but never read -- this mirrors the old
-// C++'s Tcb::seq_/server_side_, which are also write-only. A faithful port,
-// not a bug; kept for parity with the C++ TCB and for future use (e.g. if
-// sequence-number tracking is ever needed).
-#[allow(dead_code)]
+// `server_side` is written but never read -- this mirrors the old C++'s
+// Tcb::server_side_, which is also write-only. A faithful port, not a bug;
+// kept for parity with the C++ TCB and for future use. `seq` and `last_seen`
+// are now genuinely read: `seq` by the duplicate-segment check below, and
+// `last_seen` by Task 2's reaper.
 struct FlowState {
     seq: u32,
     server_side: bool,
+    last_seen: Instant,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -356,6 +364,20 @@ enum PacketKind {
     NewConnection,
     Closed,
     Data,
+    /// A retransmitted/already-seen TCP segment on a tracked flow -- the
+    /// packet's sequence number is behind the flow's tracked seq. Mirrors
+    /// the old C++ microseg code's `tcp_seq < getTcpSeq()` check (plain
+    /// numeric comparison, not RFC 1982 wraparound-safe -- a faithful port
+    /// of the old behavior, not a new design choice; see plan Task 1).
+    Duplicate,
+    /// A non-SYN, non-RST TCP packet on a flow this engine isn't tracking
+    /// (e.g. the daemon attached to a pod after some of its connections
+    /// were already established, so no SYN was ever seen). WAF has no
+    /// recovery path for this and treats it as a no-op. Microsegmentation
+    /// uses it to attempt late-binding: match a policy for this five-tuple
+    /// and, if an HTTP policy applies, start tracking from this packet
+    /// onward -- mirroring the pre-existing C++ microseg behavior exactly.
+    UnknownData,
 }
 
 struct PacketDecision {
@@ -389,7 +411,7 @@ impl FlowEngine {
     /// header and runs the TCB lifecycle state machine exactly as
     /// Tcp::receive does, minus the HTTP-layer calls (Task 7 wires those up
     /// in C++, driven by this method's return value).
-    fn on_packet_internal(&mut self, bytes: &[u8]) -> Option<PacketDecision> {
+    fn on_packet_internal(&mut self, bytes: &[u8], now: Instant) -> Option<PacketDecision> {
         let ip = parse_ipv4_header(bytes)?;
         if ip.protocol != IPPROTO_TCP {
             return None;
@@ -412,7 +434,7 @@ impl FlowEngine {
         let ip_header_len = ip.header_len as u32;
         let payload_offset = (ip.header_len + tcp.header_len) as u32;
 
-        if self.tcbs.contains_key(&id) {
+        if let Some(state) = self.tcbs.get(&id) {
             if tcp.fin || tcp.rst {
                 self.tcbs.remove(&id);
                 self.tcbs.remove(&peer_id);
@@ -425,6 +447,25 @@ impl FlowEngine {
                     payload_offset: 0,
                 });
             }
+            if tcp.seq < state.seq {
+                // Duplicate/retransmitted segment -- do not advance tracked
+                // seq, do not update last_seen (an entry that only ever
+                // receives retransmits of old data is not "active" for
+                // reaper purposes; this mirrors treating it as if this
+                // packet never fully arrived).
+                return Some(PacketDecision {
+                    kind: PacketKind::Duplicate,
+                    conn_id: id,
+                    peer_conn_id: peer_id,
+                    peer_is_new: false,
+                    ip_header_len,
+                    payload_offset,
+                });
+            }
+            let payload_len = (bytes.len() - payload_offset as usize) as u32;
+            let state = self.tcbs.get_mut(&id).expect("checked above");
+            state.seq = tcp.seq.wrapping_add(payload_len);
+            state.last_seen = now;
             return Some(PacketDecision {
                 kind: PacketKind::Data,
                 conn_id: id,
@@ -437,13 +478,18 @@ impl FlowEngine {
 
         // Unknown flow.
         if tcp.rst {
-            return None; // mirrors: log + return OK, no state change
+            return None; // unchanged from Phase 5 -- deliberately NOT
+                          // extended to UnknownData; see plan's Global
+                          // Constraints for why.
         }
         if tcp.syn {
-            self.tcbs.insert(id, FlowState { seq: tcp.seq.wrapping_add(1), server_side: true });
+            self.tcbs.insert(
+                id,
+                FlowState { seq: tcp.seq.wrapping_add(1), server_side: true, last_seen: now },
+            );
             let peer_is_new = !self.tcbs.contains_key(&peer_id);
             if peer_is_new {
-                self.tcbs.insert(peer_id, FlowState { seq: 0, server_side: false });
+                self.tcbs.insert(peer_id, FlowState { seq: 0, server_side: false, last_seen: now });
             }
             return Some(PacketDecision {
                 kind: PacketKind::NewConnection,
@@ -454,10 +500,20 @@ impl FlowEngine {
                 payload_offset: 0,
             });
         }
-        // Neither RST nor SYN on an unknown flow (e.g. a bare ACK arriving
-        // before we saw the SYN) -- no-op, mirrors the commented-out ACK
-        // branch in the current C++.
-        None
+        // Neither RST nor SYN on an unknown flow -- previously a silent
+        // no-op (returned None); now an explicit UnknownData decision so
+        // microseg's late-binding recovery can use it. ip_header_len/
+        // payload_offset ARE populated here (unlike NewConnection/Closed)
+        // because microseg needs them to extract the payload for its
+        // onData() call.
+        Some(PacketDecision {
+            kind: PacketKind::UnknownData,
+            conn_id: id,
+            peer_conn_id: peer_id,
+            peer_is_new: false,
+            ip_header_len,
+            payload_offset,
+        })
     }
 
     fn live_connection_count(&self) -> usize {
@@ -523,9 +579,10 @@ mod flow_engine_tests {
     #[test]
     fn syn_creates_new_connection_and_peer() {
         let mut engine = FlowEngine::new();
+        let now = Instant::now();
         let ip = ipv4_header(6, [10, 0, 0, 1], [10, 0, 0, 2]);
         let tcp = tcp_segment(1234, 80, 1000, true, false, false, &[]);
-        let decision = engine.on_packet_internal(&packet(ip, tcp)).expect("should decide");
+        let decision = engine.on_packet_internal(&packet(ip, tcp), now).expect("should decide");
         assert_eq!(decision.kind, PacketKind::NewConnection);
         assert!(decision.peer_is_new);
         assert_eq!(engine.live_connection_count(), 2); // both directions tracked
@@ -544,25 +601,29 @@ mod flow_engine_tests {
         // NewConnection. This was verified by hand-tracing net/tcp.cc's
         // ConnectionID field mapping, not assumed.
         let mut engine = FlowEngine::new();
+        let now = Instant::now();
         let ip_fwd = ipv4_header(6, [10, 0, 0, 1], [10, 0, 0, 2]);
         let tcp_fwd = tcp_segment(1234, 80, 1000, true, false, false, &[]);
-        engine.on_packet_internal(&packet(ip_fwd, tcp_fwd)).unwrap();
+        engine.on_packet_internal(&packet(ip_fwd, tcp_fwd), now).unwrap();
 
         let ip_rev = ipv4_header(6, [10, 0, 0, 2], [10, 0, 0, 1]);
         let tcp_rev = tcp_segment(80, 1234, 2000, true, false, false, &[]);
-        let decision = engine.on_packet_internal(&packet(ip_rev, tcp_rev)).expect("should decide");
+        let decision =
+            engine.on_packet_internal(&packet(ip_rev, tcp_rev), now).expect("should decide");
         assert_eq!(decision.kind, PacketKind::Data);
     }
 
     #[test]
     fn data_packet_on_established_flow_reports_payload_offset() {
         let mut engine = FlowEngine::new();
+        let now = Instant::now();
         let ip = ipv4_header(6, [10, 0, 0, 1], [10, 0, 0, 2]);
         let tcp_syn = tcp_segment(1234, 80, 1000, true, false, false, &[]);
-        engine.on_packet_internal(&packet(ip.clone(), tcp_syn)).unwrap();
+        engine.on_packet_internal(&packet(ip.clone(), tcp_syn), now).unwrap();
 
         let tcp_data = tcp_segment(1234, 80, 1001, false, false, false, b"hello");
-        let decision = engine.on_packet_internal(&packet(ip, tcp_data)).expect("should decide");
+        let decision =
+            engine.on_packet_internal(&packet(ip, tcp_data), now).expect("should decide");
         assert_eq!(decision.kind, PacketKind::Data);
         assert_eq!(decision.ip_header_len, 20);
         assert_eq!(decision.payload_offset, 40); // 20-byte IP + 20-byte TCP header
@@ -571,13 +632,14 @@ mod flow_engine_tests {
     #[test]
     fn fin_closes_both_directions() {
         let mut engine = FlowEngine::new();
+        let now = Instant::now();
         let ip = ipv4_header(6, [10, 0, 0, 1], [10, 0, 0, 2]);
         let tcp_syn = tcp_segment(1234, 80, 1000, true, false, false, &[]);
-        engine.on_packet_internal(&packet(ip.clone(), tcp_syn)).unwrap();
+        engine.on_packet_internal(&packet(ip.clone(), tcp_syn), now).unwrap();
         assert_eq!(engine.live_connection_count(), 2);
 
         let tcp_fin = tcp_segment(1234, 80, 1001, false, true, false, &[]);
-        let decision = engine.on_packet_internal(&packet(ip, tcp_fin)).expect("should decide");
+        let decision = engine.on_packet_internal(&packet(ip, tcp_fin), now).expect("should decide");
         assert_eq!(decision.kind, PacketKind::Closed);
         assert_eq!(engine.live_connection_count(), 0);
     }
@@ -585,34 +647,108 @@ mod flow_engine_tests {
     #[test]
     fn rst_on_unknown_flow_is_ignored() {
         let mut engine = FlowEngine::new();
+        let now = Instant::now();
         let ip = ipv4_header(6, [10, 0, 0, 1], [10, 0, 0, 2]);
         let tcp_rst = tcp_segment(1234, 80, 1000, false, false, true, &[]);
-        assert!(engine.on_packet_internal(&packet(ip, tcp_rst)).is_none());
+        assert!(engine.on_packet_internal(&packet(ip, tcp_rst), now).is_none());
         assert_eq!(engine.live_connection_count(), 0);
     }
 
     #[test]
-    fn ack_on_unknown_flow_is_ignored() {
+    fn rst_on_unknown_flow_is_still_ignored_not_unknown_data() {
+        // Deliberate, documented narrowing from the old C++ (see plan's Global
+        // Constraints) -- RST on an unknown flow stays a no-op, not UnknownData.
         let mut engine = FlowEngine::new();
+        let now = Instant::now();
+        let ip = ipv4_header(6, [10, 0, 0, 1], [10, 0, 0, 2]);
+        let tcp_rst = tcp_segment(1234, 80, 1000, false, false, true, &[]);
+        assert!(engine.on_packet_internal(&packet(ip, tcp_rst), now).is_none());
+    }
+
+    #[test]
+    fn ack_on_unknown_flow_is_unknown_data() {
+        // Behavior change from this task: a bare ACK (non-SYN, non-RST) on a
+        // flow this engine never saw a SYN for used to be a silent None; it's
+        // now an explicit UnknownData decision (see PacketKind::UnknownData
+        // doc comment) so microseg's late-binding recovery can use it. WAF's
+        // behavior is unchanged -- it still treats this as a no-op.
+        let mut engine = FlowEngine::new();
+        let now = Instant::now();
         let ip = ipv4_header(6, [10, 0, 0, 1], [10, 0, 0, 2]);
         let tcp_ack = tcp_segment(1234, 80, 1000, false, false, false, &[]);
-        assert!(engine.on_packet_internal(&packet(ip, tcp_ack)).is_none());
+        let decision =
+            engine.on_packet_internal(&packet(ip, tcp_ack), now).expect("should decide");
+        assert_eq!(decision.kind, PacketKind::UnknownData);
         assert_eq!(engine.live_connection_count(), 0);
+    }
+
+    #[test]
+    fn duplicate_segment_is_recognized_and_does_not_regress_tracked_seq() {
+        let mut engine = FlowEngine::new();
+        let now = Instant::now();
+        let ip = ipv4_header(6, [10, 0, 0, 1], [10, 0, 0, 2]);
+
+        let tcp_syn = tcp_segment(1234, 80, 1000, true, false, false, &[]);
+        let d1 = engine.on_packet_internal(&packet(ip.clone(), tcp_syn), now).expect("syn decision");
+        assert_eq!(d1.kind, PacketKind::NewConnection);
+
+        // First data segment: seq 1001, 10 bytes of payload.
+        let tcp_data1 = tcp_segment(1234, 80, 1001, false, false, false, b"0123456789");
+        let d2 = engine
+            .on_packet_internal(&packet(ip.clone(), tcp_data1.clone()), now)
+            .expect("data decision");
+        assert_eq!(d2.kind, PacketKind::Data);
+
+        // Replay the SAME segment (retransmission) -- must be recognized as
+        // Duplicate, and must NOT advance the tracked seq past what data1
+        // already advanced it to.
+        let d3 = engine
+            .on_packet_internal(&packet(ip.clone(), tcp_data1), now)
+            .expect("duplicate decision");
+        assert_eq!(d3.kind, PacketKind::Duplicate);
+
+        // A genuinely new segment continuing from where data1 left off must
+        // still be accepted as Data (proves the duplicate check didn't
+        // corrupt tracked state).
+        let tcp_data2 = tcp_segment(1234, 80, 1011, false, false, false, b"abcde");
+        let d4 = engine
+            .on_packet_internal(&packet(ip, tcp_data2), now)
+            .expect("second data decision");
+        assert_eq!(d4.kind, PacketKind::Data);
+    }
+
+    #[test]
+    fn non_syn_non_rst_on_unknown_flow_returns_unknown_data() {
+        let mut engine = FlowEngine::new();
+        let now = Instant::now();
+
+        // A bare data/ACK packet with no prior SYN ever seen for this flow.
+        let ip = ipv4_header(6, [10, 0, 0, 1], [10, 0, 0, 2]);
+        let tcp = tcp_segment(1234, 80, 5000, false, false, false, b"GET / HTTP/1.1\r\n");
+        let decision = engine
+            .on_packet_internal(&packet(ip, tcp), now)
+            .expect("unknown-data decision");
+        assert_eq!(decision.kind, PacketKind::UnknownData);
+        // payload_offset/ip_header_len must still be populated -- microseg's
+        // late-binding path needs them to extract the payload.
+        assert!(decision.payload_offset > 0);
     }
 
     #[test]
     fn non_tcp_protocol_is_ignored() {
         let mut engine = FlowEngine::new();
+        let now = Instant::now();
         let ip = ipv4_header(1 /* ICMP */, [10, 0, 0, 1], [10, 0, 0, 2]);
-        assert!(engine.on_packet_internal(&ip).is_none());
+        assert!(engine.on_packet_internal(&ip, now).is_none());
     }
 
     #[test]
     fn connection_strings_reports_both_directions() {
         let mut engine = FlowEngine::new();
+        let now = Instant::now();
         let ip = ipv4_header(6, [10, 0, 0, 1], [10, 0, 0, 2]);
         let tcp = tcp_segment(1234, 80, 1000, true, false, false, &[]);
-        engine.on_packet_internal(&packet(ip, tcp)).unwrap();
+        engine.on_packet_internal(&packet(ip, tcp), now).unwrap();
         let mut conns = engine.connection_strings();
         conns.sort();
         assert_eq!(conns, vec!["10.0.0.1:1234,10.0.0.2:80", "10.0.0.2:80,10.0.0.1:1234"]);
