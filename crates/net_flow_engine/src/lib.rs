@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[cxx::bridge(namespace = "net_flow")]
 mod ffi {
@@ -51,6 +51,7 @@ mod ffi {
         unsafe fn on_packet(self: &mut FlowEngine, pkg: *const u8, len: usize) -> PacketDecision;
         fn live_connection_count(self: &FlowEngine) -> usize;
         fn connection_strings(self: &FlowEngine) -> Vec<String>;
+        fn evict_stale_connections(self: &mut FlowEngine) -> Vec<SharedConnectionId>;
 
         unsafe fn parse_five_tuple(pkg: *const u8, len: usize) -> SharedFiveTuple;
     }
@@ -538,7 +539,43 @@ impl FlowEngine {
             })
             .collect()
     }
+
+    /// Removes TCB entries whose `last_seen` is at least `timeout` behind
+    /// `now`, returning the IDs removed. Note a peer entry is evicted
+    /// independently by its OWN `last_seen`, not automatically alongside its
+    /// counterpart, since each side of a flow accrues activity independently
+    /// (e.g. a long-lived one-directional stream).
+    fn evict_stale(&mut self, now: Instant, timeout: Duration) -> Vec<ConnectionId> {
+        let stale: Vec<ConnectionId> = self
+            .tcbs
+            .iter()
+            .filter(|(_, state)| now.duration_since(state.last_seen) >= timeout)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in &stale {
+            self.tcbs.remove(id);
+        }
+        stale
+    }
+
+    /// # Safety: none -- no raw pointers, safe to call directly (unlike
+    /// on_packet/parse_five_tuple).
+    fn evict_stale_connections(&mut self) -> Vec<ffi::SharedConnectionId> {
+        self.evict_stale(Instant::now(), STALE_CONNECTION_TIMEOUT)
+            .into_iter()
+            .map(Into::into)
+            .collect()
+    }
 }
+
+/// Sweep interval and entry timeout are independent: the timeout is how old
+/// an entry must be to be evicted; the caller (Task 6, C++) decides how
+/// often to call this. 5 minutes: this tracker exists only to reconstruct
+/// in-flight HTTP headers for policy matching, not general connection
+/// tracking -- real HTTP client/server idle timeouts are typically tens of
+/// seconds to low minutes, so this gives comfortable slack. Tune via this
+/// constant if it proves wrong in practice, not via a design change.
+const STALE_CONNECTION_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[cfg(test)]
 mod flow_engine_tests {
@@ -752,6 +789,53 @@ mod flow_engine_tests {
         let mut conns = engine.connection_strings();
         conns.sort();
         assert_eq!(conns, vec!["10.0.0.1:1234,10.0.0.2:80", "10.0.0.2:80,10.0.0.1:1234"]);
+    }
+
+    #[test]
+    fn evict_stale_removes_only_entries_past_the_timeout() {
+        let mut engine = FlowEngine::new();
+        let t0 = Instant::now();
+
+        // Flow A: will go stale.
+        let ip_a = ipv4_header(6, [10, 0, 0, 1], [10, 0, 0, 2]);
+        let tcp_a = tcp_segment(1234, 80, 1000, true, false, false, &[]);
+        engine.on_packet_internal(&packet(ip_a, tcp_a), t0).unwrap();
+
+        // Flow B: a different five-tuple (different src IP/port), created
+        // 400s after flow A. Stays fresh relative to t2 below.
+        let t1 = t0 + Duration::from_secs(400);
+        let ip_b = ipv4_header(6, [10, 0, 0, 3], [10, 0, 0, 4]);
+        let tcp_b = tcp_segment(5555, 80, 2000, true, false, false, &[]);
+        engine.on_packet_internal(&packet(ip_b, tcp_b), t1).unwrap();
+
+        assert_eq!(engine.live_connection_count(), 4); // both directions of A and B
+
+        // t2 is 600s after t0 (flow A stale under a 300s timeout: 600s >=
+        // 300s) but only 200s after t1 (flow B fresh: 200s < 300s).
+        let t2 = t0 + Duration::from_secs(600);
+        let evicted = engine.evict_stale(t2, Duration::from_secs(300));
+
+        assert_eq!(evicted.len(), 2); // both directions of flow A only
+        assert_eq!(engine.live_connection_count(), 2); // only flow B (both directions) survives
+
+        let mut conns = engine.connection_strings();
+        conns.sort();
+        assert_eq!(conns, vec!["10.0.0.3:5555,10.0.0.4:80", "10.0.0.4:80,10.0.0.3:5555"]);
+    }
+
+    #[test]
+    fn evict_stale_returns_both_sides_of_an_evicted_flow() {
+        let mut engine = FlowEngine::new();
+        let t0 = Instant::now();
+        let ip = ipv4_header(6, [10, 0, 0, 1], [10, 0, 0, 2]);
+        let tcp = tcp_segment(1234, 80, 1000, true, false, false, &[]);
+        let decision = engine.on_packet_internal(&packet(ip, tcp), t0).unwrap();
+
+        let evicted = engine.evict_stale(t0 + Duration::from_secs(9999), Duration::from_secs(300));
+        // Both conn_id and peer_conn_id should be gone.
+        assert!(evicted.contains(&decision.conn_id));
+        assert!(evicted.contains(&decision.peer_conn_id));
+        assert_eq!(engine.live_connection_count(), 0);
     }
 }
 
