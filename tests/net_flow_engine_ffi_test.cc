@@ -199,6 +199,15 @@ TEST(ConnectionManagerCutoverTest, HandleDataPassesTcpHeaderStartNotIpHeaderStar
 
   const std::string payload = "GET /x";
   auto data_pkt = DataPacket(/*syn=*/false, payload);
+  // DataPacket() defaults its TCP sequence number to 0, same as the SYN
+  // packet above -- which would make the engine treat this as a
+  // retransmission of the SYN (Duplicate, kind 4) rather than the next
+  // segment (Data, kind 3), per Task 1's duplicate-segment detection. The
+  // SYN consumes sequence number 0, so the next real segment must carry
+  // seq=1. TCP sequence number is at byte offset 24 (20-byte IP header + 4
+  // bytes into the TCP header).
+  uint32_t seq_be = htonl(1);
+  std::memcpy(data_pkt.data() + 24, &seq_be, sizeof(seq_be));
   // Deliberately not asserting on the return value here: HandleData's final
   // OK-vs-Drop result additionally depends on http::Connection::processData's
   // llhttp-based HTTP detection for these arbitrary bytes, which is unrelated
@@ -420,6 +429,34 @@ TEST(ConnectionManagerMicrosegTest, UntrackedFlowReportsNotTracked) {
   auto data = DataPacket(/*syn=*/false, "irrelevant");
   auto result = mgr.receive(data.data(), data.size(), /*track_tcp=*/true);
   EXPECT_FALSE(mgr.MicrosegTracked(result.decision));
+}
+
+// Direct coverage for DispatchMicroseg's case 5 (UnknownData) -- the
+// late-binding path this plan's own drafting history flagged as previously
+// bug-prone (a double-dispatch-call risk caught and fixed before Task 4 was
+// even written; see the case 1 vs case 5 split's comments in
+// net/connection_manager.h). Unlike NewConnectionThenDataProducesHeaderWhenTracked
+// above (which reaches case 1 then case 3 via a SYN followed by a Data
+// packet), this test sends a data packet with NO prior SYN, so
+// net_flow_engine's on_packet_internal has never seen this flow and returns
+// kind 5 (UnknownData) -- and DispatchMicroseg's case 5 must do BOTH the
+// first-sight insert AND the HTTP header extraction in that single call.
+TEST(ConnectionManagerMicrosegTest, UnknownDataLateBindsAndExtractsHeaderInOneCall) {
+  http::HttpFilterFactory factory;
+  net::ConnectionManager mgr(factory);
+
+  auto data = DataPacket(/*syn=*/false, "GET /x HTTP/1.1\r\nHost: example.com\r\n\r\n");
+  auto result = mgr.receive(data.data(), data.size(), /*track_tcp=*/true);
+  ASSERT_EQ(result.decision.kind, 5);  // UnknownData
+  EXPECT_FALSE(mgr.MicrosegTracked(result.decision));  // not tracked yet
+
+  auto header = mgr.DispatchMicroseg(result.decision, data.data(), data.size(), "some-rule-key");
+  ASSERT_TRUE(header.has_value());
+  EXPECT_EQ(header->host_, "example.com");
+
+  // The single DispatchMicroseg call above must have both inserted the
+  // entry AND extracted the header -- no second call was made.
+  EXPECT_TRUE(mgr.MicrosegTracked(result.decision));
 }
 
 TEST(NetFlowEngineFfiTest, EvictStaleConnectionsIsCallableAndReturnsEmptyForFreshFlows) {
