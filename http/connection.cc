@@ -18,20 +18,23 @@
 
 namespace http {
 
-// Connection::Connection(std::string key)
-//     : ruleKey_(key), header_(), packet_(),
-//       filters_manager_(std::make_unique<HttpFilterManager>()) {
-//   inspector_ = std::make_unique<HttpInspector>();
-//   tcpSeq_ = 0;
-//   LOG(INFO) << "new connection : " << key;
-// }
-
 Connection::Connection(bool serverSide, HttpFilterManagerPtr filterManager)
     : header_(), packet_(), filters_manager_(filterManager), server_side_(serverSide) {
   inspector_ = std::make_unique<HttpInspector>();
 }
 
-Connection::Connection(std::string key) : header_(), packet_(), server_side_(false) {
+// Microseg-style constructor: no HttpFilterManager is supplied by the caller
+// (microsegmentation has no per-pod HttpFilterFactory/filter chain the way
+// WAF's Connection(bool, HttpFilterManagerPtr) does), so this must construct
+// its own default HttpFilterManager rather than leave filters_manager_ null.
+// Without this, createCodec() below still copies the (null) filters_manager_
+// into the new http1/http2 ConnectionImpl, and the first onHeadersComplete()
+// dereferences it -- a guaranteed null-pointer crash the moment onData()
+// completes an HTTP header parse. rule_key_ likewise must be set from `key`;
+// it was previously dropped on the floor, silently breaking getRuleKey().
+Connection::Connection(std::string key)
+    : rule_key_(std::move(key)), header_(), packet_(),
+      filters_manager_(std::make_shared<HttpFilterManager>()), server_side_(false) {
   inspector_ = std::make_unique<HttpInspector>();
 }
 

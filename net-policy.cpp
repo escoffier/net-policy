@@ -28,6 +28,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <sys/timerfd.h>
 #include <sys/un.h>
 #include <unistd.h>
 #include <gflags/gflags.h>
@@ -550,18 +551,14 @@ static int rst_tcp_link(unsigned char* pkg) {
 
 static int input_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct nfq_data* nfa,
                         void* argv) {
-  bool found = false;
-  int id = 0, offset;
+  int id = 0;
   uint32_t mark;
   FLOW_DIR dir = FlowDir::kIngress;
   std::string rule_key;
   FiveTuple tuple;
-  struct tcphdr tcphdr;
-  TCP_FOUR_TUPLE_V4 ct_key;
   NET_POLICY_RULE rule_ret;
   struct nfqnl_msg_packet_hdr* ph;
-  unsigned char *pkg, *value = nullptr;
-  std::map<TCP_FOUR_TUPLE_V4, http::ConnectionPtr>::iterator tcp_it;
+  unsigned char* pkg;
   NFQ_RES_INFO* nfq_res = (NFQ_RES_INFO*)argv;
   DaemonContext* daemon = nfq_res->daemon_;
 
@@ -585,13 +582,22 @@ static int input_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct 
   if (data_len < (int)sizeof(struct iphdr))
     return nfq_set_verdict(qh, id, NF_ACCEPT, 0, NULL);
 
-  // WafEnabled() is passed as `track_tcp`: the five-tuple parse below is
-  // unconditional (L3-L4 policy matching needs it on every packet), but the
-  // Rust engine's TCB tracking stays behind the same WAF gate it was behind
-  // before this phase -- FlowEngine has no reaper, so tracking with the WAF
-  // off would leak TCB entries in the default deployment.
+  // `track_tcp` is now unconditionally true. Until this phase it was
+  // WafEnabled(), because the WAF was the only consumer of the TCB state
+  // machine and FlowEngine had no reaper -- tracking with the WAF off (the
+  // default, waf_enable_ = false) would have grown the TCB table without
+  // bound. Both halves of that rationale are gone: microsegmentation's
+  // per-connection HTTP tracking is now driven by the same decision (see the
+  // TCP block below), so leaving the gate in place would have silently
+  // disabled L7 microsegmentation policy in every WAF-off deployment -- a
+  // functional regression, not a carried-forward constraint, since the
+  // hand-rolled state machine this phase retires ran regardless of the WAF.
+  // Unbounded growth is instead handled by FlowEngine's timeout reaper (added
+  // earlier in this phase; wired to a timerfd on the epoll loop by the task
+  // that follows this one). Note DispatchWaf below is still WAF-gated, so the
+  // WAF's own behavior is unchanged either way.
   auto result = daemon->ConnMgr().receive(reinterpret_cast<const uint8_t*>(pkg), data_len,
-                                          daemon->WafEnabled());
+                                          /*track_tcp=*/true);
   if (!result.tuple.recognized) {
     // Replaces parse_package's failure path (`ret != kNfMatchRule` -> NF_ACCEPT).
     // The old code issued that verdict WITHOUT returning; the switch below then
@@ -610,41 +616,9 @@ static int input_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct 
   tuple.src_addr_     = net::ipv4ToString(result.tuple.src_addr);
   tuple.dst_addr_     = net::ipv4ToString(result.tuple.dst_addr);
 
-  // Reconstruct offset/tcphdr for the downstream microseg TCP-tracking block,
-  // which is out of scope for this phase and still reads both. Mirrors
-  // parse_package's old arithmetic exactly; result.tuple.ip_header_len is the
-  // one extra fact the new parse exposes to make this possible without a
-  // second full parse pass.
-  //
-  // This memcpy is bounds-safe in a way parse_package's old direct
-  // `(struct tcphdr*)(pkg + iph->ihl * 4)` cast was not: parse_five_tuple only
-  // reports recognized==true for TCP after confirming the buffer holds a full
-  // IP header plus a full TCP header (and the equivalent 8-byte check for UDP),
-  // whereas parse_package dereferenced tcph/udph with no bounds check beyond
-  // the caller's initial sizeof(struct iphdr) guard.
-  //
-  // That is a genuine memory-safety improvement, but it is NOT purely a
-  // strengthening: it also changes behavior for malformed/truncated packets.
-  // parse_package would read out of bounds and carry on with garbage ports,
-  // still reaching MatchMicroPolicyRule -- which could NF_DROP the packet.
-  // parse_five_tuple reports recognized==false for those same packets, so the
-  // early return above short-circuits to NF_ACCEPT before any policy check
-  // runs. A runt that a DENY-by-CIDR rule previously dropped (accidentally,
-  // off garbage data) is now accepted -- a fail-open change confined to the
-  // malformed-packet case. Practical reachability is low (NFQ is configured
-  // for full packet copies and conntrack defragments upstream). Behavior on
-  // well-formed traffic is unchanged.
-  offset = static_cast<int>(result.tuple.ip_header_len);
-  if (tuple.proto_ == IPPROTO_TCP) {
-    memcpy(&tcphdr, pkg + result.tuple.ip_header_len, sizeof(tcphdr));
-    offset += tcphdr.doff << 2;
-  } else if (tuple.proto_ == IPPROTO_UDP) {
-    offset += sizeof(struct udphdr);
-  }
-  // ICMP: offset stays at ip_header_len, matching parse_package.
   /*print debug log*/
-  // LOG_V("input receive %s, mark : %d, seq: %u, tot len : %d, %s:%u -> %s:%u, memory : %p ",
-  // GetProtoString(tuple.proto_), mark, ntohl(tcphdr.seq), tuple.tot_len_, tuple.src_addr_.c_str(),
+  // LOG_V("input receive %s, mark : %d, tot len : %d, %s:%u -> %s:%u, memory : %p ",
+  // GetProtoString(tuple.proto_), mark, tuple.tot_len_, tuple.src_addr_.c_str(),
   // tuple.src_port_, tuple.dst_addr_.c_str(), tuple.dst_port_, argv); LOG_D("input receive data: %p",
   // pkg);
   if (daemon->WafEnabled() && result.is_tcp) {
@@ -654,59 +628,161 @@ static int input_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct 
       return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllowReq), data_len, pkg);
     }
   }
-  /*tcp four tuple*/
-  ct_key.dst_port_ = tuple.dst_port_;
-  ct_key.src_port_ = tuple.src_port_;
-  ct_key.dst_addr_ = tuple.dst_addr_u32_;
-  ct_key.src_addr_ = tuple.src_addr_u32_;
-  /*tcp protocol*/
-  switch (tuple.proto_) {
-  case IPPROTO_TCP:
-    /*query conntrack info*/
-    tcp_it = daemon->Microseg().TcpCtInput().find(ct_key);
-    if (tcp_it == daemon->Microseg().TcpCtInput().end()) {
-      /*tcp syn*/
-      if (tcphdr.syn != 0)
-        break;
-      /*tcp ack*/
-      if (data_len <= offset)
-        return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllowReq), 0, NULL);
-      /*break*/
-      break;
-    }
-    /*tcp tuple exist*/
-    found = true;
-    /*tcp fin*/
-    if ((tcphdr.fin == 1) || (tcphdr.rst == 1)) {
-      daemon->Microseg().TcpCtInput().erase(ct_key);
-      /*print debug log*/
-      LOG_D("microseg-dp input data, delete conntrack info, src: %s:%d, dest : %s:%d",
-            tuple.src_addr_.c_str(), tuple.src_port_, tuple.dst_addr_.c_str(), tuple.dst_port_);
-      /*return*/
+
+  if ((tuple.proto_ == IPPROTO_UDP) || (tuple.proto_ == IPPROTO_ICMP)) {
+    // Unchanged from before this phase: UDP/ICMP never enter TCB dispatch.
+    // The old code routed them through the same shared `if (!found)` block the
+    // TCP path used, but that block's http-rule condition was hard-wired true
+    // for them (`... || proto == IPPROTO_UDP || proto == IPPROTO_ICMP || ...`),
+    // so a UDP/ICMP packet always returned from inside it and could never
+    // reach the TCP-only tail below. Hoisting them here is a pure
+    // restructuring, verdict-for-verdict identical.
+    rule_ret = MatchMicroPolicyRule(tuple, dir, rule_key, *daemon);
+    if (rule_ret == NetPolicyRule::kDefault)
       return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllow), 0, NULL);
+    daemon->PostSrv().SendMatchMsg(tuple, rule_ret, dir, rule_key);
+    if (rule_ret == NetPolicyRule::kDeny) {
+      LOG_D("input drop %s %s:%u -> %s:%u ", GetProtoString(tuple.proto_), tuple.src_addr_.c_str(),
+            tuple.src_port_, tuple.dst_addr_.c_str(), tuple.dst_port_);
+      return nfq_set_verdict(qh, id, NF_DROP, 0, NULL);
     }
-    /*tcp ack*/
-    if (data_len <= offset)
-      return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllowReq), 0, NULL);
-    /*break*/
-    break;
-  case IPPROTO_UDP:
-  case IPPROTO_ICMP:
-    break;
-  default:
+    return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllow), 0, NULL);
+  }
+  if (tuple.proto_ != IPPROTO_TCP) {
+    // Unreachable in practice (parse_five_tuple only reports recognized==true
+    // for TCP/UDP/ICMP), kept as the old switch's `default:` behavior.
     return nfq_set_verdict(qh, id, NF_ACCEPT, 0, NULL);
   }
-  /*query tcp conntrack result*/
-  if (!found) {
+
+  // ---- TCP from here on. -------------------------------------------------
+  // `result.decision.kind` classifies this packet (0 Ignore / 1 NewConnection /
+  // 2 Closed / 3 Data / 4 Duplicate / 5 UnknownData), replacing the retired
+  // hand-rolled SYN/FIN/RST/sequence-number detection.
+  //
+  // IMPORTANT: DispatchMicroseg is called EXACTLY ONCE per packet. There are
+  // exactly two call sites below and no execution path reaches both:
+  //   (a) MicrosegClose(), for Closed (kind 2) packets only -- called
+  //       unconditionally below, before the tracked/untracked split, and a
+  //       no-op for every other kind,
+  //   (b) the single shared call at the bottom, reached by everything else.
+  // A kind-2 packet can never reach (b): if this direction is tracked it
+  // returns from the Closed branch below, and if it is not, it returns at
+  // `!syn && !has_payload` (payload_offset is not populated for kind 2, so
+  // has_payload is false) or, for a nonsensical SYN+FIN, from the untracked
+  // SYN branch. SYN handling does not use DispatchMicroseg at all -- it calls
+  // MicrosegTrack (a pure insert, never onData) and returns, because a SYN
+  // carries no payload worth inspecting. In particular kind 5 (UnknownData)
+  // must not be dispatched in the untracked branch and again at the bottom:
+  // case 5 does both the late-binding insert and the extraction in one call,
+  // so a second call would run onData() twice over the same bytes. An early
+  // draft of this phase's plan had exactly that bug.
+  const auto& decision = result.decision;
+  const bool tracked   = daemon->ConnMgr().MicrosegTracked(decision);
+  // Tell the reaper this flow is still alive. Must happen here, before any of
+  // the early returns below, not down at the DispatchMicroseg call: a live
+  // connection can go minutes between payload-bearing packets while still
+  // exchanging ACKs (which return early at `!has_payload`), and its microseg
+  // entry -- rule_key and half-parsed request alike -- must not age out from
+  // under it. Purely a timestamp refresh: never inserts, so it cannot change
+  // `tracked` above, and it is a no-op for kinds 0 and 4 (see MicrosegTouch).
+  daemon->ConnMgr().MicrosegTouch(decision);
+  // Replaces the old `data_len <= offset` payload-presence test, which gated
+  // TWO of the old function's return points (one per found/!found branch) and
+  // is why a bare ACK never reached policy matching or HTTP extraction.
+  // payload_offset is only populated for kinds 3/4/5; kinds 1/2 are classified
+  // by their flags before payload presence can matter.
+  const bool has_payload = ((decision.kind == 3) || (decision.kind == 4) || (decision.kind == 5)) &&
+                           (data_len > static_cast<int>(decision.payload_offset));
+  // Reconstructs the old `tcphdr.syn != 0` / `tcphdr.syn == 1` tests. It must
+  // be the raw flag, NOT `kind == 1`: NewConnection additionally requires the
+  // flow to be absent from the TCB table, so a SYN-ACK arrives as kind 3 and a
+  // SYN retransmission as kind 4 (see PacketDecision::syn). Testing kind here
+  // would let both escape policy matching entirely -- under a DENY rule the
+  // first SYN would be dropped but its retransmit accepted, completing the
+  // handshake the rule was meant to block.
+  const bool syn = decision.syn;
+
+  if (decision.kind == 0) {
+    // Ignore. For a recognized TCP packet this now means exactly one thing: a
+    // RST on a flow the TCB tracker never saw a SYN for (on_packet_internal
+    // returns None for it -- the documented narrowing in this phase's plan;
+    // it is deliberately NOT promoted to UnknownData). The old code treated
+    // such a packet as payload-less and accepted it with kAllowReq without
+    // running any policy match, which is what this reproduces. The one
+    // difference: if that flow had been late-bound into microseg's map, the
+    // old code would also have erased its entry here. See this task's report.
+    return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllowReq), 0, NULL);
+  }
+
+  // Closed (FIN/RST): tear down BOTH directions' microsegmentation entries
+  // here, ABOVE the tracked/untracked split -- not from inside the `tracked`
+  // branch, where this call used to live. The engine drops both directions'
+  // TCB entries on the first FIN/RST it sees regardless of which direction
+  // carried it, so this Closed decision routinely arrives on the direction
+  // that has no microseg entry of its own (an L7 policy is usually written
+  // for one direction only), and gating teardown on `tracked` left the other
+  // direction's entry stale until the reaper. See
+  // ConnectionManager::MicrosegClose for the full rationale and the 4-tuple-
+  // reuse failure mode it prevents. A no-op for every non-Closed kind, and it
+  // never changes any packet's verdict -- both branches below still return
+  // exactly what they returned before.
+  daemon->ConnMgr().MicrosegClose(decision, reinterpret_cast<const uint8_t*>(pkg), data_len);
+
+  if (tracked) {
+    // Old `found == true` branch, in the same order it tested things.
+    if (decision.kind == 2) {  // Closed: the old `fin == 1 || rst == 1` test.
+      // Teardown already done unconditionally above.
+      LOG_D("microseg-dp input data, delete conntrack info, src: %s:%d, dest : %s:%d",
+            tuple.src_addr_.c_str(), tuple.src_port_, tuple.dst_addr_.c_str(), tuple.dst_port_);
+      return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllow), 0, NULL);
+    }
+    if (!has_payload) {
+      // Old: `found`, not FIN/RST, `data_len <= offset` -- a bare ACK. Note
+      // the old code's found-path payload test had NO SYN exemption (unlike
+      // its !found path, where the SYN test came first), so a payload-less
+      // SYN on a tracked flow returns here; `syn` is deliberately not
+      // consulted.
+      return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllowReq), 0, NULL);
+    }
+    if (syn) {
+      // Old L726's `if (tcphdr.syn == 1)`, reachable in the found path only
+      // for a payload-bearing SYN: its insert was a std::map::insert on an
+      // already-present key, i.e. a no-op, and it returned kAllowReq without
+      // extracting. Reproduced exactly -- no re-tracking, no onData.
+      return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllowReq), 0, NULL);
+    }
+    if (decision.kind == 4) {  // Old: `tcp_seq < tcp_it->second->getTcpSeq()`.
+      LOG_D("input - duplicated tcp segment");
+      return nfq_set_verdict(qh, id, NF_ACCEPT, 0, NULL);
+    }
+    // The tracked flow's own stored key is authoritative here -- this branch
+    // never ran MatchMicroPolicyRule, so the local rule_key is still empty.
+    // Mirrors the old `rule_key = tcp_it->second->getRuleKey();`, without
+    // which the HTTP-policy lookup at the bottom could never hit.
+    rule_key = daemon->ConnMgr().MicrosegRuleKey(decision).value_or(std::string());
+  } else {
+    // Old `found == false` branch, in the same order it tested things: SYN
+    // first (`if (tcphdr.syn != 0) break;`), then payload presence, then the
+    // shared match block.
+    if (!syn && !has_payload) {
+      // Old: not found, not SYN, `data_len <= offset`. Note this also swallows
+      // kind 2 (FIN/RST on a TCB-tracked flow microseg never tracked), which
+      // the old code likewise accepted here since such packets carry no
+      // payload; a FIN carrying data is the one case the old code would have
+      // policy-matched and this does not (payload_offset is not populated for
+      // kind 2). See this task's report. Such a packet has nonetheless already
+      // torn down the PEER direction's microseg entry via the unconditional
+      // MicrosegClose call above -- that teardown must not depend on reaching
+      // this branch or the tracked one.
+      return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllowReq), 0, NULL);
+    }
     /*match rule*/
     rule_ret = MatchMicroPolicyRule(tuple, dir, rule_key, *daemon);
     if (rule_ret == NetPolicyRule::kDefault)
       return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllow), 0, NULL);
     /*query http rule*/
     auto http_rule = daemon->Microseg().InputHttpPolicy().find(rule_key);
-    /*check http rule*/
-    if ((http_rule == daemon->Microseg().InputHttpPolicy().end()) || (tuple.proto_ == IPPROTO_UDP) ||
-        (tuple.proto_ == IPPROTO_ICMP) || (http_rule->second.empty())) {
+    if ((http_rule == daemon->Microseg().InputHttpPolicy().end()) || (http_rule->second.empty())) {
       /*post match message*/
       daemon->PostSrv().SendMatchMsg(tuple, rule_ret, dir, rule_key);
       // deny
@@ -719,60 +795,53 @@ static int input_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct 
       /*return*/
       return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllow), 0, NULL);
     }
+    // An HTTP policy applies to this flow.
+    if (syn) {
+      // Old L726-733: start tracking with the key just matched, and return
+      // without extracting (a SYN carries no payload worth inspecting). Covers
+      // SYN, SYN-ACK and SYN retransmissions alike, exactly as the old
+      // `tcphdr.syn == 1` did.
+      LOG_D("microseg-dp  input sync, src: %s, dest : %s, data len : %d", tuple.src_addr_.c_str(),
+            tuple.dst_addr_.c_str(), data_len);
+      daemon->ConnMgr().MicrosegTrack(decision, rule_key);
+      return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllowReq), 0, NULL);
+    }
+    // Non-SYN, payload-bearing, HTTP policy applies: start tracking this flow
+    // with the key just matched, then fall through to the single shared
+    // dispatch. This is old L739-747's explicit `if (tcp_it == end())
+    // insert(Connection(rule_key))` immediately before its onData() call, and
+    // it is what makes late-binding work for kind 3 (Data) -- e.g. the first
+    // response packet of a flow whose SYN-ACK found no egress policy, or any
+    // flow an AddPolicyRule started applying to mid-connection. Only kind 5
+    // late-binds inside DispatchMicroseg; kinds 3 and 4 do not, by design.
+    // Doing the insert here rather than inside DispatchMicroseg keeps that one
+    // call the sole owner of onData() (for kind 5 this insert simply makes
+    // case 5's own insert-on-miss a no-op -- it does not double-parse).
+    daemon->ConnMgr().MicrosegTrack(decision, rule_key);
   }
 
-  auto tcp_seq = ntohl(tcphdr.seq);
-  /*tcp syn packet*/
-  if (tcphdr.syn == 1) {
-    LOG_D("microseg-dp  input sync, src: %s, dest : %s, offset : %d, data len : %d",
-          tuple.src_addr_.c_str(), tuple.dst_addr_.c_str(), offset, data_len);
-    auto conn = std::make_unique<http::Connection>(rule_key);
-    conn->setTcpSeq(tcp_seq + 1);
-    daemon->Microseg().TcpCtInput().insert({ct_key, std::move(conn)});
-    /*return*/
-    return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllowReq), 0, NULL);
-  }
   /*print debug log*/
-  LOG_D("microseg-dp  input data, src: %s, dest : %s, offset : %d, data len : %d",
-        tuple.src_addr_.c_str(), tuple.dst_addr_.c_str(), offset, data_len);
-  /*can not find tcp conntrack*/
-  if (tcp_it == daemon->Microseg().TcpCtInput().end()) {
-    LOG_D(
-        "microseg-dp input not sync, new conntrack, src: %s, dest : %s, offset : %d, data len : %d",
-        tuple.src_addr_.c_str(), tuple.dst_addr_.c_str(), offset, data_len);
-    auto [it, success] = daemon->Microseg().TcpCtInput().insert({ct_key, std::make_unique<http::Connection>(rule_key)});
-    if (success) {
-      tcp_it = it;
-    }
-  }
-  /*get tcp data*/
-  value = pkg + offset;
-  /*get rule key*/
-  rule_key = tcp_it->second->getRuleKey();
-  /*get tcp seq*/
-  if (tcp_seq < tcp_it->second->getTcpSeq()) {
-    LOG_D("input - duplicated tcp segment");
-    return nfq_set_verdict(qh, id, NF_ACCEPT, 0, NULL);
-  }
-  auto payload_len = data_len - offset;
-  /*save tcp seq*/
-  tcp_it->second->setTcpSeq(tcp_seq + payload_len);
-  /*string convert*/
-  auto data = std::string_view(reinterpret_cast<const char*>(value), payload_len);
-  auto header = tcp_it->second->onData(data);
-  LOG_D("input method : %s, path : %s, host : %s, state : %d", header.method_.c_str(),
-        header.path_.c_str(), header.host_.c_str(), static_cast<int>(header.parseState_));
+  LOG_D("microseg-dp  input data, src: %s, dest : %s, data len : %d", tuple.src_addr_.c_str(),
+        tuple.dst_addr_.c_str(), data_len);
+  // Reached by exactly: a non-SYN, payload-bearing kind 3/4/5 packet that is
+  // either already tracked or was just tracked by the MicrosegTrack call
+  // above. Every SYN-flagged packet and every payload-less one has returned by
+  // now, so kind 1 can never reach here (it is always SYN-flagged) and neither
+  // can kind 2.
+  auto header = daemon->ConnMgr().DispatchMicroseg(decision, reinterpret_cast<const uint8_t*>(pkg),
+                                                   data_len, rule_key);
+  LOG_D("input method : %s, path : %s, host : %s, state : %d",
+        header ? header->method_.c_str() : "", header ? header->path_.c_str() : "",
+        header ? header->host_.c_str() : "", header ? static_cast<int>(header->parseState_) : -1);
   /*parse http state*/
-  if (header.parseState_ != ParseState::Done)
+  if (!header)
     return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllowReq), 0, NULL);
-  /*get rule key*/
-  rule_key = tcp_it->second->getRuleKey();
   /*query http rule*/
   auto http_rule = daemon->Microseg().InputHttpPolicy().find(rule_key);
   if (http_rule == daemon->Microseg().InputHttpPolicy().end())
     return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kDefault), 0, NULL);
   // process header
-  rule_ret = MatchHttpPolicyRule(http_rule->second, header);
+  rule_ret = MatchHttpPolicyRule(http_rule->second, *header);
   /*print debug log*/
   LOG_D("match input http rule : %d, key : %s", static_cast<int>(rule_ret), rule_key.c_str());
   /*net rule continue*/
@@ -789,18 +858,14 @@ static int input_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct 
 
 static int output_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct nfq_data* nfa,
                          void* argv) {
-  bool found = false;
-  int id = 0, offset;
+  int id = 0;
   uint32_t mark;
   FLOW_DIR dir = FlowDir::kEgress;
   std::string rule_key;
   FiveTuple tuple;
-  struct tcphdr tcphdr;
-  TCP_FOUR_TUPLE_V4 ct_key;
   struct nfqnl_msg_packet_hdr* ph;
-  unsigned char *pkg, *value;
+  unsigned char* pkg;
   NET_POLICY_RULE rule_ret;
-  std::map<TCP_FOUR_TUPLE_V4, http::ConnectionPtr>::iterator tcp_it;
   NFQ_RES_INFO* nfq_res = (NFQ_RES_INFO*)argv;
   DaemonContext* daemon = nfq_res->daemon_;
 
@@ -824,13 +889,10 @@ static int output_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct
   if (data_len < (int)sizeof(struct iphdr))
     return nfq_set_verdict(qh, id, NF_ACCEPT, 0, NULL);
 
-  // WafEnabled() is passed as `track_tcp`: the five-tuple parse below is
-  // unconditional (L3-L4 policy matching needs it on every packet), but the
-  // Rust engine's TCB tracking stays behind the same WAF gate it was behind
-  // before this phase -- FlowEngine has no reaper, so tracking with the WAF
-  // off would leak TCB entries in the default deployment.
+  // `track_tcp` is unconditionally true -- see input_nfq_cb's identical call
+  // for why this is no longer gated on WafEnabled().
   auto result = daemon->ConnMgr().receive(reinterpret_cast<const uint8_t*>(pkg), data_len,
-                                          daemon->WafEnabled());
+                                          /*track_tcp=*/true);
   if (!result.tuple.recognized) {
     // See input_nfq_cb for the rationale behind returning here rather than
     // replicating parse_package's old fall-through-without-return quirk.
@@ -845,23 +907,9 @@ static int output_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct
   tuple.src_addr_     = net::ipv4ToString(result.tuple.src_addr);
   tuple.dst_addr_     = net::ipv4ToString(result.tuple.dst_addr);
 
-  // Reconstruct offset/tcphdr for the downstream microseg TCP-tracking block --
-  // see input_nfq_cb's identical block for the full rationale (mirrors
-  // parse_package's arithmetic; bounds-checked by parse_five_tuple in a way the
-  // old direct pointer casts were not, at the cost of failing open on
-  // malformed/truncated packets that previously reached policy matching via
-  // out-of-bounds reads).
-  offset = static_cast<int>(result.tuple.ip_header_len);
-  if (tuple.proto_ == IPPROTO_TCP) {
-    memcpy(&tcphdr, pkg + result.tuple.ip_header_len, sizeof(tcphdr));
-    offset += tcphdr.doff << 2;
-  } else if (tuple.proto_ == IPPROTO_UDP) {
-    offset += sizeof(struct udphdr);
-  }
-  // ICMP: offset stays at ip_header_len, matching parse_package.
   /*print debug log*/
-  // LOG_V("output receive %s, mark : %d, seq: %u, tot len : %d, %s:%u -> %s:%u, memory : %p ",
-  // GetProtoString(tuple.proto_), mark, ntohl(tcphdr.seq), tuple.tot_len_, tuple.src_addr_.c_str(),
+  // LOG_V("output receive %s, mark : %d, tot len : %d, %s:%u -> %s:%u, memory : %p ",
+  // GetProtoString(tuple.proto_), mark, tuple.tot_len_, tuple.src_addr_.c_str(),
   // tuple.src_port_, tuple.dst_addr_.c_str(), tuple.dst_port_, argv); LOG_D("input receive data: %p",
   // pkg);
   if (daemon->WafEnabled() && result.is_tcp) {
@@ -872,59 +920,100 @@ static int output_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct
       return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllowRsp), data_len, pkg);
     }
   }
-  /*tcp four tuple*/
-  ct_key.dst_port_ = tuple.dst_port_;
-  ct_key.src_port_ = tuple.src_port_;
-  ct_key.dst_addr_ = tuple.dst_addr_u32_;
-  ct_key.src_addr_ = tuple.src_addr_u32_;
-  /*tcp protocol*/
-  switch (tuple.proto_) {
-  case IPPROTO_TCP:
-    /*query conntrack info*/
-    tcp_it = daemon->Microseg().TcpCtOutput().find(ct_key);
-    if (tcp_it == daemon->Microseg().TcpCtOutput().end()) {
-      /*tcp syn*/
-      if (tcphdr.syn != 0)
-        break;
-      /*tcp ack*/
-      if (data_len <= offset)
-        return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllowRsp), 0, NULL);
-      /*break*/
-      break;
-    }
-    /*tcp tuple exist*/
-    found = true;
-    /*tcp fin*/
-    if ((tcphdr.fin == 1) || (tcphdr.rst == 1)) {
-      daemon->Microseg().TcpCtOutput().erase(ct_key);
-      /*print debug log*/
-      LOG_D("microseg-dp out data, delete conntrack info, src: %s:%d, dest : %s:%d",
-            tuple.src_addr_.c_str(), tuple.src_port_, tuple.dst_addr_.c_str(), tuple.dst_port_);
-      /*return*/
+
+  if ((tuple.proto_ == IPPROTO_UDP) || (tuple.proto_ == IPPROTO_ICMP)) {
+    // See input_nfq_cb's identical block: UDP/ICMP never enter TCB dispatch,
+    // and the old shared `!found` block could never carry them past its own
+    // returns anyway.
+    rule_ret = MatchMicroPolicyRule(tuple, dir, rule_key, *daemon);
+    if (rule_ret == NetPolicyRule::kDefault)
       return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllow), 0, NULL);
+    daemon->PostSrv().SendMatchMsg(tuple, rule_ret, dir, rule_key);
+    if (rule_ret == NetPolicyRule::kDeny) {
+      LOG_D("output drop %s %s:%u -> %s:%u ", GetProtoString(tuple.proto_), tuple.src_addr_.c_str(),
+            tuple.src_port_, tuple.dst_addr_.c_str(), tuple.dst_port_);
+      return nfq_set_verdict(qh, id, NF_DROP, 0, NULL);
     }
-    /*tcp ack*/
-    if (data_len <= offset)
-      return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllowRsp), 0, NULL);
-    /*break*/
-    break;
-  case IPPROTO_UDP:
-  case IPPROTO_ICMP:
-    break;
-  default:
+    return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllow), 0, NULL);
+  }
+  if (tuple.proto_ != IPPROTO_TCP) {
+    // Old switch's `default:` behavior; unreachable in practice.
     return nfq_set_verdict(qh, id, NF_ACCEPT, 0, NULL);
   }
-  /*query tcp conntrack result*/
-  if (!found) {
+
+  // ---- TCP from here on. See input_nfq_cb for the full commentary on the
+  // kind-based dispatch, the exactly-one-DispatchMicroseg-call invariant (the
+  // same two mutually exclusive call sites appear below), how `has_payload`
+  // reproduces the retired `data_len <= offset` test, and why the SYN test
+  // must be the raw flag rather than `kind == 1` (a SYN-ACK -- the first
+  // egress packet of every peer-initiated connection, and so this direction's
+  // normal entry point -- arrives as kind 3, never kind 1).
+  const auto& decision = result.decision;
+  const bool tracked   = daemon->ConnMgr().MicrosegTracked(decision);
+  // Tell the reaper this flow is still alive. Must happen here, before any of
+  // the early returns below, not down at the DispatchMicroseg call: a live
+  // connection can go minutes between payload-bearing packets while still
+  // exchanging ACKs (which return early at `!has_payload`), and its microseg
+  // entry -- rule_key and half-parsed request alike -- must not age out from
+  // under it. Purely a timestamp refresh: never inserts, so it cannot change
+  // `tracked` above, and it is a no-op for kinds 0 and 4 (see MicrosegTouch).
+  daemon->ConnMgr().MicrosegTouch(decision);
+  const bool has_payload = ((decision.kind == 3) || (decision.kind == 4) || (decision.kind == 5)) &&
+                           (data_len > static_cast<int>(decision.payload_offset));
+  const bool syn = decision.syn;
+
+  if (decision.kind == 0) {
+    // RST on a flow the TCB tracker never saw a SYN for -- old code's
+    // payload-less early return. See input_nfq_cb.
+    return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllowRsp), 0, NULL);
+  }
+
+  // Closed (FIN/RST): tear down BOTH directions' microsegmentation entries
+  // above the tracked/untracked split. See input_nfq_cb's identical call and
+  // ConnectionManager::MicrosegClose for why this must not be gated on
+  // `tracked` -- this direction is in fact the one MORE likely to be untracked
+  // in a deployment whose L7 policy is ingress-only, while still being the
+  // direction a server-initiated close arrives on.
+  daemon->ConnMgr().MicrosegClose(decision, reinterpret_cast<const uint8_t*>(pkg), data_len);
+
+  if (tracked) {
+    if (decision.kind == 2) {  // Closed: the old `fin == 1 || rst == 1` test.
+      // Teardown already done unconditionally above.
+      LOG_D("microseg-dp out data, delete conntrack info, src: %s:%d, dest : %s:%d",
+            tuple.src_addr_.c_str(), tuple.src_port_, tuple.dst_addr_.c_str(), tuple.dst_port_);
+      return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllow), 0, NULL);
+    }
+    if (!has_payload) {
+      // Old: `found`, not FIN/RST, `data_len <= offset` -- a bare ACK. The old
+      // found-path payload test had no SYN exemption; see input_nfq_cb.
+      return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllowRsp), 0, NULL);
+    }
+    if (syn) {
+      // Old L943's `if (tcphdr.syn == 1)` on an already-tracked flow: its
+      // insert was a no-op and it returned without extracting.
+      return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllowRsp), 0, NULL);
+    }
+    if (decision.kind == 4) {  // Old: `tcp_seq < tcp_it->second->getTcpSeq()`.
+      LOG_D("output - duplicated tcp segment");
+      return nfq_set_verdict(qh, id, NF_ACCEPT, 0, NULL);
+    }
+    // Mirrors the old `rule_key = tcp_it->second->getRuleKey();` -- this
+    // branch never ran MatchMicroPolicyRule, so the local rule_key is empty.
+    rule_key = daemon->ConnMgr().MicrosegRuleKey(decision).value_or(std::string());
+  } else {
+    if (!syn && !has_payload) {
+      // Old: not found, not SYN, `data_len <= offset`. A kind-2 packet reaching
+      // here has already torn down the peer direction's microseg entry via the
+      // unconditional MicrosegClose above; see input_nfq_cb.
+      return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllowRsp), 0, NULL);
+    }
     /*match rule*/
     rule_ret = MatchMicroPolicyRule(tuple, dir, rule_key, *daemon);
     if (rule_ret == NetPolicyRule::kDefault)
       return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllow), 0, NULL);
     /*query http rule*/
     auto http_rule = daemon->Microseg().OutputHttpPolicy().find(rule_key);
-    /*check http rule*/
-    if ((http_rule == daemon->Microseg().OutputHttpPolicy().end()) || (tuple.proto_ == IPPROTO_UDP) ||
-        (tuple.proto_ == IPPROTO_ICMP) || (http_rule->second.empty())) {
+    if ((http_rule == daemon->Microseg().OutputHttpPolicy().end()) || (http_rule->second.empty())) {
       /*post match message*/
       daemon->PostSrv().SendMatchMsg(tuple, rule_ret, dir, rule_key);
       // deny
@@ -937,59 +1026,40 @@ static int output_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct
       /*return*/
       return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllow), 0, NULL);
     }
-  }
-  auto tcp_seq = ntohl(tcphdr.seq);
-  /*tcp syn packet*/
-  if (tcphdr.syn == 1) {
-    LOG_D("microseg-dp output sync, rule key : %s, src: %s, dest : %s, offset : %d, data len : %d",
-          rule_key.c_str(), tuple.src_addr_.c_str(), tuple.dst_addr_.c_str(), offset, data_len);
-    auto conn = std::make_unique<http::Connection>(rule_key);
-    conn->setTcpSeq(tcp_seq + 1);
-    daemon->Microseg().TcpCtOutput().insert({ct_key, std::move(conn)});
-    /*return*/
-    return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllowRsp), 0, NULL);
-  }
-  /*print debug log*/
-  LOG_D("microseg-dp output data, src: %s, dest : %s, offset : %d, data len : %d",
-        tuple.src_addr_.c_str(), tuple.dst_addr_.c_str(), offset, data_len);
-  /*can not find tcp conntrack*/
-  if (tcp_it == daemon->Microseg().TcpCtOutput().end()) {
-    LOG_D("microseg-dp output not sync, new conntrack, src: %s, dest : %s, offset : %d, data len : "
-          "%d",
-          tuple.src_addr_.c_str(), tuple.dst_addr_.c_str(), offset, data_len);
-    auto [it, success] = daemon->Microseg().TcpCtOutput().insert({ct_key, std::make_unique<http::Connection>(rule_key)});
-    if (success) {
-      tcp_it = it;
+    // An HTTP policy applies to this flow.
+    if (syn) {
+      // Old L943-950. For this direction the common case is a SYN-ACK, which
+      // is where the egress side of a peer-initiated connection gets tracked
+      // with its OWN OutputHttpPolicy key -- the ingress SYN must not seed it
+      // (see ConnectionManager::MicrosegTrack).
+      LOG_D("microseg-dp output sync, rule key : %s, src: %s, dest : %s, data len : %d",
+            rule_key.c_str(), tuple.src_addr_.c_str(), tuple.dst_addr_.c_str(), data_len);
+      daemon->ConnMgr().MicrosegTrack(decision, rule_key);
+      return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllowRsp), 0, NULL);
     }
-  }
-  /*get tcp data*/
-  value = pkg + offset;
-  /*get rule key*/
-  rule_key = tcp_it->second->getRuleKey();
-  /*get tcp seq*/
-  if (tcp_seq < tcp_it->second->getTcpSeq()) {
-    LOG_D("output - duplicated tcp segment");
-    return nfq_set_verdict(qh, id, NF_ACCEPT, 0, NULL);
+    // Non-SYN, payload-bearing, HTTP policy applies: late-bind before the
+    // shared dispatch -- old L956-964's explicit insert. See input_nfq_cb.
+    daemon->ConnMgr().MicrosegTrack(decision, rule_key);
   }
 
-  auto payload_len = data_len - offset;
-  /*save tcp seq*/
-  tcp_it->second->setTcpSeq(tcp_seq + payload_len);
-  /*string convert*/
-  auto data = std::string_view(reinterpret_cast<const char*>(value), payload_len);
-  auto header = tcp_it->second->onData(data);
+  /*print debug log*/
+  LOG_D("microseg-dp output data, src: %s, dest : %s, data len : %d", tuple.src_addr_.c_str(),
+        tuple.dst_addr_.c_str(), data_len);
+  auto header = daemon->ConnMgr().DispatchMicroseg(decision, reinterpret_cast<const uint8_t*>(pkg),
+                                                   data_len, rule_key);
   LOG_D("output method : %s, path : %s, host : %s, state : %d, rule key : %s",
-        header.method_.c_str(), header.path_.c_str(), header.host_.c_str(),
-        static_cast<int>(header.parseState_), rule_key.c_str());
+        header ? header->method_.c_str() : "", header ? header->path_.c_str() : "",
+        header ? header->host_.c_str() : "", header ? static_cast<int>(header->parseState_) : -1,
+        rule_key.c_str());
   /*parse http state*/
-  if (header.parseState_ != ParseState::Done)
+  if (!header)
     return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllowRsp), 0, NULL);
   /*query http rule*/
   auto http_rule = daemon->Microseg().OutputHttpPolicy().find(rule_key);
   if (http_rule == daemon->Microseg().OutputHttpPolicy().end())
     return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kDefault), 0, NULL);
   // process header
-  rule_ret = MatchHttpPolicyRule(http_rule->second, header);
+  rule_ret = MatchHttpPolicyRule(http_rule->second, *header);
   /*print debug log*/
   LOG_D("match output http rule : %d, key : %s", static_cast<int>(rule_ret), rule_key.c_str());
   /*net rule continue*/
@@ -1971,6 +2041,24 @@ int ProcAcceptPostLinkEvent(int32_t epoll_fd, int32_t fd, void* ptr) {
   return 0;
 }
 
+/*Periodic reaper (Phase 6b-2). Fires on the timerfd armed in
+ *RunNetPolicyDaemon and sweeps stale per-flow state -- both the Rust engine's
+ *TCB table and ConnectionManager's own late-bound microsegmentation entries
+ *(see ConnectionManager::EvictStale). Runs on the epoll thread like every
+ *other callback, so it needs no locking against the packet path.*/
+static int32_t ReaperTimerEvent(int32_t epoll_fd, int32_t fd, void* ptr) {
+  (void)epoll_fd;
+  uint64_t expirations;
+  /*Required for a timerfd: the read() is what clears its readable state.
+   *Without it, level-triggered epoll would re-fire on every epoll_wait and
+   *spin the loop.*/
+  if (read(fd, &expirations, sizeof(expirations)) != (ssize_t)sizeof(expirations))
+    RETURN_ERROR(0, "read reaper timerfd failed, %s.", strerror(errno));
+  RcvEpollCb* cb = (RcvEpollCb*)ptr;
+  cb->daemon_->ConnMgr().EvictStale();
+  return 0;
+}
+
 int CreatePostServer(int efd, RCV_EPOLL_CB* pstPostEv, DaemonContext* daemon) {
   int fd = 0, ret, opt = 1;
   struct epoll_event ev;
@@ -2055,7 +2143,7 @@ int RunNetPolicyDaemon(int argc, char* argv[]) {
   struct epoll_event ev, events[20];
   int epfd = 0, zLinkFd;
   int ret, nfds, i;
-  RCV_EPOLL_CB postEvent, rustDispatchWakeEvent, *pstCbEv;
+  RCV_EPOLL_CB postEvent, rustDispatchWakeEvent, reaperEvent, *pstCbEv;
   // print start log
   LOG_I("policy process start......");
   /*get log level env*/
@@ -2099,6 +2187,42 @@ int RunNetPolicyDaemon(int argc, char* argv[]) {
   ret = epoll_ctl(epfd, EPOLL_CTL_ADD, rust_dispatch_wake_fd, &ev);
   if (ret < 0)
     GOTO_ERROR(err, "epoll ctl failed for rust control dispatch wake fd, %s.", strerror(errno));
+
+  // --- Reaper timer (Phase 6b-2): periodic sweep of stale TCB/microseg state ---
+  // This is what bounds the memory the TCP-tracking path consumes. It became
+  // load-bearing rather than merely tidy when the microsegmentation cutover
+  // dropped the old WafEnabled() gate on receive()'s track_tcp: TCB tracking
+  // now runs on every TCP connection in every deployment, including the default
+  // WAF-off one (see input_nfq_cb's comment on that argument), so without this
+  // timer both the Rust engine's TCB table and ConnectionManager's own per-flow
+  // maps would grow without bound for the daemon's lifetime.
+  int reaper_timer_fd;
+  reaper_timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
+  if (reaper_timer_fd < 0)
+    GOTO_ERROR(err, "create reaper timerfd failed, %s.", strerror(errno));
+  {
+    // The sweep INTERVAL is independent of the entry TIMEOUT (5 minutes,
+    // net_flow_engine's STALE_CONNECTION_TIMEOUT, which is also what
+    // EvictStale applies to its own microseg entries). A shorter interval only
+    // bounds how far past the timeout an evictable entry can linger before it
+    // is actually swept; it never evicts anything early. 60s is a reasonable
+    // default -- tune it here, independently of the timeout.
+    struct itimerspec its = {};
+    its.it_value.tv_sec = 60;     // first expiry
+    its.it_interval.tv_sec = 60;  // and every 60s after
+    ret = timerfd_settime(reaper_timer_fd, 0, &its, nullptr);
+    if (ret < 0)
+      GOTO_ERROR(err, "arm reaper timerfd failed, %s.", strerror(errno));
+  }
+  reaperEvent.fd_ = reaper_timer_fd;
+  reaperEvent.epoll_in_func_ = ReaperTimerEvent;
+  reaperEvent.nfq_res_ = nullptr;
+  reaperEvent.daemon_ = &daemon;
+  ev.data.ptr = &reaperEvent;
+  ev.events = EPOLLIN;
+  ret = epoll_ctl(epfd, EPOLL_CTL_ADD, reaper_timer_fd, &ev);
+  if (ret < 0)
+    GOTO_ERROR(err, "epoll ctl failed for reaper timer fd, %s.", strerror(errno));
 
   // --- Rust EventService (production event stream, port 50052) ---
   // Started before start_control_server below: it has no DaemonContext/epoll_fd
