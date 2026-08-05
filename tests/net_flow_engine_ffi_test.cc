@@ -482,6 +482,23 @@ std::vector<uint8_t> SynAckPacket() {
   return p;
 }
 
+// Same connection as SynPacket()/FinPacket(), but the FIN travels in the
+// REVERSE direction -- the server closing the connection rather than the
+// client. Its ConnectionID is the peer of SynPacket()'s, which is the whole
+// point of ClosedOnTheUntrackedPeerDirectionStillErasesTheTrackedDirection.
+std::vector<uint8_t> ReverseFinPacket() {
+  std::vector<uint8_t> p(40, 0);
+  p[0] = (4 << 4) | 5;
+  p[9] = 6;
+  p[12] = 10; p[13] = 0; p[14] = 0; p[15] = 2;   // saddr = 10.0.0.2 (reversed)
+  p[16] = 10; p[17] = 0; p[18] = 0; p[19] = 1;   // daddr = 10.0.0.1
+  p[20] = 0x00; p[21] = 0x50;  // source port 80  (reversed)
+  p[22] = 0x04; p[23] = 0xD2;  // dest port 1234
+  p[32] = 5 << 4;              // doff=5
+  p[33] = 0x01;                // FIN
+  return p;
+}
+
 }  // namespace
 
 // Regression test for Critical #1 of Task 5's review: a SYN-ACK is SYN-flagged
@@ -601,6 +618,86 @@ TEST(ConnectionManagerMicrosegTest, MicrosegTrackDoesNotOverwriteAnExistingEntry
   mgr.MicrosegTrack(r.decision, "first-key");
   mgr.MicrosegTrack(r.decision, "second-key");
   EXPECT_EQ(mgr.MicrosegRuleKey(r.decision).value_or(""), "first-key");
+}
+
+// Regression test for the final whole-branch review's Fix 1: a microseg entry
+// must be torn down as soon as the connection closes, even when the closing
+// FIN/RST is captured on the direction that has NO microseg entry of its own.
+//
+// The setup here is the common one, not an exotic corner: an L7 microseg
+// policy is typically written for ONE direction, so only that direction gets a
+// microseg_conns_ entry (MicrosegTrack deliberately never seeds the peer --
+// see TrackingOneDirectionDoesNotSeedThePeer). But net_flow_engine removes
+// BOTH directions' TCB entries on the FIRST FIN/RST it sees, whichever
+// direction that is, so the Closed decision very often surfaces on the
+// direction with no entry -- where the callback takes its !tracked branch.
+// Before this fix, the callbacks only dispatched Closed from inside their
+// `tracked` branch, so that entry survived until the reaper swept it up to
+// ~5 minutes later. If the client reused the same 4-tuple in the meantime
+// (ephemeral port reuse), MicrosegTrack's insert-if-absent semantics handed
+// the NEW connection the OLD one's rule_key and mid-message llhttp parser
+// state -- silently failing open on L7 enforcement, since the new
+// connection's bytes could never reach ParseState::Done against that state.
+//
+// ConnectionManager::MicrosegClose is where the "not gated on
+// MicrosegTracked" invariant now lives, precisely so it is testable here
+// rather than only inside the two nfq callbacks (which take libnetfilter_queue
+// handles and cannot be driven from a unit test).
+TEST(ConnectionManagerMicrosegTest, ClosedOnTheUntrackedPeerDirectionStillErasesTheTrackedDirection) {
+  http::HttpFilterFactory factory;
+  net::ConnectionManager mgr(factory);
+
+  // Direction A (10.0.0.1:1234 -> 10.0.0.2:80) is the ONLY microseg-tracked
+  // direction, as if an ingress-only HTTP policy applied at handshake time.
+  auto syn = SynPacket();
+  auto syn_result = mgr.receive(syn.data(), syn.size(), /*track_tcp=*/true);
+  ASSERT_EQ(syn_result.decision.kind, 1);  // NewConnection
+  mgr.MicrosegTrack(syn_result.decision, "ingress-key");
+  ASSERT_TRUE(mgr.MicrosegTracked(syn_result.decision));
+  ASSERT_EQ(mgr.microsegConnectionCount(), 1u);
+
+  // The server closes first, so the FIN is captured on direction B.
+  auto fin = ReverseFinPacket();
+  auto fin_result = mgr.receive(fin.data(), fin.size(), /*track_tcp=*/true);
+  ASSERT_EQ(fin_result.decision.kind, 2);  // Closed
+  // The premise of the bug: direction B is the untracked one, so the
+  // callback's `tracked` branch -- where the Closed dispatch used to live --
+  // is not taken for this packet.
+  ASSERT_FALSE(mgr.MicrosegTracked(fin_result.decision));
+
+  EXPECT_TRUE(mgr.MicrosegClose(fin_result.decision, fin.data(), fin.size()));
+
+  // Direction A's entry must be gone IMMEDIATELY -- not left for the reaper.
+  EXPECT_FALSE(mgr.MicrosegTracked(syn_result.decision));
+  EXPECT_EQ(mgr.microsegConnectionCount(), 0u);
+}
+
+// MicrosegClose is called unconditionally for every TCP packet by both
+// callbacks, so it must be an exact no-op for every non-Closed kind -- in
+// particular it must never erase a live flow's entry, and must report false so
+// the caller knows this packet still needs the normal dispatch path.
+TEST(ConnectionManagerMicrosegTest, MicrosegCloseIsANoOpForNonClosedDecisions) {
+  http::HttpFilterFactory factory;
+  net::ConnectionManager mgr(factory);
+
+  auto syn = SynPacket();
+  auto syn_result = mgr.receive(syn.data(), syn.size(), /*track_tcp=*/true);
+  mgr.MicrosegTrack(syn_result.decision, "ingress-key");
+  ASSERT_EQ(mgr.microsegConnectionCount(), 1u);
+
+  EXPECT_FALSE(mgr.MicrosegClose(syn_result.decision, syn.data(), syn.size()));  // kind 1
+  EXPECT_EQ(mgr.microsegConnectionCount(), 1u);
+
+  auto data = DataPacket(/*syn=*/false, "GET /x HTTP/1.1\r\nHost: example.com\r\n\r\n");
+  uint32_t seq_be = htonl(1);
+  std::memcpy(data.data() + 24, &seq_be, sizeof(seq_be));
+  auto data_result = mgr.receive(data.data(), data.size(), /*track_tcp=*/true);
+  ASSERT_EQ(data_result.decision.kind, 3);  // Data
+  EXPECT_FALSE(mgr.MicrosegClose(data_result.decision, data.data(), data.size()));
+  EXPECT_EQ(mgr.microsegConnectionCount(), 1u);
+  // ...and the entry it left alone is still the same one, parser state and
+  // rule_key intact.
+  EXPECT_EQ(mgr.MicrosegRuleKey(data_result.decision).value_or(""), "ingress-key");
 }
 
 TEST(NetFlowEngineFfiTest, EvictStaleConnectionsIsCallableAndReturnsEmptyForFreshFlows) {

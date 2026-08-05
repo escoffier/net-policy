@@ -661,9 +661,15 @@ static int input_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct 
   //
   // IMPORTANT: DispatchMicroseg is called EXACTLY ONCE per packet. There are
   // exactly two call sites below and no execution path reaches both:
-  //   (a) the tracked-flow `Closed` branch (returns immediately),
+  //   (a) MicrosegClose(), for Closed (kind 2) packets only -- called
+  //       unconditionally below, before the tracked/untracked split, and a
+  //       no-op for every other kind,
   //   (b) the single shared call at the bottom, reached by everything else.
-  // SYN handling does not use DispatchMicroseg at all -- it calls
+  // A kind-2 packet can never reach (b): if this direction is tracked it
+  // returns from the Closed branch below, and if it is not, it returns at
+  // `!syn && !has_payload` (payload_offset is not populated for kind 2, so
+  // has_payload is false) or, for a nonsensical SYN+FIN, from the untracked
+  // SYN branch. SYN handling does not use DispatchMicroseg at all -- it calls
   // MicrosegTrack (a pure insert, never onData) and returns, because a SYN
   // carries no payload worth inspecting. In particular kind 5 (UnknownData)
   // must not be dispatched in the untracked branch and again at the bottom:
@@ -708,10 +714,24 @@ static int input_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct 
     return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllowReq), 0, NULL);
   }
 
+  // Closed (FIN/RST): tear down BOTH directions' microsegmentation entries
+  // here, ABOVE the tracked/untracked split -- not from inside the `tracked`
+  // branch, where this call used to live. The engine drops both directions'
+  // TCB entries on the first FIN/RST it sees regardless of which direction
+  // carried it, so this Closed decision routinely arrives on the direction
+  // that has no microseg entry of its own (an L7 policy is usually written
+  // for one direction only), and gating teardown on `tracked` left the other
+  // direction's entry stale until the reaper. See
+  // ConnectionManager::MicrosegClose for the full rationale and the 4-tuple-
+  // reuse failure mode it prevents. A no-op for every non-Closed kind, and it
+  // never changes any packet's verdict -- both branches below still return
+  // exactly what they returned before.
+  daemon->ConnMgr().MicrosegClose(decision, reinterpret_cast<const uint8_t*>(pkg), data_len);
+
   if (tracked) {
     // Old `found == true` branch, in the same order it tested things.
     if (decision.kind == 2) {  // Closed: the old `fin == 1 || rst == 1` test.
-      daemon->ConnMgr().DispatchMicroseg(decision, reinterpret_cast<const uint8_t*>(pkg), data_len, "");
+      // Teardown already done unconditionally above.
       LOG_D("microseg-dp input data, delete conntrack info, src: %s:%d, dest : %s:%d",
             tuple.src_addr_.c_str(), tuple.src_port_, tuple.dst_addr_.c_str(), tuple.dst_port_);
       return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllow), 0, NULL);
@@ -750,7 +770,10 @@ static int input_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct 
       // the old code likewise accepted here since such packets carry no
       // payload; a FIN carrying data is the one case the old code would have
       // policy-matched and this does not (payload_offset is not populated for
-      // kind 2). See this task's report.
+      // kind 2). See this task's report. Such a packet has nonetheless already
+      // torn down the PEER direction's microseg entry via the unconditional
+      // MicrosegClose call above -- that teardown must not depend on reaching
+      // this branch or the tracked one.
       return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllowReq), 0, NULL);
     }
     /*match rule*/
@@ -945,9 +968,17 @@ static int output_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct
     return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllowRsp), 0, NULL);
   }
 
+  // Closed (FIN/RST): tear down BOTH directions' microsegmentation entries
+  // above the tracked/untracked split. See input_nfq_cb's identical call and
+  // ConnectionManager::MicrosegClose for why this must not be gated on
+  // `tracked` -- this direction is in fact the one MORE likely to be untracked
+  // in a deployment whose L7 policy is ingress-only, while still being the
+  // direction a server-initiated close arrives on.
+  daemon->ConnMgr().MicrosegClose(decision, reinterpret_cast<const uint8_t*>(pkg), data_len);
+
   if (tracked) {
     if (decision.kind == 2) {  // Closed: the old `fin == 1 || rst == 1` test.
-      daemon->ConnMgr().DispatchMicroseg(decision, reinterpret_cast<const uint8_t*>(pkg), data_len, "");
+      // Teardown already done unconditionally above.
       LOG_D("microseg-dp out data, delete conntrack info, src: %s:%d, dest : %s:%d",
             tuple.src_addr_.c_str(), tuple.src_port_, tuple.dst_addr_.c_str(), tuple.dst_port_);
       return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllow), 0, NULL);
@@ -971,7 +1002,9 @@ static int output_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct
     rule_key = daemon->ConnMgr().MicrosegRuleKey(decision).value_or(std::string());
   } else {
     if (!syn && !has_payload) {
-      // Old: not found, not SYN, `data_len <= offset`.
+      // Old: not found, not SYN, `data_len <= offset`. A kind-2 packet reaching
+      // here has already torn down the peer direction's microseg entry via the
+      // unconditional MicrosegClose above; see input_nfq_cb.
       return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllowRsp), 0, NULL);
     }
     /*match rule*/

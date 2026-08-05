@@ -186,6 +186,48 @@ public:
     }
   }
 
+  // Microsegmentation teardown for a Closed (FIN/RST) decision: a no-op for
+  // every other kind, so the callbacks can -- and must -- call it once for
+  // every TCP packet, unconditionally. Returns true iff the decision was a
+  // Closed one, i.e. iff teardown actually ran.
+  //
+  // Deliberately NOT gated on MicrosegTracked(decision), and that is the whole
+  // reason this method exists rather than the callbacks calling
+  // DispatchMicroseg for kind 2 from inside their `tracked` branch (which is
+  // what they did until the final whole-branch review of Phase 6b-2 caught it):
+  //
+  //   MicrosegTrack seeds ONLY the packet's own direction, never the peer (see
+  //   its comment -- microseg rule keys are direction-specific), so a
+  //   connection covered by an L7 policy on one direction only -- the usual
+  //   case -- has exactly one microseg_conns_ entry. But net_flow_engine
+  //   removes BOTH directions' TCB entries on the FIRST FIN/RST it sees,
+  //   whichever direction carried it, so the resulting Closed decision very
+  //   often surfaces on the direction that has no entry, where the callback
+  //   takes its !tracked branch and returns early at `!syn && !has_payload`.
+  //   Gating teardown on `tracked` therefore left the OTHER direction's now
+  //   permanently-stale entry in place until the reaper swept it up to five
+  //   minutes later. In that window, a client reusing the same 4-tuple
+  //   (ephemeral port reuse) inherited the dead connection's rule_key and
+  //   mid-message llhttp parser state via MicrosegTrack's insert-if-absent
+  //   semantics -- the new connection's bytes could then never reach
+  //   ParseState::Done, silently failing open on L7 policy enforcement.
+  //
+  // DispatchMicroseg's case 2 erases both `conn_id` and `peer_conn_id`, so one
+  // call from EITHER direction's callback cleans up both directions' entries.
+  // The callbacks keep their existing per-direction verdicts for the closing
+  // packet (kAllow when tracked, kAllowReq/kAllowRsp when not) -- this method
+  // changes only WHEN the erase happens, never what the packet's verdict is.
+  bool MicrosegClose(const net_flow::PacketDecision& decision, const uint8_t* pkg, size_t len) {
+    if (decision.kind != 2) {
+      return false;
+    }
+    // Routed through DispatchMicroseg rather than erasing here, so case 2 stays
+    // the single owner of what "closed" means for microseg_conns_. `rule_key`
+    // is unused by that case, as are pkg/len.
+    DispatchMicroseg(decision, pkg, len, std::string());
+    return true;
+  }
+
   // Mirrors the old C++ microseg block's per-kind handling, keyed by
   // ConnectionID instead of a queue-direction-specific TcpFourTupleV4 map.
   // `rule_key` is only consulted for NewConnection/UnknownData (the caller
@@ -349,6 +391,34 @@ public:
       // also HandleClosed's behavior -- is additionally what keeps onClose to
       // exactly ONE call per connection when both directions go stale in the
       // same sweep, since the two directions share one HttpFilterManager.
+      //
+      // KNOWN, ACCEPTED ASYMMETRY -- WAF INSPECTION IS NOT RECOVERABLE AFTER A
+      // REAP, MICROSEGMENTATION'S IS. Flagged explicitly here rather than
+      // silently absorbed, matching how this phase documented its other
+      // deliberate behavior changes (the RST-on-unknown-flow narrowing, the new
+      // duplicate-segment guard WAF gained for free).
+      //
+      // http_conns_ is (re-)inserted ONLY by HandleNewConnection, reachable
+      // only from DispatchWaf case 1 (NewConnection), which requires a SYN on a
+      // flow not already in the engine's `tcbs`. Once this sweep evicts a
+      // connection, the engine has dropped its TCB too, so every later packet
+      // on that still-live socket arrives as kind 5 (UnknownData) -- and
+      // DispatchWaf's case 5 is deliberately a no-op per this phase's plan
+      // (Global Constraints), never late-binding the way DispatchMicroseg's
+      // case 5 does. So a connection that goes idle past the timeout (a
+      // keep-alive HTTP connection-pool socket is the realistic case) loses WAF
+      // inspection permanently, for the whole remainder of its life; only
+      // microsegmentation re-binds, via its own case 5.
+      //
+      // This is NEW with this phase -- there was no reaper before it, so no
+      // connection was ever evicted while live. It is accepted rather than
+      // fixed because a late-binding WAF path is a genuine design change (WAF
+      // state is a whole HttpFilterManager with connection-scoped context, not
+      // microseg's single re-derivable rule_key), out of scope for the fix wave
+      // that documented it. If it needs fixing later, the shape is a DispatchWaf
+      // case 5 that reconstructs a filter manager mid-stream -- with its own
+      // decision about what onNewConnection means for a connection whose start
+      // was never observed.
       CloseHttpConn(id, PeerOf(id));
       microseg_conns_.erase(id);
     }
@@ -483,6 +553,33 @@ private:
 
   http::HttpFilterFactory& filter_factory_;
   rust::Box<net_flow::FlowEngine> engine_;
+
+  // KNOWN LIMITATION -- LOOPBACK TRAFFIC COLLIDES IN BOTH MAPS BELOW.
+  //
+  // Both maps are keyed by ConnectionID alone, which is derived purely from the
+  // packet's (saddr, daddr, sport, dport) -- it carries no notion of which NFQ
+  // queue, and therefore which direction, the packet was captured on.
+  // crates/net_iptables installs its NFQUEUE jumps on mangle PREROUTING and
+  // mangle OUTPUT with no `lo`/loopback exclusion, so a 127.0.0.1 -> 127.0.0.1
+  // packet is delivered to BOTH input_nfq_cb and output_nfq_cb with identical
+  // bytes, yielding the SAME ConnectionID in both callbacks. For localhost or
+  // sidecar traffic under an L7 microseg or WAF policy, the two directions then
+  // share one entry: one direction's rule_key (looked up in InputHttpPolicy)
+  // and half-parsed llhttp state can be handed to the other (which would look
+  // its key up in OutputHttpPolicy), i.e. cross-direction contamination.
+  //
+  // This is a real regression from the pre-Phase-6b-2 design, which kept two
+  // separate direction-keyed maps (MicroSegEngine::TcpCtInput()/TcpCtOutput())
+  // that could not collide. It predates the callback cutover -- it arrived with
+  // the single ConnectionID-keyed microseg_conns_ -- and is recorded here, in
+  // the code, deliberately: the SDD ledger that first flagged it is deleted
+  // when this branch merges. Non-loopback traffic is unaffected, since the two
+  // directions of such a flow have genuinely distinct ConnectionIDs.
+  //
+  // The fix, when it is done, is to key both maps by (ConnectionID, direction)
+  // -- roughly 40 lines, touching every call site in net-policy.cpp -- or to
+  // exclude `lo` at the iptables layer. Do not paper over it by mutating shared
+  // entries defensively at the use sites.
   std::unordered_map<ConnectionID, std::shared_ptr<http::Connection>, ConnectionIDHash> http_conns_;
   std::unordered_map<ConnectionID, MicrosegEntry, ConnectionIDHash> microseg_conns_;
 };
