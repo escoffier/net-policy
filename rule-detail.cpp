@@ -86,12 +86,10 @@ NFQ_RES_INFO::~NFQ_RES_INFO() {}
 
 void NFQ_RES_INFO::Init() {
   this->pid_ = 0;
-  this->input_fd_ = 0;
-  this->output_fd_ = 0;
   this->pod_id_ = 0;
   this->poll_fd_ = 0;
-  this->input_que_ = nullptr;
-  this->output_que_ = nullptr;
+  // input_queue_/output_queue_ default-construct as disengaged
+  // std::optionals; no explicit reset needed here.
   this->input_cb_ = nullptr;
   this->output_cb_ = nullptr;
   // nf conntrack
@@ -104,31 +102,20 @@ void NFQ_RES_INFO::Init() {
 /*释放资源*/
 void NFQ_RES_INFO::FreeResource(int efd) {
   struct epoll_event ev;
-  struct nfq_q_handle* qh = NULL;
 
-  /*close input fd*/
-  if (this->input_fd_ > 0) {
-    ev.data.fd = this->input_fd_;
-    epoll_ctl(efd, EPOLL_CTL_DEL, this->input_fd_, &ev);
-    close(this->input_fd_);
+  /*unregister + close input queue*/
+  if (this->input_queue_) {
+    int fd = (*this->input_queue_)->fd();
+    ev.data.fd = fd;
+    epoll_ctl(efd, EPOLL_CTL_DEL, fd, &ev);
+    this->input_queue_.reset();  // drops the Rust NfqQueue, closing its socket
   }
-  /*close output fd*/
-  if (this->output_fd_ > 0) {
-    ev.data.fd = this->output_fd_;
-    epoll_ctl(efd, EPOLL_CTL_DEL, this->output_fd_, &ev);
-    close(this->output_fd_);
-  }
-  /*destroy input queue*/
-  if (this->input_que_) {
-    qh = this->input_que_;
-    nfq_close(qh->h);
-    nfq_destroy_queue(qh);
-  }
-  /*destroy output queue*/
-  if (this->output_que_) {
-    qh = this->output_que_;
-    nfq_close(qh->h);
-    nfq_destroy_queue(qh);
+  /*unregister + close output queue*/
+  if (this->output_queue_) {
+    int fd = (*this->output_queue_)->fd();
+    ev.data.fd = fd;
+    epoll_ctl(efd, EPOLL_CTL_DEL, fd, &ev);
+    this->output_queue_.reset();
   }
   if (this->input_cb_)
     delete this->input_cb_;

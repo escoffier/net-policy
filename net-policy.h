@@ -28,6 +28,7 @@
 #include "waf/plugin.h"
 #include "net_policy_engine_cxxbridge/lib.h"
 #include "net_iptables_cxxbridge/lib.h"
+#include "net_nfq_cxxbridge/lib.h"
 #include "admin/profile.h"
 #include "utils.h"
 
@@ -113,11 +114,14 @@ class NFQ_RES_INFO
 {
 public:
     int pid_;
-    int input_fd_;
-    int output_fd_;
     int poll_fd_;
-    struct nfq_q_handle* input_que_  = nullptr;
-    struct nfq_q_handle* output_que_ = nullptr;
+    // Fallible to construct (queue open can fail) and freed explicitly by
+    // FreeResource before this object's own destruction, so these cannot be
+    // bare rust::Box<T> fields -- Box<T> has no default constructor and
+    // cannot be null. std::optional represents "not yet opened"/"already
+    // freed"; the Box it wraps, whenever engaged, is always a real queue.
+    std::optional<rust::Box<net_nfq::NfqQueue>> input_queue_;
+    std::optional<rust::Box<net_nfq::NfqQueue>> output_queue_;
     RcvEpollCb*          input_cb_   = nullptr;
     RcvEpollCb*          output_cb_  = nullptr;
     // nf conntrack
