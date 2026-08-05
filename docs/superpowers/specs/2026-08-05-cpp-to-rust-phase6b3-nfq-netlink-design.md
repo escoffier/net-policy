@@ -93,7 +93,7 @@ sequence and neither is large enough alone to justify its own crate.
 `cxx` bridge shape:
 
 ```rust
-pub struct NfqMessage { id: u32, payload: Vec<u8> }
+pub struct NfqMessage { id: u32, payload: Vec<u8>, nfmark: u32 }
 pub enum NfqVerdict { Accept, Drop }
 
 // opaque Rust type, one instance per direction (input/output) — matching
@@ -105,7 +105,23 @@ fn open_queue(queue_num: u16) -> Result<Box<NfqQueue>>; // nfq_open+bind_pf+crea
 impl NfqQueue {
     fn fd(&self) -> i32;                                  // for epoll_ctl registration
     fn recv_batch(&mut self) -> Result<Vec<NfqMessage>>;   // drains until WouldBlock
-    fn verdict(&mut self, id: u32, v: NfqVerdict, mark: u32, payload: &[u8]) -> Result<()>;
+    // `mark` is Option, not a bare u32: nfq_set_verdict (no mark argument at
+    // all) and nfq_set_verdict2 (explicit mark) are NOT the same operation --
+    // the 3-arg form leaves the packet's existing nfmark untouched, while the
+    // 2-arg-plus-mark form overwrites it. Collapsing both into "always set an
+    // explicit mark, using 0 for the old no-mark call sites" would forcibly
+    // zero marks that used to survive ACCEPT verdicts untouched (see
+    // input_nfq_cb's own nfq_get_nfmark(nfa) fast-path, which depends on a
+    // mark set by an EARLIER verdict surviving to be read on a LATER packet).
+    // None => nfq_set_verdict (mark untouched); Some(m) => nfq_set_verdict2
+    // with that mark. `payload`: an empty slice means "no NFQA_PAYLOAD
+    // attribute at all" (kernel keeps the original, unmodified payload,
+    // matching today's `data_len=0, pkg=NULL` calls) -- NOT a zero-length
+    // payload override. A non-empty slice is sent as the replacement payload,
+    // covering both "re-inject the unmodified bytes" and "re-inject after an
+    // in-place rewrite" call sites identically, since both already hand back
+    // the full buffer today.
+    fn verdict(&mut self, id: u32, v: NfqVerdict, mark: Option<u32>, payload: &[u8]) -> Result<()>;
     // Drop closes the queue -- replaces nfq_close/nfq_destroy_queue
 }
 
@@ -116,7 +132,11 @@ fn set_ns(pid: i32, base_path: &str) -> Result<()>; // unshare(CLONE_NEWNET)+set
 behavior: internally loops calling the underlying `nfq` crate's per-message recv
 until it hits `WouldBlock`, collecting everything available into one `Vec` — a
 single `read()` on the netlink socket can carry multiple queued messages today,
-and this preserves that.
+and this preserves that. Each `NfqMessage` carries `nfmark` (from
+`nfq_get_nfmark`) alongside `id`/`payload`, since `input_nfq_cb` reads the
+incoming mark itself (its fast-path early-accept when the mark already says
+`kAllow`/`kAllowRsp`) — today via `nfq_get_nfmark(nfa)`, going forward via this
+field instead of a separate call.
 
 ### 2. Error handling — a new pattern for this codebase, narrowly scoped
 
@@ -154,15 +174,24 @@ failure changes.
   `(net_nfq::NfqQueue& queue, uint32_t id, unsigned char* pkg, int data_len)` —
   `NfqueueRcvData` extracts `id`/`pkg`/`data_len` directly from each
   `net_nfq::NfqMessage` before calling in, replacing the current
-  `nfq_get_msg_packet_hdr`/`nfq_get_payload` calls at the top of each callback.
+  `nfq_get_msg_packet_hdr`/`nfq_get_payload` calls at the top of each callback,
+  and `nfq_get_nfmark(nfa)`'s one read site (`input_nfq_cb`'s fast-path
+  early-accept) reads the message's `nfmark` field instead.
   Every `nfq_set_verdict(qh, id, V, 0, NULL)` becomes
-  `queue.verdict(id, V, 0, {})`; every `nfq_set_verdict2(qh, id, V, mark,
-  data_len, pkg)` becomes `queue.verdict(id, V, mark, {pkg,
-  (size_t)data_len})`. The decision logic surrounding these calls is untouched.
+  `queue.verdict(id, V, std::nullopt, {})` (mark left untouched, no payload
+  override); every `nfq_set_verdict2(qh, id, V, mark, data_len, pkg)` becomes
+  `queue.verdict(id, V, mark, {pkg, (size_t)data_len})`. The decision logic
+  surrounding these calls is untouched.
 - The `rst_tcp_link`-style in-place payload rewrite (zeroing TCP payload bytes,
   recomputing the checksum) keeps mutating `pkg` directly before the verdict
   call — `pkg` is still a plain mutable buffer, just sourced from
   `recv_batch()`'s `Vec<u8>` instead of a `libnetfilter_queue`-owned pointer.
+- `FreeResource`'s current fd-cleanup order — `epoll_ctl(EPOLL_CTL_DEL, ...)`
+  then `close(fd)` for each direction, done explicitly *before* the queue
+  object itself is destroyed — is preserved: it calls `.fd()` on each
+  `NfqQueue` to do the `epoll_ctl` removal, then drops the `Box`, rather than
+  relying on `Drop` alone to implicitly unregister-and-close in an
+  unspecified order relative to the epoll set.
 
 ### 4. Netns switching (`net_nfq::netns` + `net-policy.cpp`)
 
