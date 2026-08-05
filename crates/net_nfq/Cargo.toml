@@ -8,5 +8,8 @@ crate-type = ["staticlib"]
 
 [dependencies]
 cxx = "1"
-nfq = "0.2"
+# Vendored, not crates.io -- published nfq 0.2.5 has no way to expose its
+# socket's fd, which this daemon's single-threaded epoll loop requires.
+# See third_party/nfq-0.2.5/VENDORING.md.
+nfq = { path = "../../third_party/nfq-0.2.5" }
 nix = { version = "0.31", features = ["sched"] }
