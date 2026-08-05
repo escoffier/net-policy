@@ -14,7 +14,6 @@
 #include "cjson.h"
 #include "libmnl/libmnl.h"
 #include "libnetfilter_conntrack/libnetfilter_conntrack.h"
-#include "libnetfilter_queue/libnetfilter_queue.h"
 #include "glog/logging.h"
 #include "http/packet.hh"
 #include "log.h"
@@ -50,7 +49,6 @@ inline constexpr int              kNfMatchRule    = 6;
 typedef struct nf_conntrack NF_CONNTRACK;
 /*epoll call function*/
 using RcvCbFunc = int32_t(*)(int32_t epoll_fd, int32_t fd, void* ptr);
-extern int SetNs(int pid, char *basePath);
 /*daemon entrypoint; defined in net-policy.cpp, called from main.cpp*/
 extern int RunNetPolicyDaemon(int argc, char* argv[]);
 

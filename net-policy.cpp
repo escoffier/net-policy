@@ -255,37 +255,6 @@ uint32_t ipv4StringToInt(std::string ip) {
   return 0;
 }
 
-int SetNs(int pid, char* basePath) {
-  int fd = 0, ret;
-  char path[128];
-  if (pid <= 0)
-    RETURN_ERROR(-1, "pid is error!");
-  // path
-  memset(path, 0, sizeof(path));
-  sprintf(path, "%s/proc/%d/ns/net", basePath, pid);
-  // open path
-  fd = open(path, O_RDONLY);
-  if (fd <= 0)
-    RETURN_ERROR(-1, "open %s failed, err : %s.", path, strerror(errno));
-  // unshare net
-  ret = unshare(CLONE_NEWNET);
-  if (ret != 0)
-    GOTO_ERROR(err, "unshare net failed! err : %s.", strerror(errno));
-  // set net ns
-  ret = setns(fd, CLONE_NEWNET);
-  if (ret != 0)
-    GOTO_ERROR(err, "set net ns failed, path : %s, err : %s.", path, strerror(errno));
-  // close fd
-  close(fd);
-  // return
-  return 0;
-err:
-  if (fd > 0)
-    close(fd);
-  /*return*/
-  return -1;
-}
-
 /*MicroSegEngine implementation*/
 void MicroSegEngine::DeletePolicy(const std::string& name) {
   input_http_policy_.erase(name);
