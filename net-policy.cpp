@@ -236,31 +236,6 @@ std::string PrintPortsData(std::vector<RULE_PORT>& ports) {
   return value;
 }
 
-int OpenLocalNetNs() {
-  const char* path = "/proc/self/ns/net";
-  // open net namespaces
-  int fd = open(path, O_RDONLY);
-  if (fd <= 0)
-    RETURN_ERROR(-1, "open %s net namespaces failed! err : %s.", path, strerror(errno));
-  return fd;
-}
-
-int SetLocalNetNs(int fd) {
-  int ret;
-  if (fd <= 0)
-    RETURN_ERROR(-1, "local net ns fd is error!!");
-  // unshare net
-  ret = unshare(CLONE_NEWNET);
-  if (ret != 0)
-    RETURN_ERROR(-1, "unshare net failed! err : %s.", strerror(errno));
-  // set local net ns
-  ret = setns(fd, CLONE_NEWNET);
-  if (ret != 0)
-    RETURN_ERROR(-1, "set local net ns failed! err : %s.", strerror(errno));
-
-  return 0;
-}
-
 std::string ipv6Convert(char* ipv6) {
   int ret;
   string sRet = "";
@@ -278,37 +253,6 @@ uint32_t ipv4StringToInt(std::string ip) {
     return addr.s_addr;
   }
   return 0;
-}
-
-int SetNs(int pid, char* basePath) {
-  int fd = 0, ret;
-  char path[128];
-  if (pid <= 0)
-    RETURN_ERROR(-1, "pid is error!");
-  // path
-  memset(path, 0, sizeof(path));
-  sprintf(path, "%s/proc/%d/ns/net", basePath, pid);
-  // open path
-  fd = open(path, O_RDONLY);
-  if (fd <= 0)
-    RETURN_ERROR(-1, "open %s failed, err : %s.", path, strerror(errno));
-  // unshare net
-  ret = unshare(CLONE_NEWNET);
-  if (ret != 0)
-    GOTO_ERROR(err, "unshare net failed! err : %s.", strerror(errno));
-  // set net ns
-  ret = setns(fd, CLONE_NEWNET);
-  if (ret != 0)
-    GOTO_ERROR(err, "set net ns failed, path : %s, err : %s.", path, strerror(errno));
-  // close fd
-  close(fd);
-  // return
-  return 0;
-err:
-  if (fd > 0)
-    close(fd);
-  /*return*/
-  return -1;
 }
 
 /*MicroSegEngine implementation*/
@@ -549,38 +493,28 @@ static int rst_tcp_link(unsigned char* pkg) {
   return NF_ACCEPT;
 }
 
-static int input_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct nfq_data* nfa,
-                        void* argv) {
-  int id = 0;
-  uint32_t mark;
+static void input_nfq_cb(NFQ_RES_INFO* nfq_res, net_nfq::NfqQueue& queue, net_nfq::NfqMessage& msg) {
+  uint32_t id = msg.id;
+  unsigned char* pkg = msg.payload.data();
+  int data_len = static_cast<int>(msg.payload.size());
+  uint32_t mark = msg.nfmark;
   FLOW_DIR dir = FlowDir::kIngress;
   std::string rule_key;
   FiveTuple tuple;
   NET_POLICY_RULE rule_ret;
-  struct nfqnl_msg_packet_hdr* ph;
-  unsigned char* pkg;
-  NFQ_RES_INFO* nfq_res = (NFQ_RES_INFO*)argv;
   DaemonContext* daemon = nfq_res->daemon_;
 
-  ph = nfq_get_msg_packet_hdr(nfa);
-  if (!ph)
-    return 0;
-
-  id = ntohl(ph->packet_id);
-  // printf("hw_protocol=0x%04x hook=%u id=%u ", ntohs(ph->hw_protocol), ph->hook, id);
-
-  mark = nfq_get_nfmark(nfa);
   if ((mark == static_cast<uint32_t>(NetPolicyRule::kAllow)) ||
-      (mark == static_cast<uint32_t>(NetPolicyRule::kAllowRsp)))
-    return nfq_set_verdict(qh, id, NF_ACCEPT, 0, NULL);
-
-  auto data_len = nfq_get_payload(nfa, &pkg);
-  if (data_len < 0)
-    return nfq_set_verdict(qh, id, NF_ACCEPT, 0, NULL);
+      (mark == static_cast<uint32_t>(NetPolicyRule::kAllowRsp))) {
+    queue.verdict(id, net_nfq::NfqVerdict::Accept, {});
+    return;
+  }
 
   // printf("payload_len=%d ", ret);
-  if (data_len < (int)sizeof(struct iphdr))
-    return nfq_set_verdict(qh, id, NF_ACCEPT, 0, NULL);
+  if (data_len < (int)sizeof(struct iphdr)) {
+    queue.verdict(id, net_nfq::NfqVerdict::Accept, {});
+    return;
+  }
 
   // `track_tcp` is now unconditionally true. Until this phase it was
   // WafEnabled(), because the WAF was the only consumer of the TCB state
@@ -605,7 +539,8 @@ static int input_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct 
     // and issued a second NF_ACCEPT verdict for the same packet id. Returning
     // here is behaviorally equivalent for every real packet and avoids the
     // redundant double verdict.
-    return nfq_set_verdict(qh, id, NF_ACCEPT, 0, NULL);
+    queue.verdict(id, net_nfq::NfqVerdict::Accept, {});
+    return;
   }
   tuple.proto_        = result.tuple.proto;
   tuple.tot_len_      = result.tuple.tot_len;
@@ -625,7 +560,10 @@ static int input_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct 
     auto status = daemon->ConnMgr().DispatchWaf(result.decision,
                                                 reinterpret_cast<const uint8_t*>(pkg), data_len);
     if (status == net::NetStatus::Drop) {
-      return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllowReq), data_len, pkg);
+      queue.verdict_with_mark(id, net_nfq::NfqVerdict::Accept,
+                              static_cast<uint32_t>(NetPolicyRule::kAllowReq),
+                              {pkg, static_cast<size_t>(data_len)});
+      return;
     }
   }
 
@@ -638,20 +576,27 @@ static int input_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct 
     // reach the TCP-only tail below. Hoisting them here is a pure
     // restructuring, verdict-for-verdict identical.
     rule_ret = MatchMicroPolicyRule(tuple, dir, rule_key, *daemon);
-    if (rule_ret == NetPolicyRule::kDefault)
-      return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllow), 0, NULL);
+    if (rule_ret == NetPolicyRule::kDefault) {
+      queue.verdict_with_mark(id, net_nfq::NfqVerdict::Accept,
+                              static_cast<uint32_t>(NetPolicyRule::kAllow), {});
+      return;
+    }
     daemon->PostSrv().SendMatchMsg(tuple, rule_ret, dir, rule_key);
     if (rule_ret == NetPolicyRule::kDeny) {
       LOG_D("input drop %s %s:%u -> %s:%u ", GetProtoString(tuple.proto_), tuple.src_addr_.c_str(),
             tuple.src_port_, tuple.dst_addr_.c_str(), tuple.dst_port_);
-      return nfq_set_verdict(qh, id, NF_DROP, 0, NULL);
+      queue.verdict(id, net_nfq::NfqVerdict::Drop, {});
+      return;
     }
-    return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllow), 0, NULL);
+    queue.verdict_with_mark(id, net_nfq::NfqVerdict::Accept,
+                            static_cast<uint32_t>(NetPolicyRule::kAllow), {});
+    return;
   }
   if (tuple.proto_ != IPPROTO_TCP) {
     // Unreachable in practice (parse_five_tuple only reports recognized==true
     // for TCP/UDP/ICMP), kept as the old switch's `default:` behavior.
-    return nfq_set_verdict(qh, id, NF_ACCEPT, 0, NULL);
+    queue.verdict(id, net_nfq::NfqVerdict::Accept, {});
+    return;
   }
 
   // ---- TCP from here on. -------------------------------------------------
@@ -711,7 +656,9 @@ static int input_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct 
     // running any policy match, which is what this reproduces. The one
     // difference: if that flow had been late-bound into microseg's map, the
     // old code would also have erased its entry here. See this task's report.
-    return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllowReq), 0, NULL);
+    queue.verdict_with_mark(id, net_nfq::NfqVerdict::Accept,
+                            static_cast<uint32_t>(NetPolicyRule::kAllowReq), {});
+    return;
   }
 
   // Closed (FIN/RST): tear down BOTH directions' microsegmentation entries
@@ -734,7 +681,9 @@ static int input_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct 
       // Teardown already done unconditionally above.
       LOG_D("microseg-dp input data, delete conntrack info, src: %s:%d, dest : %s:%d",
             tuple.src_addr_.c_str(), tuple.src_port_, tuple.dst_addr_.c_str(), tuple.dst_port_);
-      return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllow), 0, NULL);
+      queue.verdict_with_mark(id, net_nfq::NfqVerdict::Accept,
+                              static_cast<uint32_t>(NetPolicyRule::kAllow), {});
+      return;
     }
     if (!has_payload) {
       // Old: `found`, not FIN/RST, `data_len <= offset` -- a bare ACK. Note
@@ -742,18 +691,23 @@ static int input_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct 
       // its !found path, where the SYN test came first), so a payload-less
       // SYN on a tracked flow returns here; `syn` is deliberately not
       // consulted.
-      return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllowReq), 0, NULL);
+      queue.verdict_with_mark(id, net_nfq::NfqVerdict::Accept,
+                              static_cast<uint32_t>(NetPolicyRule::kAllowReq), {});
+      return;
     }
     if (syn) {
       // Old L726's `if (tcphdr.syn == 1)`, reachable in the found path only
       // for a payload-bearing SYN: its insert was a std::map::insert on an
       // already-present key, i.e. a no-op, and it returned kAllowReq without
       // extracting. Reproduced exactly -- no re-tracking, no onData.
-      return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllowReq), 0, NULL);
+      queue.verdict_with_mark(id, net_nfq::NfqVerdict::Accept,
+                              static_cast<uint32_t>(NetPolicyRule::kAllowReq), {});
+      return;
     }
     if (decision.kind == 4) {  // Old: `tcp_seq < tcp_it->second->getTcpSeq()`.
       LOG_D("input - duplicated tcp segment");
-      return nfq_set_verdict(qh, id, NF_ACCEPT, 0, NULL);
+      queue.verdict(id, net_nfq::NfqVerdict::Accept, {});
+      return;
     }
     // The tracked flow's own stored key is authoritative here -- this branch
     // never ran MatchMicroPolicyRule, so the local rule_key is still empty.
@@ -774,12 +728,17 @@ static int input_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct 
       // torn down the PEER direction's microseg entry via the unconditional
       // MicrosegClose call above -- that teardown must not depend on reaching
       // this branch or the tracked one.
-      return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllowReq), 0, NULL);
+      queue.verdict_with_mark(id, net_nfq::NfqVerdict::Accept,
+                              static_cast<uint32_t>(NetPolicyRule::kAllowReq), {});
+      return;
     }
     /*match rule*/
     rule_ret = MatchMicroPolicyRule(tuple, dir, rule_key, *daemon);
-    if (rule_ret == NetPolicyRule::kDefault)
-      return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllow), 0, NULL);
+    if (rule_ret == NetPolicyRule::kDefault) {
+      queue.verdict_with_mark(id, net_nfq::NfqVerdict::Accept,
+                              static_cast<uint32_t>(NetPolicyRule::kAllow), {});
+      return;
+    }
     /*query http rule*/
     auto http_rule = daemon->Microseg().InputHttpPolicy().find(rule_key);
     if ((http_rule == daemon->Microseg().InputHttpPolicy().end()) || (http_rule->second.empty())) {
@@ -790,10 +749,13 @@ static int input_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct 
         LOG_D("input drop %s %s:%u -> %s:%u ", GetProtoString(tuple.proto_), tuple.src_addr_.c_str(),
               tuple.src_port_, tuple.dst_addr_.c_str(), tuple.dst_port_);
         /*drop data*/
-        return nfq_set_verdict(qh, id, NF_DROP, 0, NULL);
+        queue.verdict(id, net_nfq::NfqVerdict::Drop, {});
+        return;
       }
       /*return*/
-      return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllow), 0, NULL);
+      queue.verdict_with_mark(id, net_nfq::NfqVerdict::Accept,
+                              static_cast<uint32_t>(NetPolicyRule::kAllow), {});
+      return;
     }
     // An HTTP policy applies to this flow.
     if (syn) {
@@ -804,7 +766,9 @@ static int input_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct 
       LOG_D("microseg-dp  input sync, src: %s, dest : %s, data len : %d", tuple.src_addr_.c_str(),
             tuple.dst_addr_.c_str(), data_len);
       daemon->ConnMgr().MicrosegTrack(decision, rule_key);
-      return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllowReq), 0, NULL);
+      queue.verdict_with_mark(id, net_nfq::NfqVerdict::Accept,
+                              static_cast<uint32_t>(NetPolicyRule::kAllowReq), {});
+      return;
     }
     // Non-SYN, payload-bearing, HTTP policy applies: start tracking this flow
     // with the key just matched, then fall through to the single shared
@@ -834,60 +798,62 @@ static int input_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct 
         header ? header->method_.c_str() : "", header ? header->path_.c_str() : "",
         header ? header->host_.c_str() : "", header ? static_cast<int>(header->parseState_) : -1);
   /*parse http state*/
-  if (!header)
-    return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllowReq), 0, NULL);
+  if (!header) {
+    queue.verdict_with_mark(id, net_nfq::NfqVerdict::Accept,
+                            static_cast<uint32_t>(NetPolicyRule::kAllowReq), {});
+    return;
+  }
   /*query http rule*/
   auto http_rule = daemon->Microseg().InputHttpPolicy().find(rule_key);
-  if (http_rule == daemon->Microseg().InputHttpPolicy().end())
-    return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kDefault), 0, NULL);
+  if (http_rule == daemon->Microseg().InputHttpPolicy().end()) {
+    queue.verdict_with_mark(id, net_nfq::NfqVerdict::Accept,
+                            static_cast<uint32_t>(NetPolicyRule::kDefault), {});
+    return;
+  }
   // process header
   rule_ret = MatchHttpPolicyRule(http_rule->second, *header);
   /*print debug log*/
   LOG_D("match input http rule : %d, key : %s", static_cast<int>(rule_ret), rule_key.c_str());
   /*net rule continue*/
-  if (rule_ret == NetPolicyRule::kDefault)
-    return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllowReq), 0, NULL);
+  if (rule_ret == NetPolicyRule::kDefault) {
+    queue.verdict_with_mark(id, net_nfq::NfqVerdict::Accept,
+                            static_cast<uint32_t>(NetPolicyRule::kAllowReq), {});
+    return;
+  }
   /*post match message*/
   daemon->PostSrv().SendMatchMsg(tuple, rule_ret, FlowDir::kIngress, rule_key);
   /*rst tcp link*/
   if (rule_ret == NetPolicyRule::kDeny)
     rst_tcp_link(pkg);
   /*send rst http*/
-  return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllowReq), data_len, pkg);
+  queue.verdict_with_mark(id, net_nfq::NfqVerdict::Accept,
+                          static_cast<uint32_t>(NetPolicyRule::kAllowReq),
+                          {pkg, static_cast<size_t>(data_len)});
+  return;
 }
 
-static int output_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct nfq_data* nfa,
-                         void* argv) {
-  int id = 0;
-  uint32_t mark;
+static void output_nfq_cb(NFQ_RES_INFO* nfq_res, net_nfq::NfqQueue& queue, net_nfq::NfqMessage& msg) {
+  uint32_t id = msg.id;
+  unsigned char* pkg = msg.payload.data();
+  int data_len = static_cast<int>(msg.payload.size());
+  uint32_t mark = msg.nfmark;
   FLOW_DIR dir = FlowDir::kEgress;
   std::string rule_key;
   FiveTuple tuple;
-  struct nfqnl_msg_packet_hdr* ph;
-  unsigned char* pkg;
   NET_POLICY_RULE rule_ret;
-  NFQ_RES_INFO* nfq_res = (NFQ_RES_INFO*)argv;
   DaemonContext* daemon = nfq_res->daemon_;
 
-  ph = nfq_get_msg_packet_hdr(nfa);
-  if (!ph)
-    return 0;
-
-  id = ntohl(ph->packet_id);
-  // printf("hw_protocol=0x%04x hook=%u id=%u ", ntohs(ph->hw_protocol), ph->hook, id);
-
-  mark = nfq_get_nfmark(nfa);
   if ((mark == static_cast<uint32_t>(NetPolicyRule::kAllow)) ||
-      (mark == static_cast<uint32_t>(NetPolicyRule::kAllowReq)))
-    return nfq_set_verdict(qh, id, NF_ACCEPT, 0, NULL);
-
-  auto data_len = nfq_get_payload(nfa, &pkg);
-  if (data_len < 0)
-    return nfq_set_verdict(qh, id, NF_ACCEPT, 0, NULL);
+      (mark == static_cast<uint32_t>(NetPolicyRule::kAllowReq))) {
+    queue.verdict(id, net_nfq::NfqVerdict::Accept, {});
+    return;
+  }
 
   // printf("payload_len=%d ", ret);
-  if (data_len < (int)sizeof(struct iphdr))
-    return nfq_set_verdict(qh, id, NF_ACCEPT, 0, NULL);
+  if (data_len < (int)sizeof(struct iphdr)) {
+    queue.verdict(id, net_nfq::NfqVerdict::Accept, {});
+    return;
+  }
 
   // `track_tcp` is unconditionally true -- see input_nfq_cb's identical call
   // for why this is no longer gated on WafEnabled().
@@ -896,7 +862,8 @@ static int output_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct
   if (!result.tuple.recognized) {
     // See input_nfq_cb for the rationale behind returning here rather than
     // replicating parse_package's old fall-through-without-return quirk.
-    return nfq_set_verdict(qh, id, NF_ACCEPT, 0, NULL);
+    queue.verdict(id, net_nfq::NfqVerdict::Accept, {});
+    return;
   }
   tuple.proto_        = result.tuple.proto;
   tuple.tot_len_      = result.tuple.tot_len;
@@ -917,7 +884,10 @@ static int output_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct
                                                 reinterpret_cast<const uint8_t*>(pkg), data_len);
     if (status == net::NetStatus::Drop) {
       // LOG_D("drop pkt: %p", pkg);
-      return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllowRsp), data_len, pkg);
+      queue.verdict_with_mark(id, net_nfq::NfqVerdict::Accept,
+                              static_cast<uint32_t>(NetPolicyRule::kAllowRsp),
+                              {pkg, static_cast<size_t>(data_len)});
+      return;
     }
   }
 
@@ -926,19 +896,26 @@ static int output_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct
     // and the old shared `!found` block could never carry them past its own
     // returns anyway.
     rule_ret = MatchMicroPolicyRule(tuple, dir, rule_key, *daemon);
-    if (rule_ret == NetPolicyRule::kDefault)
-      return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllow), 0, NULL);
+    if (rule_ret == NetPolicyRule::kDefault) {
+      queue.verdict_with_mark(id, net_nfq::NfqVerdict::Accept,
+                              static_cast<uint32_t>(NetPolicyRule::kAllow), {});
+      return;
+    }
     daemon->PostSrv().SendMatchMsg(tuple, rule_ret, dir, rule_key);
     if (rule_ret == NetPolicyRule::kDeny) {
       LOG_D("output drop %s %s:%u -> %s:%u ", GetProtoString(tuple.proto_), tuple.src_addr_.c_str(),
             tuple.src_port_, tuple.dst_addr_.c_str(), tuple.dst_port_);
-      return nfq_set_verdict(qh, id, NF_DROP, 0, NULL);
+      queue.verdict(id, net_nfq::NfqVerdict::Drop, {});
+      return;
     }
-    return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllow), 0, NULL);
+    queue.verdict_with_mark(id, net_nfq::NfqVerdict::Accept,
+                            static_cast<uint32_t>(NetPolicyRule::kAllow), {});
+    return;
   }
   if (tuple.proto_ != IPPROTO_TCP) {
     // Old switch's `default:` behavior; unreachable in practice.
-    return nfq_set_verdict(qh, id, NF_ACCEPT, 0, NULL);
+    queue.verdict(id, net_nfq::NfqVerdict::Accept, {});
+    return;
   }
 
   // ---- TCP from here on. See input_nfq_cb for the full commentary on the
@@ -965,7 +942,9 @@ static int output_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct
   if (decision.kind == 0) {
     // RST on a flow the TCB tracker never saw a SYN for -- old code's
     // payload-less early return. See input_nfq_cb.
-    return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllowRsp), 0, NULL);
+    queue.verdict_with_mark(id, net_nfq::NfqVerdict::Accept,
+                            static_cast<uint32_t>(NetPolicyRule::kAllowRsp), {});
+    return;
   }
 
   // Closed (FIN/RST): tear down BOTH directions' microsegmentation entries
@@ -981,21 +960,28 @@ static int output_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct
       // Teardown already done unconditionally above.
       LOG_D("microseg-dp out data, delete conntrack info, src: %s:%d, dest : %s:%d",
             tuple.src_addr_.c_str(), tuple.src_port_, tuple.dst_addr_.c_str(), tuple.dst_port_);
-      return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllow), 0, NULL);
+      queue.verdict_with_mark(id, net_nfq::NfqVerdict::Accept,
+                              static_cast<uint32_t>(NetPolicyRule::kAllow), {});
+      return;
     }
     if (!has_payload) {
       // Old: `found`, not FIN/RST, `data_len <= offset` -- a bare ACK. The old
       // found-path payload test had no SYN exemption; see input_nfq_cb.
-      return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllowRsp), 0, NULL);
+      queue.verdict_with_mark(id, net_nfq::NfqVerdict::Accept,
+                              static_cast<uint32_t>(NetPolicyRule::kAllowRsp), {});
+      return;
     }
     if (syn) {
       // Old L943's `if (tcphdr.syn == 1)` on an already-tracked flow: its
       // insert was a no-op and it returned without extracting.
-      return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllowRsp), 0, NULL);
+      queue.verdict_with_mark(id, net_nfq::NfqVerdict::Accept,
+                              static_cast<uint32_t>(NetPolicyRule::kAllowRsp), {});
+      return;
     }
     if (decision.kind == 4) {  // Old: `tcp_seq < tcp_it->second->getTcpSeq()`.
       LOG_D("output - duplicated tcp segment");
-      return nfq_set_verdict(qh, id, NF_ACCEPT, 0, NULL);
+      queue.verdict(id, net_nfq::NfqVerdict::Accept, {});
+      return;
     }
     // Mirrors the old `rule_key = tcp_it->second->getRuleKey();` -- this
     // branch never ran MatchMicroPolicyRule, so the local rule_key is empty.
@@ -1005,12 +991,17 @@ static int output_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct
       // Old: not found, not SYN, `data_len <= offset`. A kind-2 packet reaching
       // here has already torn down the peer direction's microseg entry via the
       // unconditional MicrosegClose above; see input_nfq_cb.
-      return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllowRsp), 0, NULL);
+      queue.verdict_with_mark(id, net_nfq::NfqVerdict::Accept,
+                              static_cast<uint32_t>(NetPolicyRule::kAllowRsp), {});
+      return;
     }
     /*match rule*/
     rule_ret = MatchMicroPolicyRule(tuple, dir, rule_key, *daemon);
-    if (rule_ret == NetPolicyRule::kDefault)
-      return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllow), 0, NULL);
+    if (rule_ret == NetPolicyRule::kDefault) {
+      queue.verdict_with_mark(id, net_nfq::NfqVerdict::Accept,
+                              static_cast<uint32_t>(NetPolicyRule::kAllow), {});
+      return;
+    }
     /*query http rule*/
     auto http_rule = daemon->Microseg().OutputHttpPolicy().find(rule_key);
     if ((http_rule == daemon->Microseg().OutputHttpPolicy().end()) || (http_rule->second.empty())) {
@@ -1021,10 +1012,13 @@ static int output_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct
         LOG_D("output drop %s %s:%u -> %s:%u ", GetProtoString(tuple.proto_), tuple.src_addr_.c_str(),
               tuple.src_port_, tuple.dst_addr_.c_str(), tuple.dst_port_);
         /*drop data*/
-        return nfq_set_verdict(qh, id, NF_DROP, 0, NULL);
+        queue.verdict(id, net_nfq::NfqVerdict::Drop, {});
+        return;
       }
       /*return*/
-      return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllow), 0, NULL);
+      queue.verdict_with_mark(id, net_nfq::NfqVerdict::Accept,
+                              static_cast<uint32_t>(NetPolicyRule::kAllow), {});
+      return;
     }
     // An HTTP policy applies to this flow.
     if (syn) {
@@ -1035,7 +1029,9 @@ static int output_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct
       LOG_D("microseg-dp output sync, rule key : %s, src: %s, dest : %s, data len : %d",
             rule_key.c_str(), tuple.src_addr_.c_str(), tuple.dst_addr_.c_str(), data_len);
       daemon->ConnMgr().MicrosegTrack(decision, rule_key);
-      return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllowRsp), 0, NULL);
+      queue.verdict_with_mark(id, net_nfq::NfqVerdict::Accept,
+                              static_cast<uint32_t>(NetPolicyRule::kAllowRsp), {});
+      return;
     }
     // Non-SYN, payload-bearing, HTTP policy applies: late-bind before the
     // shared dispatch -- old L956-964's explicit insert. See input_nfq_cb.
@@ -1052,26 +1048,38 @@ static int output_nfq_cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg, struct
         header ? header->host_.c_str() : "", header ? static_cast<int>(header->parseState_) : -1,
         rule_key.c_str());
   /*parse http state*/
-  if (!header)
-    return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllowRsp), 0, NULL);
+  if (!header) {
+    queue.verdict_with_mark(id, net_nfq::NfqVerdict::Accept,
+                            static_cast<uint32_t>(NetPolicyRule::kAllowRsp), {});
+    return;
+  }
   /*query http rule*/
   auto http_rule = daemon->Microseg().OutputHttpPolicy().find(rule_key);
-  if (http_rule == daemon->Microseg().OutputHttpPolicy().end())
-    return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kDefault), 0, NULL);
+  if (http_rule == daemon->Microseg().OutputHttpPolicy().end()) {
+    queue.verdict_with_mark(id, net_nfq::NfqVerdict::Accept,
+                            static_cast<uint32_t>(NetPolicyRule::kDefault), {});
+    return;
+  }
   // process header
   rule_ret = MatchHttpPolicyRule(http_rule->second, *header);
   /*print debug log*/
   LOG_D("match output http rule : %d, key : %s", static_cast<int>(rule_ret), rule_key.c_str());
   /*net rule continue*/
-  if (rule_ret == NetPolicyRule::kDefault)
-    return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllowRsp), 0, NULL);
+  if (rule_ret == NetPolicyRule::kDefault) {
+    queue.verdict_with_mark(id, net_nfq::NfqVerdict::Accept,
+                            static_cast<uint32_t>(NetPolicyRule::kAllowRsp), {});
+    return;
+  }
   /*post match message*/
   daemon->PostSrv().SendMatchMsg(tuple, rule_ret, FlowDir::kEgress, rule_key);
   /*rst tcp link*/
   if (rule_ret == NetPolicyRule::kDeny)
     rst_tcp_link(pkg);
   /*send rst http*/
-  return nfq_set_verdict2(qh, id, NF_ACCEPT, static_cast<uint32_t>(NetPolicyRule::kAllowRsp), data_len, pkg);
+  queue.verdict_with_mark(id, net_nfq::NfqVerdict::Accept,
+                          static_cast<uint32_t>(NetPolicyRule::kAllowRsp),
+                          {pkg, static_cast<size_t>(data_len)});
+  return;
 }
 
 int OpenConntrack(NFQ_RES_INFO* nfq_res) {
@@ -1103,81 +1111,50 @@ err:
 }
 
 int OpenNfque(FLOW_DIR quenum, NFQ_RES_INFO* nfq_res) {
-  int ret;
-  struct nfq_handle* h = NULL;
-  struct nfq_q_handle* qh = NULL;
-  /*nfq open*/
-  h = nfq_open();
-  if (!h)
-    RETURN_ERROR(-1, "nfq_open failed.");
-
-  ret = nfq_unbind_pf(h, AF_INET);
-  if (ret < 0)
-    GOTO_ERROR(err, "nfq unbind pf failed.");
-
-  ret = nfq_bind_pf(h, AF_INET);
-  if (ret < 0)
-    GOTO_ERROR(err, "fq bind pf failed.");
-
-  if (quenum == FlowDir::kIngress) {
-    qh = nfq_create_queue(h, static_cast<uint16_t>(quenum), &input_nfq_cb, (void*)nfq_res);
-  } else {
-    qh = nfq_create_queue(h, static_cast<uint16_t>(quenum), &output_nfq_cb, (void*)nfq_res);
+  try {
+    rust::Box<net_nfq::NfqQueue> queue = net_nfq::open_queue(static_cast<uint16_t>(quenum));
+    if (quenum == FlowDir::kIngress) {
+      nfq_res->input_queue_.emplace(std::move(queue));
+    } else {
+      nfq_res->output_queue_.emplace(std::move(queue));
+    }
+    return 0;
+  } catch (const std::exception& e) {
+    RETURN_ERROR(-1, "net_nfq::open_queue failed, dir : %d, err : %s.",
+                 static_cast<int>(quenum), e.what());
   }
-  if (!qh)
-    GOTO_ERROR(err, "nfq create queue failed");
-
-  ret = nfq_set_mode(qh, NFQNL_COPY_PACKET, 0xffff);
-  if (ret < 0)
-    GOTO_ERROR(err, "nfq set mode failed.");
-
-  /*save nfqueue handle*/
-  if (quenum == FlowDir::kIngress) {
-    nfq_res->input_fd_  = nfq_fd(h);
-    nfq_res->input_que_ = qh;
-  } else {
-    nfq_res->output_fd_  = nfq_fd(h);
-    nfq_res->output_que_ = qh;
-  }
-  /*return*/
-  return 0;
-
-err:
-  if (h)
-    nfq_close(h);
-  if (qh)
-    nfq_destroy_queue(qh);
-  /*return*/
-  return -1;
 }
 
 int NfqueueRcvData(int32_t epoll_fd, int32_t fd, void* ptr) {
-  int ret;
-  char buf[65536];
-  NFQ_RES_INFO* nfq_res = NULL;
-  struct nfq_q_handle* qh;
+  (void)epoll_fd;
   RCV_EPOLL_CB* nfqEvent = (RCV_EPOLL_CB*)ptr;
   if (!ptr)
     RETURN_ERROR(0, "the argument pointer is nil.");
-  nfq_res = nfqEvent->nfq_res_;
-  /*read data*/
-  ret = read(fd, buf, sizeof(buf));
-  if (ret <= 0) {
-    if ((errno == 0) || (errno == EAGAIN) || (errno == EINTR))
-      RETURN_WARN(0, "read data failed, fd : %d, %s.", fd, strerror(errno));
-    close(fd);
-    RETURN_ERROR(0, "read nfqueue data failed, ret : %d, fd : %d, pid : %d, %s.", ret, fd,
-                 nfq_res->pid_, strerror(errno));
+  NFQ_RES_INFO* nfq_res = nfqEvent->nfq_res_;
+  bool is_input = (fd == (*nfq_res->input_queue_)->fd());
+  net_nfq::NfqQueue& queue = is_input ? **nfq_res->input_queue_ : **nfq_res->output_queue_;
+
+  rust::Vec<net_nfq::NfqMessage> batch;
+  try {
+    batch = queue.recv_batch();
+  } catch (const std::exception& e) {
+    RETURN_ERROR(0, "nfq recv_batch failed, fd : %d, pid : %d, %s.", fd, nfq_res->pid_, e.what());
   }
-  /*check buffer*/
-  // if(ret == (int)sizeof(buf)) RETURN_ERROR(0, "read nfqueue data is overflow.");
-  /*get nfq handle*/
-  qh = nfq_res->input_que_;
-  if (fd != nfq_res->input_fd_)
-    qh = nfq_res->output_que_;
-  /*parse nfqueue data*/
-  nfq_handle_packet(qh->h, buf, ret);
-  /*return*/
+  for (auto& msg : batch) {
+    // input_nfq_cb/output_nfq_cb return void and let a verdict-issuing
+    // call's exception propagate rather than catching at each of their ~22
+    // call sites individually -- caught here, once per message, matching
+    // this project's existing single-catch-around-dispatched-work pattern
+    // (see DispatchGrpcRustQueueEvent's identical shape around item->work()).
+    try {
+      if (is_input)
+        input_nfq_cb(nfq_res, queue, msg);
+      else
+        output_nfq_cb(nfq_res, queue, msg);
+    } catch (const std::exception& e) {
+      LOG_E("nfq callback threw, fd : %d, pid : %d, %s.", fd, nfq_res->pid_, e.what());
+    }
+  }
   return 0;
 }
 
@@ -1185,6 +1162,8 @@ int AddEpollEvent(int zEvfd, NFQ_RES_INFO* nfq_res) {
   int ret;
   struct epoll_event ev;
   RCV_EPOLL_CB *nfqInput = nullptr, *nfqOutput = nullptr;
+  int input_fd = (*nfq_res->input_queue_)->fd();
+  int output_fd = (*nfq_res->output_queue_)->fd();
 
   nfqInput = new RCV_EPOLL_CB;
   nfqOutput = new RCV_EPOLL_CB;
@@ -1193,31 +1172,30 @@ int AddEpollEvent(int zEvfd, NFQ_RES_INFO* nfq_res) {
   /*copy data*/
   nfqInput->nfq_res_ = nfq_res;
   nfqOutput->nfq_res_ = nfq_res;
-  /*set nonblock*/
-  fcntl(nfq_res->input_fd_, F_SETFL, fcntl(nfq_res->input_fd_, F_GETFL) | O_NONBLOCK);
-  fcntl(nfq_res->output_fd_, F_SETFL, fcntl(nfq_res->output_fd_, F_GETFL) | O_NONBLOCK);
+  // Nonblocking mode is set inside net_nfq::open_queue itself now (via
+  // Queue::set_nonblocking) -- no separate fcntl() call needed here.
   /*input queue event*/
-  nfqInput->fd_ = nfq_res->input_fd_;
+  nfqInput->fd_ = input_fd;
   nfqInput->epoll_in_func_ = NfqueueRcvData;
   // register epoll event
   ev.data.ptr = nfqInput;
   ev.events = EPOLLIN;
-  ret = epoll_ctl(zEvfd, EPOLL_CTL_ADD, nfq_res->input_fd_, &ev);
+  ret = epoll_ctl(zEvfd, EPOLL_CTL_ADD, input_fd, &ev);
   if (ret < 0)
-    GOTO_ERROR(err, "add nfqueue handle to epoll failed, pid : %d, %s.", nfq_res->input_fd_,
+    GOTO_ERROR(err, "add nfqueue handle to epoll failed, pid : %d, %s.", input_fd,
                strerror(errno));
   /*output queue event*/
-  nfqOutput->fd_ = nfq_res->output_fd_;
+  nfqOutput->fd_ = output_fd;
   nfqOutput->epoll_in_func_ = NfqueueRcvData;
   // register epoll event
   ev.data.ptr = nfqOutput;
   ev.events = EPOLLIN;
-  ret = epoll_ctl(zEvfd, EPOLL_CTL_ADD, nfq_res->output_fd_, &ev);
+  ret = epoll_ctl(zEvfd, EPOLL_CTL_ADD, output_fd, &ev);
   if (ret < 0)
-    GOTO_ERROR(err, "add nfqueue handle to epoll failed, pid : %d, %s.", nfq_res->output_fd_,
+    GOTO_ERROR(err, "add nfqueue handle to epoll failed, pid : %d, %s.", output_fd,
                strerror(errno));
   /*print debug log*/
-  LOG_I("pid : %d, inputfd : %d, outputfd : %d.", nfq_res->pid_, nfq_res->input_fd_, nfq_res->output_fd_);
+  LOG_I("pid : %d, inputfd : %d, outputfd : %d.", nfq_res->pid_, input_fd, output_fd);
   nfq_res->input_cb_  = nfqInput;
   nfq_res->output_cb_ = nfqOutput;
   /*return*/
@@ -1629,7 +1607,17 @@ int32_t GrpcDispatchPodUp(DaemonContext* daemon, GrpcDispatchQueue* queue, int32
     NET_CTRL_INFO ctrl = {};
     ctrl.pid_ = pid;
     ctrl.pod_id_ = pod_id;
-    int ret = SetNs(ctrl.pid_, const_cast<char*>(kBasePath.data()));
+    int ret = 0;
+    try {
+      // kBasePath is a std::string_view (net-policy.h:34); rust::Str has no
+      // std::string_view constructor, only Str(const std::string&) and
+      // Str(const char*, size_t) -- use the latter directly rather than
+      // copying into a std::string first.
+      net_nfq::set_ns(ctrl.pid_, rust::Str(kBasePath.data(), kBasePath.size()));
+    } catch (const std::exception& e) {
+      LOG_E("net_nfq::set_ns failed, pid : %d, err : %s.", ctrl.pid_, e.what());
+      ret = -1;
+    }
     if (ret == 0) {
       ret = InitNfqueue(epoll_fd, ctrl, *daemon);
       if (ret == 0)
@@ -2154,8 +2142,6 @@ int RunNetPolicyDaemon(int argc, char* argv[]) {
   log_level_env = getenv(POLICY_WAF_ENABLE);
   if (log_level_env)
     daemon.SetWafEnabled(strcmp(log_level_env, "true") == 0);
-  // open local net ns
-  daemon.SetLocalNetNsFd(OpenLocalNetNs());
   /*get iptables version*/
   daemon.SetIptablesVersion(net_iptables::get_iptables_version());
   /*print debug log*/

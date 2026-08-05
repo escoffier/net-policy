@@ -1,0 +1,15 @@
+[package]
+name = "net_nfq"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+cxx = "1"
+# Vendored, not crates.io -- published nfq 0.2.5 has no way to expose its
+# socket's fd, which this daemon's single-threaded epoll loop requires.
+# See third_party/nfq-0.2.5/VENDORING.md.
+nfq = { path = "../../third_party/nfq-0.2.5" }
+nix = { version = "0.31", features = ["sched"] }

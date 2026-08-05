@@ -14,7 +14,6 @@
 #include "cjson.h"
 #include "libmnl/libmnl.h"
 #include "libnetfilter_conntrack/libnetfilter_conntrack.h"
-#include "libnetfilter_queue/libnetfilter_queue.h"
 #include "glog/logging.h"
 #include "http/packet.hh"
 #include "log.h"
@@ -28,6 +27,7 @@
 #include "waf/plugin.h"
 #include "net_policy_engine_cxxbridge/lib.h"
 #include "net_iptables_cxxbridge/lib.h"
+#include "net_nfq_cxxbridge/lib.h"
 #include "admin/profile.h"
 #include "utils.h"
 
@@ -49,7 +49,6 @@ inline constexpr int              kNfMatchRule    = 6;
 typedef struct nf_conntrack NF_CONNTRACK;
 /*epoll call function*/
 using RcvCbFunc = int32_t(*)(int32_t epoll_fd, int32_t fd, void* ptr);
-extern int SetNs(int pid, char *basePath);
 /*daemon entrypoint; defined in net-policy.cpp, called from main.cpp*/
 extern int RunNetPolicyDaemon(int argc, char* argv[]);
 
@@ -113,11 +112,14 @@ class NFQ_RES_INFO
 {
 public:
     int pid_;
-    int input_fd_;
-    int output_fd_;
     int poll_fd_;
-    struct nfq_q_handle* input_que_  = nullptr;
-    struct nfq_q_handle* output_que_ = nullptr;
+    // Fallible to construct (queue open can fail) and freed explicitly by
+    // FreeResource before this object's own destruction, so these cannot be
+    // bare rust::Box<T> fields -- Box<T> has no default constructor and
+    // cannot be null. std::optional represents "not yet opened"/"already
+    // freed"; the Box it wraps, whenever engaged, is always a real queue.
+    std::optional<rust::Box<net_nfq::NfqQueue>> input_queue_;
+    std::optional<rust::Box<net_nfq::NfqQueue>> output_queue_;
     RcvEpollCb*          input_cb_   = nullptr;
     RcvEpollCb*          output_cb_  = nullptr;
     // nf conntrack
@@ -188,8 +190,6 @@ public:
     int DeleteNfQueRes(int efd, uint64_t pid);
     /**/
     NFQ_RES_INFO *GetNfqRes(uint64_t pid);
-    /**/
-    void ClearNfQueResource(int efd, int ipt_ver);
 };
 
 /*策略详情 -- plain data holder; matching/key-generation logic now lives in
@@ -317,8 +317,6 @@ public:
     /*---- former raw-scalar globals (g_log_level stays a separate atomic global) ----*/
     bool WafEnabled() const           { return waf_enable_; }
     void SetWafEnabled(bool v)        { waf_enable_ = v; }
-    int  LocalNetNsFd() const         { return local_net_ns_fd_; }
-    void SetLocalNetNsFd(int fd)      { local_net_ns_fd_ = fd; }
     int  IptablesVersion() const      { return ipt_ver_; }
     void SetIptablesVersion(int v)    { ipt_ver_ = v; }
 
@@ -329,7 +327,6 @@ public:
 
 private:
     bool waf_enable_      = false;
-    int  local_net_ns_fd_ = 0;
     int  ipt_ver_         = 0;
 
     http::HttpFilterFactory              http_filter_factory_;      // must precede connection_manager_
