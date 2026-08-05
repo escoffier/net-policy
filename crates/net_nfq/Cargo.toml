@@ -1,0 +1,12 @@
+[package]
+name = "net_nfq"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+cxx = "1"
+nfq = "0.2"
+nix = { version = "0.31", features = ["sched"] }
