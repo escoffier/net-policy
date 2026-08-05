@@ -86,20 +86,6 @@ struct PseudoHeader
 };
 using PSEUDO_HEADER = PseudoHeader; // legacy alias
 
-struct TcpFourTupleV4
-{
-    uint32_t src_addr_;
-    uint32_t dst_addr_;
-    uint16_t src_port_;
-    uint16_t dst_port_;
-
-    bool operator<(const TcpFourTupleV4& other) const noexcept {
-        return std::tie(src_addr_, dst_addr_, src_port_, dst_port_) <
-               std::tie(other.src_addr_, other.dst_addr_, other.src_port_, other.dst_port_);
-    }
-};
-using TCP_FOUR_TUPLE_V4 = TcpFourTupleV4; // legacy alias
-
 class FiveTuple
 {
 public:
@@ -283,15 +269,9 @@ public:
     void AddNodeIp(uint32_t ip)                    { nodes_ip_[ip] = 1; }
     void RemoveNodeIp(uint32_t ip)                 { nodes_ip_.erase(ip); }
 
-    /*---- TCP connection tracking ----*/
-    std::map<TcpFourTupleV4, http::ConnectionPtr>& TcpCtInput()  { return tcp_ct_input_; }
-    std::map<TcpFourTupleV4, http::ConnectionPtr>& TcpCtOutput() { return tcp_ct_output_; }
-
 private:
     PolicyRule                                                         policy_rule_;
     std::unordered_map<uint32_t, uint8_t>                             nodes_ip_;
-    std::map<TcpFourTupleV4, http::ConnectionPtr>                     tcp_ct_input_;
-    std::map<TcpFourTupleV4, http::ConnectionPtr>                     tcp_ct_output_;
     std::unordered_map<std::string, std::vector<HTTP_RULE_INFO>>      input_http_policy_;
     std::unordered_map<std::string, std::vector<HTTP_RULE_INFO>>      output_http_policy_;
 };

@@ -7,6 +7,7 @@
 #include <string>
 
 #include "http/http_filter_factory.h"
+#include "net-policy.h"
 #include "net/connection_manager.h"
 #include "net_flow_engine_cxxbridge/lib.h"
 
@@ -739,4 +740,121 @@ TEST(ConnectionManagerReaperTest, TrackedFlowsMicrosegEntryAlsoAgesOut) {
 // hand-maintained copy of the number.
 TEST(NetFlowEngineFfiTest, StaleConnectionTimeoutIsExposedOverFfi) {
   EXPECT_EQ(net_flow::stale_connection_timeout_secs(), 300u);
+}
+
+// --- End-to-end: SYN -> HTTP request -> policy verdict (Task 7) -----------
+//
+// Everything above exercises net_flow_engine and ConnectionManager in
+// isolation. These tests trace the SAME call sequence input_nfq_cb/
+// output_nfq_cb drive in net-policy.cpp (SYN tracked with a rule_key already
+// resolved by MatchMicroPolicyRule -> HTTP data dispatched through
+// DispatchMicroseg -> the resulting http::Header matched against the flow's
+// HTTP_RULE_INFO list), to confirm the new Rust-backed path produces the same
+// verdict shape (NetPolicyRule::kAllow / kDeny / kDefault) the old
+// TcpCtInput()-based code did.
+//
+// MatchHttpPolicyRule itself has internal linkage (`static` in net-policy.cpp)
+// and is not reachable from a test binary, so MatchHttpPolicyRuleLike below is
+// a deliberate structural mirror of its body (net-policy.cpp:387-396) --
+// first host/method/path match wins, empty fields wildcard, kDefault if none
+// match -- NOT a literal reuse. What's under test is that DispatchMicroseg's
+// real, Rust-decision-driven Header is what feeds this matching logic, not
+// the matching logic itself (which Phase 4/5's own tests already cover).
+namespace {
+
+NetPolicyRule MatchHttpPolicyRuleLike(const std::vector<HTTP_RULE_INFO>& rules,
+                                       const http::Header& header) {
+  for (const auto& rule : rules) {
+    if (!rule.host_.empty() && (rule.host_ != header.host_)) continue;
+    if (!rule.method_.empty() && (rule.method_ != header.method_)) continue;
+    if (!rule.path_.empty() && (rule.path_ != header.path_)) continue;
+    return rule.action_;
+  }
+  return NetPolicyRule::kDefault;
+}
+
+}  // namespace
+
+TEST(ConnectionManagerEndToEndTest, SynThenHttpRequestProducesAllowVerdictForMatchingRule) {
+  http::HttpFilterFactory factory;
+  net::ConnectionManager mgr(factory);
+
+  // SYN: mirrors input_nfq_cb's untracked-branch SYN handling once
+  // MatchMicroPolicyRule has already resolved a rule_key for this flow's net
+  // policy and an HTTP policy applies to that key (net-policy.cpp:776-784) --
+  // MicrosegTrack, then return without extracting.
+  auto syn = SynPacket();
+  auto syn_result = mgr.receive(syn.data(), syn.size(), /*track_tcp=*/true);
+  ASSERT_EQ(syn_result.decision.kind, 1);  // NewConnection
+  const std::string rule_key = "allow-store-front";
+  mgr.MicrosegTrack(syn_result.decision, rule_key);
+
+  // Next packet on this flow: now tracked, so the real callback's tracked
+  // branch (net-policy.cpp:711-742) would skip MatchMicroPolicyRule entirely
+  // and pull the key back off the tracked entry -- reproduced directly here.
+  ASSERT_TRUE(mgr.MicrosegTracked(syn_result.decision));
+  ASSERT_EQ(mgr.MicrosegRuleKey(syn_result.decision).value_or(""), rule_key);
+
+  auto data = DataPacket(/*syn=*/false, "GET /store HTTP/1.1\r\nHost: shop.example.com\r\n\r\n");
+  uint32_t seq_be = htonl(1);  // SYN consumed seq 0; the next real segment must carry seq=1.
+  std::memcpy(data.data() + 24, &seq_be, sizeof(seq_be));
+  auto data_result = mgr.receive(data.data(), data.size(), /*track_tcp=*/true);
+  ASSERT_EQ(data_result.decision.kind, 3);  // Data
+
+  auto header = mgr.DispatchMicroseg(data_result.decision, data.data(), data.size(), rule_key);
+  ASSERT_TRUE(header.has_value());
+  EXPECT_EQ(header->host_, "shop.example.com");
+  EXPECT_EQ(header->method_, "GET");
+  EXPECT_EQ(header->path_, "/store");
+
+  std::vector<HTTP_RULE_INFO> rules(1);
+  rules[0].direction_ = static_cast<uint8_t>(FlowDir::kIngress);
+  rules[0].action_    = NetPolicyRule::kAllow;
+  rules[0].host_      = "shop.example.com";
+
+  EXPECT_EQ(MatchHttpPolicyRuleLike(rules, *header), NetPolicyRule::kAllow);
+}
+
+TEST(ConnectionManagerEndToEndTest, SynThenHttpRequestProducesDenyVerdictForMatchingRule) {
+  http::HttpFilterFactory factory;
+  net::ConnectionManager mgr(factory);
+
+  auto syn = SynPacket();
+  auto syn_result = mgr.receive(syn.data(), syn.size(), /*track_tcp=*/true);
+  ASSERT_EQ(syn_result.decision.kind, 1);  // NewConnection
+  const std::string rule_key = "deny-admin-path";
+  mgr.MicrosegTrack(syn_result.decision, rule_key);
+  ASSERT_TRUE(mgr.MicrosegTracked(syn_result.decision));
+
+  auto data = DataPacket(/*syn=*/false, "GET /admin HTTP/1.1\r\nHost: shop.example.com\r\n\r\n");
+  uint32_t seq_be = htonl(1);
+  std::memcpy(data.data() + 24, &seq_be, sizeof(seq_be));
+  auto data_result = mgr.receive(data.data(), data.size(), /*track_tcp=*/true);
+  ASSERT_EQ(data_result.decision.kind, 3);  // Data
+
+  auto header = mgr.DispatchMicroseg(data_result.decision, data.data(), data.size(), rule_key);
+  ASSERT_TRUE(header.has_value());
+  EXPECT_EQ(header->path_, "/admin");
+
+  std::vector<HTTP_RULE_INFO> rules(2);
+  // A more specific rule ahead of a catch-all -- first match wins, exactly
+  // like MatchHttpPolicyRule's linear scan, so this also proves ordering
+  // matters and the catch-all does not shadow it.
+  rules[0].direction_ = static_cast<uint8_t>(FlowDir::kIngress);
+  rules[0].action_    = NetPolicyRule::kDeny;
+  rules[0].path_      = "/admin";
+  rules[1].direction_ = static_cast<uint8_t>(FlowDir::kIngress);
+  rules[1].action_    = NetPolicyRule::kAllow;  // catch-all: empty host/method/path
+
+  EXPECT_EQ(MatchHttpPolicyRuleLike(rules, *header), NetPolicyRule::kDeny);
+
+  // Negative control on the SAME extracted header: a rule set with only a
+  // non-matching host must fall through to kDefault, not accidentally match --
+  // this is what would catch a MatchHttpPolicyRuleLike (or, if ever exposed,
+  // MatchHttpPolicyRule) bug that ignores empty-field wildcarding incorrectly
+  // in the other direction.
+  std::vector<HTTP_RULE_INFO> non_matching(1);
+  non_matching[0].host_   = "other.example.com";
+  non_matching[0].action_ = NetPolicyRule::kDeny;
+  EXPECT_EQ(MatchHttpPolicyRuleLike(non_matching, *header), NetPolicyRule::kDefault);
 }
