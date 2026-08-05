@@ -192,8 +192,6 @@ public:
     int DeleteNfQueRes(int efd, uint64_t pid);
     /**/
     NFQ_RES_INFO *GetNfqRes(uint64_t pid);
-    /**/
-    void ClearNfQueResource(int efd, int ipt_ver);
 };
 
 /*策略详情 -- plain data holder; matching/key-generation logic now lives in
@@ -321,8 +319,6 @@ public:
     /*---- former raw-scalar globals (g_log_level stays a separate atomic global) ----*/
     bool WafEnabled() const           { return waf_enable_; }
     void SetWafEnabled(bool v)        { waf_enable_ = v; }
-    int  LocalNetNsFd() const         { return local_net_ns_fd_; }
-    void SetLocalNetNsFd(int fd)      { local_net_ns_fd_ = fd; }
     int  IptablesVersion() const      { return ipt_ver_; }
     void SetIptablesVersion(int v)    { ipt_ver_ = v; }
 
@@ -333,7 +329,6 @@ public:
 
 private:
     bool waf_enable_      = false;
-    int  local_net_ns_fd_ = 0;
     int  ipt_ver_         = 0;
 
     http::HttpFilterFactory              http_filter_factory_;      // must precede connection_manager_

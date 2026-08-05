@@ -236,31 +236,6 @@ std::string PrintPortsData(std::vector<RULE_PORT>& ports) {
   return value;
 }
 
-int OpenLocalNetNs() {
-  const char* path = "/proc/self/ns/net";
-  // open net namespaces
-  int fd = open(path, O_RDONLY);
-  if (fd <= 0)
-    RETURN_ERROR(-1, "open %s net namespaces failed! err : %s.", path, strerror(errno));
-  return fd;
-}
-
-int SetLocalNetNs(int fd) {
-  int ret;
-  if (fd <= 0)
-    RETURN_ERROR(-1, "local net ns fd is error!!");
-  // unshare net
-  ret = unshare(CLONE_NEWNET);
-  if (ret != 0)
-    RETURN_ERROR(-1, "unshare net failed! err : %s.", strerror(errno));
-  // set local net ns
-  ret = setns(fd, CLONE_NEWNET);
-  if (ret != 0)
-    RETURN_ERROR(-1, "set local net ns failed! err : %s.", strerror(errno));
-
-  return 0;
-}
-
 std::string ipv6Convert(char* ipv6) {
   int ret;
   string sRet = "";
@@ -2198,8 +2173,6 @@ int RunNetPolicyDaemon(int argc, char* argv[]) {
   log_level_env = getenv(POLICY_WAF_ENABLE);
   if (log_level_env)
     daemon.SetWafEnabled(strcmp(log_level_env, "true") == 0);
-  // open local net ns
-  daemon.SetLocalNetNsFd(OpenLocalNetNs());
   /*get iptables version*/
   daemon.SetIptablesVersion(net_iptables::get_iptables_version());
   /*print debug log*/

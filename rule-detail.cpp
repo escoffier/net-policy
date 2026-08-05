@@ -318,24 +318,3 @@ NFQ_RES_INFO* NfQueData::GetNfqRes(uint64_t pid) {
   /*return*/
   return it->second.get();
 }
-
-/*clear nfqueue resource*/
-void NfQueData::ClearNfQueResource(int efd, int ipt_ver) {
-  int ret;
-  for (auto& [pid, res] : this->res_data_) {
-    if (res == nullptr)
-      continue;
-    /*set network namespace*/
-    ret = SetNs(res->pid_, const_cast<char*>(kBasePath.data()));
-    if (ret != 0)
-      continue;
-    /*print debug log*/
-    LOG_D("destroy nfqueue, pid : %d.", res->pid_);
-    /*clear iptables rule*/
-    net_iptables::clear_iptables_rule(ipt_ver);
-    /*free nfque resource — unique_ptr handles delete*/
-    res->FreeResource(efd);
-  }
-  /*clear map*/
-  this->res_data_.clear();
-}
