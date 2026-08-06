@@ -435,20 +435,11 @@ static void input_nfq_cb(NFQ_RES_INFO* nfq_res, net_nfq::NfqQueue& queue, net_nf
     return;
   }
 
-  // `track_tcp` is now unconditionally true. Until this phase it was
-  // WafEnabled(), because the WAF was the only consumer of the TCB state
-  // machine and FlowEngine had no reaper -- tracking with the WAF off (the
-  // default, waf_enable_ = false) would have grown the TCB table without
-  // bound. Both halves of that rationale are gone: microsegmentation's
-  // per-connection HTTP tracking is now driven by the same decision (see the
-  // TCP block below), so leaving the gate in place would have silently
-  // disabled L7 microsegmentation policy in every WAF-off deployment -- a
-  // functional regression, not a carried-forward constraint, since the
-  // hand-rolled state machine this phase retires ran regardless of the WAF.
-  // Unbounded growth is instead handled by FlowEngine's timeout reaper (added
-  // earlier in this phase; wired to a timerfd on the epoll loop by the task
-  // that follows this one). Note DispatchWaf below is still WAF-gated, so the
-  // WAF's own behavior is unchanged either way.
+  // `track_tcp` is unconditionally true: microsegmentation's per-connection
+  // HTTP tracking depends on the same PacketDecision (see the TCP block
+  // below), and unbounded TCB growth is bounded by FlowEngine's timeout
+  // reaper (the timerfd armed in RunNetPolicyDaemon), not by gating tracking
+  // itself.
   auto result = daemon->ConnMgr().receive(reinterpret_cast<const uint8_t*>(pkg), data_len,
                                           /*track_tcp=*/true);
   if (!result.tuple.recognized) {
@@ -475,17 +466,6 @@ static void input_nfq_cb(NFQ_RES_INFO* nfq_res, net_nfq::NfqQueue& queue, net_nf
   // GetProtoString(tuple.proto_), mark, tuple.tot_len_, tuple.src_addr_.c_str(),
   // tuple.src_port_, tuple.dst_addr_.c_str(), tuple.dst_port_, argv); LOG_D("input receive data: %p",
   // pkg);
-  if (daemon->WafEnabled() && result.is_tcp) {
-    auto status = daemon->ConnMgr().DispatchWaf(result.decision,
-                                                reinterpret_cast<const uint8_t*>(pkg), data_len);
-    if (status == net::NetStatus::Drop) {
-      queue.verdict_with_mark(id, net_nfq::NfqVerdict::Accept,
-                              static_cast<uint32_t>(NetPolicyRule::kAllowReq),
-                              {pkg, static_cast<size_t>(data_len)});
-      return;
-    }
-  }
-
   if ((tuple.proto_ == IPPROTO_UDP) || (tuple.proto_ == IPPROTO_ICMP)) {
     // Unchanged from before this phase: UDP/ICMP never enter TCB dispatch.
     // The old code routed them through the same shared `if (!found)` block the
@@ -775,7 +755,7 @@ static void output_nfq_cb(NFQ_RES_INFO* nfq_res, net_nfq::NfqQueue& queue, net_n
   }
 
   // `track_tcp` is unconditionally true -- see input_nfq_cb's identical call
-  // for why this is no longer gated on WafEnabled().
+  // for the rationale.
   auto result = daemon->ConnMgr().receive(reinterpret_cast<const uint8_t*>(pkg), data_len,
                                           /*track_tcp=*/true);
   if (!result.tuple.recognized) {
@@ -798,18 +778,6 @@ static void output_nfq_cb(NFQ_RES_INFO* nfq_res, net_nfq::NfqQueue& queue, net_n
   // GetProtoString(tuple.proto_), mark, tuple.tot_len_, tuple.src_addr_.c_str(),
   // tuple.src_port_, tuple.dst_addr_.c_str(), tuple.dst_port_, argv); LOG_D("input receive data: %p",
   // pkg);
-  if (daemon->WafEnabled() && result.is_tcp) {
-    auto status = daemon->ConnMgr().DispatchWaf(result.decision,
-                                                reinterpret_cast<const uint8_t*>(pkg), data_len);
-    if (status == net::NetStatus::Drop) {
-      // LOG_D("drop pkt: %p", pkg);
-      queue.verdict_with_mark(id, net_nfq::NfqVerdict::Accept,
-                              static_cast<uint32_t>(NetPolicyRule::kAllowRsp),
-                              {pkg, static_cast<size_t>(data_len)});
-      return;
-    }
-  }
-
   if ((tuple.proto_ == IPPROTO_UDP) || (tuple.proto_ == IPPROTO_ICMP)) {
     // See input_nfq_cb's identical block: UDP/ICMP never enter TCB dispatch,
     // and the old shared `!found` block could never carry them past its own

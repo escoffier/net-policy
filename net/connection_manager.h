@@ -48,23 +48,19 @@ public:
   // Parses the packet's five-tuple (all of TCP/UDP/ICMP) -- always, since L3-L4
   // policy matching needs it on every packet -- and, when `track_tcp` is set
   // and the packet is TCP, additionally advances the Rust engine's TCB state
-  // machine. Deliberately does NOT dispatch to the WAF; the caller decides
-  // whether to, via DispatchWaf below.
+  // machine.
   //
-  // `track_tcp` originally existed to preserve a resource-lifetime property:
-  // FlowEngine had no timeout/reaper, entries left the TCB table only on a
-  // FIN/RST for an already-tracked flow, and on_packet was only ever reached
-  // behind net-policy.cpp's `daemon->WafEnabled()` guard (waf_enable_ defaults
-  // to false), so tracking unconditionally would have grown that table without
-  // bound in the default deployment.
-  //
-  // Both halves of that rationale are now gone: FlowEngine has a timeout
-  // reaper, and microsegmentation's per-connection HTTP tracking is driven by
-  // the same PacketDecision the WAF is, so gating it on the WAF would silently
-  // disable L7 microsegmentation policy whenever the WAF is off. Production
-  // callers (input_nfq_cb/output_nfq_cb) therefore pass `true`; the flag stays
-  // on the signature because tests still use it to assert the untracked
-  // behavior. Do NOT gate the five-tuple parse or `is_tcp` on it either way.
+  // `track_tcp` originally existed to preserve a resource-lifetime property,
+  // back when the only consumer of the TCB state machine was the now-removed
+  // WAF feature and FlowEngine had no timeout/reaper: tracking unconditionally
+  // would have grown that table without bound whenever WAF was off (its
+  // default). FlowEngine has a timeout reaper now, so that rationale no
+  // longer applies -- production callers (input_nfq_cb/output_nfq_cb) pass
+  // `true` unconditionally, since microsegmentation's per-connection HTTP
+  // tracking (DispatchMicroseg below) depends on the same PacketDecision. The
+  // flag stays on the signature because tests still use it to assert the
+  // untracked behavior. Do NOT gate the five-tuple parse or `is_tcp` on it
+  // either way.
   ReceiveResult receive(const uint8_t* pkg, size_t len, bool track_tcp) {
     ReceiveResult result{};
     result.tuple = net_flow::parse_five_tuple(pkg, len);
@@ -73,33 +69,6 @@ public:
       result.decision = engine_->on_packet(pkg, len);
     }
     return result;
-  }
-
-  // Unchanged logic from the old internal Handle{NewConnection,Data,Closed}
-  // dispatch -- only the call site moved, from inside receive() to here, an
-  // explicitly-invoked public method. Callers should only call this for TCP
-  // (ReceiveResult::is_tcp); a default-constructed decision (kind 0, Ignore)
-  // is handled as a no-op regardless.
-  NetStatus DispatchWaf(const net_flow::PacketDecision& decision, const uint8_t* pkg, size_t len) {
-    switch (decision.kind) {
-      case 0:  // Ignore
-        return NetStatus::OK;
-      case 1:  // NewConnection
-        return HandleNewConnection(decision);
-      case 2:  // Closed
-        return HandleClosed(decision);
-      case 3:  // Data
-        return HandleData(decision, pkg, len);
-      case 4:  // Duplicate -- new for WAF: a retransmission guard it didn't
-               // have before this phase (see plan Task 1's commit message).
-        return NetStatus::OK;
-      case 5:  // UnknownData -- matches WAF's pre-existing implicit behavior
-               // for this case exactly (previously fell into `default:` via
-               // kind 0/Ignore; now explicit).
-        return NetStatus::OK;
-      default:
-        return NetStatus::OK;
-    }
   }
 
   // Pure lookup: does a tracked microseg Connection already exist for this
@@ -346,7 +315,7 @@ public:
   //  1. The Rust engine's own TCB table. `evict_stale_connections()` drops
   //     entries whose last packet is older than the timeout and hands back
   //     their IDs; whatever this class holds for those IDs goes with them, so
-  //     neither map keeps a Connection referencing a flow the engine no longer
+  //     microseg_conns_ keeps no entry referencing a flow the engine no longer
   //     tracks.
   //
   //  2. `microseg_conns_` entries the engine can never report. A flow the
@@ -360,13 +329,6 @@ public:
   //     lifetime of the daemon. Hence the second loop: microseg entries carry
   //     their own last_seen (refreshed by MicrosegTouch on every packet) and
   //     age out on it, whether or not the engine ever knew about them.
-  //
-  // `http_conns_` (WAF) deliberately gets no equivalent age sweep, because it
-  // has no late-bound entries to leak: it is only ever inserted into by
-  // HandleNewConnection, i.e. kind 1, whose conn_id and peer_conn_id are BOTH
-  // in `tcbs` by construction (the SYN branch inserts both -- peer_is_new is
-  // false precisely when the peer was already there). Source 1 covers all of
-  // them. DispatchWaf's case 5 is a no-op and never inserts.
   void EvictStale() {
     EvictStale(std::chrono::steady_clock::now(),
                std::chrono::seconds(net_flow::stale_connection_timeout_secs()));
@@ -384,42 +346,6 @@ public:
     for (const auto& shared_id : engine_->evict_stale_connections()) {
       ConnectionID id{shared_id.local_ip, shared_id.foreign_ip, shared_id.local_port,
                       shared_id.foreign_port};
-      // Same teardown a FIN/RST gets (HandleClosed): the WAF's onClose is what
-      // emits a connection's accumulated attack report, so erasing the entry
-      // without it would silently drop that report for any connection that
-      // timed out instead of closing cleanly. Erasing the peer alongside it --
-      // also HandleClosed's behavior -- is additionally what keeps onClose to
-      // exactly ONE call per connection when both directions go stale in the
-      // same sweep, since the two directions share one HttpFilterManager.
-      //
-      // KNOWN, ACCEPTED ASYMMETRY -- WAF INSPECTION IS NOT RECOVERABLE AFTER A
-      // REAP, MICROSEGMENTATION'S IS. Flagged explicitly here rather than
-      // silently absorbed, matching how this phase documented its other
-      // deliberate behavior changes (the RST-on-unknown-flow narrowing, the new
-      // duplicate-segment guard WAF gained for free).
-      //
-      // http_conns_ is (re-)inserted ONLY by HandleNewConnection, reachable
-      // only from DispatchWaf case 1 (NewConnection), which requires a SYN on a
-      // flow not already in the engine's `tcbs`. Once this sweep evicts a
-      // connection, the engine has dropped its TCB too, so every later packet
-      // on that still-live socket arrives as kind 5 (UnknownData) -- and
-      // DispatchWaf's case 5 is deliberately a no-op per this phase's plan
-      // (Global Constraints), never late-binding the way DispatchMicroseg's
-      // case 5 does. So a connection that goes idle past the timeout (a
-      // keep-alive HTTP connection-pool socket is the realistic case) loses WAF
-      // inspection permanently, for the whole remainder of its life; only
-      // microsegmentation re-binds, via its own case 5.
-      //
-      // This is NEW with this phase -- there was no reaper before it, so no
-      // connection was ever evicted while live. It is accepted rather than
-      // fixed because a late-binding WAF path is a genuine design change (WAF
-      // state is a whole HttpFilterManager with connection-scoped context, not
-      // microseg's single re-derivable rule_key), out of scope for the fix wave
-      // that documented it. If it needs fixing later, the shape is a DispatchWaf
-      // case 5 that reconstructs a filter manager mid-stream -- with its own
-      // decision about what onNewConnection means for a connection whose start
-      // was never observed.
-      CloseHttpConn(id, PeerOf(id));
       microseg_conns_.erase(id);
     }
     for (auto it = microseg_conns_.begin(); it != microseg_conns_.end();) {
@@ -443,13 +369,6 @@ public:
     return conns;
   }
 
-  // Exposes the size of the C++-side connection table (distinct from the Rust
-  // engine's own flow table reported by connections()/stat() above). Used by
-  // tests to verify HandleClosed/HandleNewConnection keep both the flow's own
-  // entry and its peer's entry in sync with the Rust engine's lifecycle
-  // decisions.
-  size_t httpConnectionCount() const { return http_conns_.size(); }
-
   // Same, for the microsegmentation map. Used by the reaper tests to observe
   // that an evicted entry is really gone rather than merely unreachable.
   size_t microsegConnectionCount() const { return microseg_conns_.size(); }
@@ -469,12 +388,6 @@ private:
     return ConnectionID{id.local_ip, id.foreign_ip, id.local_port, id.foreign_port};
   }
 
-  // The reverse-direction ID: local and foreign swapped, exactly how
-  // on_packet_internal derives peer_conn_id from conn_id.
-  static ConnectionID PeerOf(const ConnectionID& id) {
-    return ConnectionID{id.foreign_ip_, id.local_ip_, id.foreign_port_, id.local_port_};
-  }
-
   void TouchMicroseg(const ConnectionID& id, std::chrono::steady_clock::time_point now) {
     auto it = microseg_conns_.find(id);
     if (it != microseg_conns_.end()) {
@@ -482,91 +395,30 @@ private:
     }
   }
 
-  // Shared by HandleClosed (FIN/RST) and EvictStale (idle timeout): run the
-  // WAF's connection-close hook once, then drop both directions' entries.
-  void CloseHttpConn(const ConnectionID& id, const ConnectionID& peer_id) {
-    auto it = http_conns_.find(id);
-    if (it != http_conns_.end()) {
-      it->second->httpFilterManager()->onClose();
-      http_conns_.erase(it);
-    }
-    http_conns_.erase(peer_id);
-  }
-
-  NetStatus HandleNewConnection(const net_flow::PacketDecision& decision) {
-    auto id = ToConnectionID(decision.conn_id);
-    auto peer_id = ToConnectionID(decision.peer_conn_id);
-    auto hashFunc = ConnectionIDHash();
-    auto hash_key = hashFunc(id);
-    auto filter_manager = std::make_shared<http::HttpFilterManager>(
-        filter_factory_, hash_key, decision.conn_id.local_ip, decision.conn_id.foreign_ip);
-
-    net::ConnectionInfo connInfo{
-        net::ipv4ToString(decision.conn_id.local_ip), net::ipv4ToString(decision.conn_id.foreign_ip),
-        decision.conn_id.local_port, decision.conn_id.foreign_port};
-    if (http::FilterStatus::StopIteration == filter_manager->onNewConnection(connInfo)) {
-      LOG(INFO) << "terminate connection processing";
-    }
-    auto http_server_conn = std::make_shared<http::Connection>(true, filter_manager);
-    http_conns_[id] = http_server_conn;
-
-    if (decision.peer_is_new) {
-      auto http_client_conn = std::make_shared<http::Connection>(false, filter_manager);
-      http_conns_[peer_id] = http_client_conn;
-    }
-    return NetStatus::OK;
-  }
-
-  NetStatus HandleClosed(const net_flow::PacketDecision& decision) {
-    CloseHttpConn(ToConnectionID(decision.conn_id), ToConnectionID(decision.peer_conn_id));
-    return NetStatus::OK;
-  }
-
-  NetStatus HandleData(const net_flow::PacketDecision& decision, const uint8_t* pkg, size_t len) {
-    auto id = ToConnectionID(decision.conn_id);
-    auto it = http_conns_.find(id);
-    if (it == http_conns_.end()) {
-      return NetStatus::OK;
-    }
-    auto p = seastar::net::packet::from_static_data(reinterpret_cast<const char*>(pkg), len);
-    // setTCPSegment's contract requires the packet to already start at the TCP
-    // header (see waf/plugin.cc's ModifyNetPackets, which casts the stored
-    // pointer directly to `struct tcphdr*`). This mirrors the old (deleted)
-    // ipv4::receive, which always stripped the IP header before Tcp::receive
-    // (and thus setTCPSegment) ever saw the packet. Trimming by the combined
-    // payload_offset before setTCPSegment -- or not trimming at all before it
-    // -- would feed it IP-header bytes and corrupt a live packet on the
-    // waf/plugin.cc ModifyNetPackets code path. Do NOT collapse this into a
-    // single trim_front(payload_offset) call.
-    p.trim_front(decision.ip_header_len);
-    it->second->httpFilterManager()->setTCPSegment(p);
-    p.trim_front(decision.payload_offset - decision.ip_header_len);
-    if (http::FilterStatus::StopIteration == it->second->httpFilterManager()->onData(p)) {
-      return NetStatus::OK;
-    }
-    auto filterStatus = it->second->processData(std::move(p));
-    if (filterStatus == http::FilterStatus::DropPkt || filterStatus == http::FilterStatus::StopIteration) {
-      return NetStatus::Drop;
-    }
-    return NetStatus::OK;
-  }
-
-  http::HttpFilterFactory& filter_factory_;
+  // No longer read anywhere: its only consumer, HandleNewConnection, was
+  // deleted with the rest of the WAF dispatch path (see this task's commit).
+  // Kept as a stored member -- rather than dropped along with the
+  // constructor parameter -- because the constructor's public signature is
+  // relied on by DaemonContext (net-policy.h, out of scope for this task)
+  // and by every ConnectionManager instantiation in
+  // tests/net_flow_engine_ffi_test.cc (Task 1's file, not touched here).
+  [[maybe_unused]] http::HttpFilterFactory& filter_factory_;
   rust::Box<net_flow::FlowEngine> engine_;
 
-  // KNOWN LIMITATION -- LOOPBACK TRAFFIC COLLIDES IN BOTH MAPS BELOW.
+  // KNOWN LIMITATION -- LOOPBACK TRAFFIC COLLIDES IN THE MAP BELOW.
   //
-  // Both maps are keyed by ConnectionID alone, which is derived purely from the
-  // packet's (saddr, daddr, sport, dport) -- it carries no notion of which NFQ
-  // queue, and therefore which direction, the packet was captured on.
-  // crates/net_iptables installs its NFQUEUE jumps on mangle PREROUTING and
-  // mangle OUTPUT with no `lo`/loopback exclusion, so a 127.0.0.1 -> 127.0.0.1
-  // packet is delivered to BOTH input_nfq_cb and output_nfq_cb with identical
-  // bytes, yielding the SAME ConnectionID in both callbacks. For localhost or
-  // sidecar traffic under an L7 microseg or WAF policy, the two directions then
-  // share one entry: one direction's rule_key (looked up in InputHttpPolicy)
-  // and half-parsed llhttp state can be handed to the other (which would look
-  // its key up in OutputHttpPolicy), i.e. cross-direction contamination.
+  // microseg_conns_ is keyed by ConnectionID alone, which is derived purely
+  // from the packet's (saddr, daddr, sport, dport) -- it carries no notion of
+  // which NFQ queue, and therefore which direction, the packet was captured
+  // on. crates/net_iptables installs its NFQUEUE jumps on mangle PREROUTING
+  // and mangle OUTPUT with no `lo`/loopback exclusion, so a 127.0.0.1 ->
+  // 127.0.0.1 packet is delivered to BOTH input_nfq_cb and output_nfq_cb with
+  // identical bytes, yielding the SAME ConnectionID in both callbacks. For
+  // localhost or sidecar traffic under an L7 microsegmentation policy, the
+  // two directions then share one entry: one direction's rule_key (looked up
+  // in InputHttpPolicy) and half-parsed llhttp state can be handed to the
+  // other (which would look its key up in OutputHttpPolicy), i.e.
+  // cross-direction contamination.
   //
   // This is a real regression from the pre-Phase-6b-2 design, which kept two
   // separate direction-keyed maps (MicroSegEngine::TcpCtInput()/TcpCtOutput())
@@ -576,11 +428,10 @@ private:
   // when this branch merges. Non-loopback traffic is unaffected, since the two
   // directions of such a flow have genuinely distinct ConnectionIDs.
   //
-  // The fix, when it is done, is to key both maps by (ConnectionID, direction)
-  // -- roughly 40 lines, touching every call site in net-policy.cpp -- or to
-  // exclude `lo` at the iptables layer. Do not paper over it by mutating shared
-  // entries defensively at the use sites.
-  std::unordered_map<ConnectionID, std::shared_ptr<http::Connection>, ConnectionIDHash> http_conns_;
+  // The fix, when it is done, is to key microseg_conns_ by (ConnectionID,
+  // direction) -- roughly 40 lines, touching every call site in
+  // net-policy.cpp -- or to exclude `lo` at the iptables layer. Do not paper
+  // over it by mutating shared entries defensively at the use sites.
   std::unordered_map<ConnectionID, MicrosegEntry, ConnectionIDHash> microseg_conns_;
 };
 
