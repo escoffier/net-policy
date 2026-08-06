@@ -106,51 +106,6 @@ TEST(NetFlowEngineFfiTest, ParseFiveTupleRecognizesTcpToo) {
 
 namespace {
 
-// Regression test for a bug the reviewer of Task 7 (the ConnectionManager/
-// FlowEngine cutover) caught: HandleData used to call setTCPSegment() on the
-// packet BEFORE trimming off the IP header, so the HTTP filter chain (and
-// waf/plugin.cc's ModifyNetPackets, which casts TCPSegment::base_ directly to
-// struct tcphdr*) would see -- and, for some WAF actions, write into -- the
-// tail of the live IP header instead of the real TCP header. This test
-// captures exactly what setTCPSegment() and onData() are handed and checks
-// they start at the TCP header / payload respectively, not earlier.
-class CapturingFilter : public http::HttpFilterBase {
-public:
-  http::FilterStatus onRequestHeaders(http::RequestHeaderMap&, bool) override {
-    return http::FilterStatus::Continue;
-  }
-  http::FilterStatus onRequestBody(seastar::net::packet&, bool) override {
-    return http::FilterStatus::Continue;
-  }
-  http::FilterStatus onResponseBody(seastar::net::packet&, bool) override {
-    return http::FilterStatus::Continue;
-  }
-  http::FilterStatus onResponseHeaders(http::RequestHeaderMap&, bool) override {
-    return http::FilterStatus::Continue;
-  }
-  http::FilterStatus onNewConnection(const net::ConnectionInfo&) override {
-    return http::FilterStatus::Continue;
-  }
-  http::FilterStatus onData(seastar::net::packet& data) override {
-    on_data_bytes_.assign(data.get_header(0, data.len()), data.len());
-    return http::FilterStatus::Continue;
-  }
-  http::FilterStatus onClose() override {
-    close_called_ = true;
-    return http::FilterStatus::Continue;
-  }
-  size_t getConnectionID() const override { return 0; }
-  void setTCPSegment(char* p, size_t size) override {
-    tcp_segment_bytes_.assign(p, size);
-  }
-  http::TCPSegment& getTcpSegment() override { return tcp_segment_; }
-
-  std::string tcp_segment_bytes_;
-  std::string on_data_bytes_;
-  http::TCPSegment tcp_segment_{};
-  bool close_called_ = false;
-};
-
 // 20-byte IPv4 header (saddr=10.0.0.1, daddr=10.0.0.2, protocol=TCP) followed
 // by a 20-byte TCP header (source=1234, dest=80, doff=5, no flags -- an
 // established-flow data segment, not the SYN) followed by `payload`.
@@ -185,103 +140,6 @@ std::vector<uint8_t> FinPacket() {
 
 }  // namespace
 
-TEST(ConnectionManagerCutoverTest, HandleDataPassesTcpHeaderStartNotIpHeaderStartToFilters) {
-  http::HttpFilterFactory factory;
-  auto captured_filter = std::make_shared<CapturingFilter>();
-  factory.registerFilter([captured_filter](size_t, uint32_t, uint32_t) {
-    return std::static_pointer_cast<http::HttpFilterBase>(captured_filter);
-  });
-
-  net::ConnectionManager mgr(factory);
-
-  auto syn = DataPacket(/*syn=*/true, "");
-  auto syn_result = mgr.receive(syn.data(), syn.size(), /*track_tcp=*/true);
-  ASSERT_TRUE(syn_result.is_tcp);
-  ASSERT_EQ(mgr.DispatchWaf(syn_result.decision, syn.data(), syn.size()), net::NetStatus::OK);
-
-  const std::string payload = "GET /x";
-  auto data_pkt = DataPacket(/*syn=*/false, payload);
-  // DataPacket() defaults its TCP sequence number to 0, same as the SYN
-  // packet above -- which would make the engine treat this as a
-  // retransmission of the SYN (Duplicate, kind 4) rather than the next
-  // segment (Data, kind 3), per Task 1's duplicate-segment detection. The
-  // SYN consumes sequence number 0, so the next real segment must carry
-  // seq=1. TCP sequence number is at byte offset 24 (20-byte IP header + 4
-  // bytes into the TCP header).
-  uint32_t seq_be = htonl(1);
-  std::memcpy(data_pkt.data() + 24, &seq_be, sizeof(seq_be));
-  // Deliberately not asserting on the return value here: HandleData's final
-  // OK-vs-Drop result additionally depends on http::Connection::processData's
-  // llhttp-based HTTP detection for these arbitrary bytes, which is unrelated
-  // to (and, independently of this test, order-dependent/flaky across runs
-  // for reasons predating this change -- llhttp state is not perfectly
-  // process-order-independent for partial, non-CRLF-terminated input) the
-  // ip_header_len/setTCPSegment fix this test exists to check. Both
-  // setTCPSegment and onData (below) run unconditionally before that
-  // HTTP-parse-dependent branch, so they're unaffected either way.
-  auto data_result = mgr.receive(data_pkt.data(), data_pkt.size(), /*track_tcp=*/true);
-  ASSERT_TRUE(data_result.is_tcp);
-  mgr.DispatchWaf(data_result.decision, data_pkt.data(), data_pkt.size());
-
-  // setTCPSegment must see the TCP header first -- source port 1234 (wire
-  // bytes 0x04 0xD2) -- NOT the IP header (which would start with 0x45, the
-  // version/ihl byte, if the IP-header trim were missing or applied too late).
-  ASSERT_GE(captured_filter->tcp_segment_bytes_.size(), 2u);
-  EXPECT_EQ(static_cast<uint8_t>(captured_filter->tcp_segment_bytes_[0]), 0x04);
-  EXPECT_EQ(static_cast<uint8_t>(captured_filter->tcp_segment_bytes_[1]), 0xD2);
-  // Size handed to setTCPSegment is [TCP header + payload], i.e. original
-  // packet length minus the 20-byte IP header -- not the full 40+payload.
-  EXPECT_EQ(captured_filter->tcp_segment_bytes_.size(), 20u + payload.size());
-
-  // onData (after the second trim, past the TCP header too) must see exactly
-  // the payload.
-  EXPECT_EQ(captured_filter->on_data_bytes_, payload);
-}
-
-// Regression coverage for the connection-close and peer-creation paths in
-// net::ConnectionManager. Task 6's differential test harness used to exercise
-// these paths (FIN/close, peer-connection creation) against the real C++
-// implementation, but was correctly deleted in Task 7 once there was only one
-// implementation left to compare. Nothing replaced that coverage for the new
-// glue in HandleNewConnection/HandleClosed -- this test closes that gap by
-// checking, through the real net::ConnectionManager (not just the Rust
-// engine), that:
-//   1. A SYN creates BOTH the flow's own entry and its peer's entry in the
-//      C++-side connection table (HandleNewConnection's peer_is_new branch).
-//   2. A subsequent FIN invokes onClose() on the (shared) HttpFilterManager.
-//   3. That same FIN removes BOTH the flow's own entry and its peer's entry
-//      from the C++-side connection table (HandleClosed must not erase only
-//      its own ConnectionID).
-TEST(ConnectionManagerCutoverTest, HandleClosedInvokesOnCloseAndRemovesBothConnections) {
-  http::HttpFilterFactory factory;
-  auto captured_filter = std::make_shared<CapturingFilter>();
-  factory.registerFilter([captured_filter](size_t, uint32_t, uint32_t) {
-    return std::static_pointer_cast<http::HttpFilterBase>(captured_filter);
-  });
-
-  net::ConnectionManager mgr(factory);
-
-  auto syn = SynPacket();
-  auto syn_result = mgr.receive(syn.data(), syn.size(), /*track_tcp=*/true);
-  ASSERT_TRUE(syn_result.is_tcp);
-  ASSERT_EQ(mgr.DispatchWaf(syn_result.decision, syn.data(), syn.size()), net::NetStatus::OK);
-  // Both the server-side (1234->80) and the auto-created peer (80->1234)
-  // entries must be present -- this is the check that would catch
-  // HandleNewConnection dropping its peer_is_new branch.
-  EXPECT_EQ(mgr.httpConnectionCount(), 2u);
-  EXPECT_FALSE(captured_filter->close_called_);
-
-  auto fin = FinPacket();
-  auto fin_result = mgr.receive(fin.data(), fin.size(), /*track_tcp=*/true);
-  ASSERT_TRUE(fin_result.is_tcp);
-  ASSERT_EQ(mgr.DispatchWaf(fin_result.decision, fin.data(), fin.size()), net::NetStatus::OK);
-
-  EXPECT_TRUE(captured_filter->close_called_);
-  // Both entries must be gone -- this is the check that would catch
-  // HandleClosed erasing only its own ConnectionID and leaking its peer's.
-  EXPECT_EQ(mgr.httpConnectionCount(), 0u);
-}
-
 // End-to-end coverage for the full input_nfq_cb-shaped call sequence against
 // the real ConnectionManager: a non-TCP (UDP) packet must still come back
 // with a recognized five-tuple (L3-L4 policy matching needs this for every
@@ -315,13 +173,11 @@ TEST(ConnectionManagerCutoverTest, ReceiveReturnsFiveTupleForUdpWithoutWafDispat
 // `&& track_tcp` conjunct in `if (result.is_tcp && track_tcp)` never decides
 // anything and dropping it would not fail that test.)
 //
-// The gate exists because net_flow_engine's FlowEngine has no timeout/reaper:
-// entries leave the TCB table only on a FIN/RST for an already-tracked flow.
-// net-policy.cpp passes daemon->WafEnabled() here, and waf_enable_ defaults to
-// false, so tracking TCP unconditionally would grow that table without bound in
-// the default deployment. Asserting on stat().tcp_conn_ (the Rust engine's live
-// TCB count) is what makes this test observe that actual resource-leak
-// scenario, rather than just restating the flag it was passed.
+// Production (input_nfq_cb/output_nfq_cb) always passes `true` now -- the flag
+// stays on receive()'s signature only as this test seam. Asserting on
+// stat().tcp_conn_ (the Rust engine's live TCB count) is what makes this test
+// observe that a `track_tcp=false` caller really does leave the TCB table
+// untouched, rather than just restating the flag it was passed.
 TEST(ConnectionManagerCutoverTest, TcpPacketWithTrackingOffDoesNotEnterTcbTable) {
   http::HttpFilterFactory filter_factory;
   net::ConnectionManager manager(filter_factory);
@@ -500,6 +356,87 @@ std::vector<uint8_t> ReverseFinPacket() {
 }
 
 }  // namespace
+
+// Regression test, retargeted from the WAF-era HandleData onto the
+// microsegmentation path after WAF removal (see
+// docs/superpowers/specs/2026-08-06-waf-removal-design.md). Originally this
+// proved ConnectionManager::HandleData trimmed the packet to the TCP header
+// (not the IP header) before handing it to the WAF's filter chain via
+// setTCPSegment. DispatchMicroseg's onData path is a single trim by
+// decision.payload_offset rather than HandleData's two-step
+// ip_header_len-then-payload_offset trim, but the same offset-correctness
+// property applies: DataPacket() places non-HTTP bytes (the fabricated TCP
+// header, byte offsets 20-39) exactly where they would leak into the parse
+// if payload_offset were wrong. If DispatchMicroseg ever trimmed short of
+// the real payload start, llhttp would see those bytes before "GET" and
+// never reach ParseState::Done, so the header below would come back empty
+// instead of the exact values asserted.
+TEST(ConnectionManagerMicrosegTest, DataPassesPayloadOffsetNotTcpHeaderStartToParser) {
+  http::HttpFilterFactory factory;
+  net::ConnectionManager mgr(factory);
+
+  auto syn = SynPacket();
+  auto syn_result = mgr.receive(syn.data(), syn.size(), /*track_tcp=*/true);
+  ASSERT_EQ(syn_result.decision.kind, 1);  // NewConnection
+  mgr.MicrosegTrack(syn_result.decision, "some-rule-key");
+
+  const std::string payload = "GET /x HTTP/1.1\r\nHost: example.com\r\n\r\n";
+  auto data_pkt = DataPacket(/*syn=*/false, payload);
+  // DataPacket() defaults its TCP sequence number to 0, same as the SYN
+  // packet above -- the SYN consumes sequence number 0, so the next real
+  // segment must carry seq=1 or the engine classifies it as a Duplicate
+  // (kind 4) retransmission of the SYN, not the next Data segment (kind 3).
+  // TCP sequence number is at byte offset 24 (20-byte IP header + 4 bytes
+  // into the TCP header).
+  uint32_t seq_be = htonl(1);
+  std::memcpy(data_pkt.data() + 24, &seq_be, sizeof(seq_be));
+  auto data_result = mgr.receive(data_pkt.data(), data_pkt.size(), /*track_tcp=*/true);
+  ASSERT_TRUE(data_result.is_tcp);
+  ASSERT_EQ(data_result.decision.kind, 3);  // Data
+
+  auto header =
+      mgr.DispatchMicroseg(data_result.decision, data_pkt.data(), data_pkt.size(), "some-rule-key");
+  ASSERT_TRUE(header.has_value());
+  EXPECT_EQ(header->method_, "GET");
+  EXPECT_EQ(header->path_, "/x");
+  EXPECT_EQ(header->host_, "example.com");
+}
+
+// Regression test, retargeted from the WAF-era HandleClosed onto the
+// microsegmentation path after WAF removal (see
+// docs/superpowers/specs/2026-08-06-waf-removal-design.md). Originally this
+// proved HandleClosed tore down BOTH directions' http_conns_ entries from a
+// single Closed dispatch, not just the dispatching direction's own.
+// DispatchMicroseg's case 2 (routed through MicrosegClose) has the same
+// both-directions-erased invariant -- it erases both `conn_id` and
+// `peer_conn_id` unconditionally -- proven here by tracking both directions
+// explicitly, then closing from just one, and checking neither survives.
+TEST(ConnectionManagerMicrosegTest, MicrosegCloseErasesBothDirectionsFromASingleDispatch) {
+  http::HttpFilterFactory factory;
+  net::ConnectionManager mgr(factory);
+
+  auto syn = SynPacket();
+  auto syn_result = mgr.receive(syn.data(), syn.size(), /*track_tcp=*/true);
+  ASSERT_EQ(syn_result.decision.kind, 1);  // NewConnection
+  mgr.MicrosegTrack(syn_result.decision, "ingress-key");
+
+  auto syn_ack = SynAckPacket();
+  auto syn_ack_result = mgr.receive(syn_ack.data(), syn_ack.size(), /*track_tcp=*/true);
+  mgr.MicrosegTrack(syn_ack_result.decision, "egress-key");
+
+  ASSERT_TRUE(mgr.MicrosegTracked(syn_result.decision));
+  ASSERT_TRUE(mgr.MicrosegTracked(syn_ack_result.decision));
+  ASSERT_EQ(mgr.microsegConnectionCount(), 2u);
+
+  auto fin = FinPacket();
+  auto fin_result = mgr.receive(fin.data(), fin.size(), /*track_tcp=*/true);
+  ASSERT_EQ(fin_result.decision.kind, 2);  // Closed
+  EXPECT_TRUE(mgr.MicrosegClose(fin_result.decision, fin.data(), fin.size()));
+
+  EXPECT_FALSE(mgr.MicrosegTracked(syn_result.decision));
+  EXPECT_FALSE(mgr.MicrosegTracked(syn_ack_result.decision));
+  EXPECT_EQ(mgr.microsegConnectionCount(), 0u);
+}
 
 // Regression test for Critical #1 of Task 5's review: a SYN-ACK is SYN-flagged
 // but is NOT kind 1 (NewConnection), because the initiating SYN already seeded
