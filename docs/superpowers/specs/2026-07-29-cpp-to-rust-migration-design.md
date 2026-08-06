@@ -72,6 +72,19 @@ established in Phase 0 before any behavior moves.
 > rationale. No other phase in this roadmap depended on WAF's Rust target,
 > so this does not affect the rest of the plan.
 
+> **Update (2026-08-06, second):** Phase 6 above ("NFQ/netlink core") is only
+> partially complete. Its completed sub-phases (6a, 6b-1, 6b-2, 6b-3, 6c)
+> migrated the low-level netlink *mechanics* (NFQUEUE operations, conntrack
+> sessions, iptables rule writing) into Rust crates, but the daemon
+> *orchestration* on top of them — `net-policy.cpp`'s epoll loop, NFQ
+> callback dispatch, pod lifecycle, and gRPC JSON marshalling — remains real,
+> unmigrated C++. This was not visible until verified directly against the
+> code. The remaining phases (3a/3b/3c, unchanged, still wanted) are now
+> followed by a new **Phase 6d** that completes Phase 6's originally-stated
+> scope, before Phase 7 (Decommission, unchanged) genuinely runs last. See
+> `docs/superpowers/specs/2026-08-06-phase7-decommission-scoping.md` for the
+> full inventory and rationale.
+
 ## Validation Strategy (per phase)
 
 Each phase follows the same gate before its Rust component takes over from
