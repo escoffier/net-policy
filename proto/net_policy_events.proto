@@ -20,7 +20,6 @@ message SubscribeEventsRequest {
 message PolicyEvent {
   oneof event {
     PolicyMatchEvent policy_match = 1;
-    WafAttackEvent   waf_attack   = 2;
   }
 }
 
@@ -34,29 +33,4 @@ message PolicyMatchEvent {
   string src_ip      = 6;
   string dst_ip      = 7;
   string policy_name = 8;
-}
-
-// mirrors the envelope + attacked_log[0] object built in PluginContext::onClose
-// (waf/plugin.cc:100-142) before being handed to PluginRootContext::HttpPost.
-message WafAttackEvent {
-  // envelope fields (waf/plugin.cc:112-118)
-  uint64 service_id    = 1;
-  string res_name      = 2;
-  string app_name      = 3;
-  string res_kind      = 4;
-  string k8s_namespace = 5;  // JSON key on the wire is "namespace"
-  string cluster_key   = 6;
-  // attack detail fields (waf/plugin.cc:123-134, AttackedLog struct waf/rule.h)
-  string action           = 7;
-  string attack_ip        = 8;
-  string attacked_app     = 9;
-  string attack_load      = 10;
-  int64  attack_time      = 11;
-  int64  rule_id          = 12;
-  string rule_name        = 13;
-  string req_pkg          = 14;
-  string rsp_pkg          = 15;
-  string attack_type      = 16;  // AttackedLog::type_
-  string attacked_url     = 17;
-  string rsp_content_type = 18;
 }

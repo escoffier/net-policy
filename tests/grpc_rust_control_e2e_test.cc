@@ -151,24 +151,6 @@ TEST_F(GrpcRustControlEndToEndTest, DeletePolicyRuleForUnknownNameReturnsZeroSta
   EXPECT_EQ(resp.status(), 0);
 }
 
-// PluginRootContext::RemoveWafRule (waf/plugin.cc) parses the JSON, then for
-// each pod IP in the "pod_ips" array does waf_rules_.erase(ip) -- a no-op on
-// std::map when the key isn't present -- and unconditionally returns true as
-// long as the "pod_ips" key itself was present. So an unknown pod IP is
-// still a "success" from RemoveWafRule's perspective, and
-// GrpcDispatchDeleteWafRule (net-policy.cpp) maps that to status 0, not an
-// error, matching the pattern already seen in DeletePolicyRule/PodDown for
-// other "not found" inputs.
-TEST_F(GrpcRustControlEndToEndTest, DeleteWafRuleForUnknownPodReturnsZeroStatus) {
-  grpc::ClientContext ctx;
-  netpolicy::v1::DeleteWafRuleRequest req;
-  req.add_pod_ips("10.0.0.99");
-  netpolicy::v1::StatusResponse resp;
-  grpc::Status status = stub_->DeleteWafRule(&ctx, req, &resp);
-  ASSERT_TRUE(status.ok()) << status.error_message();
-  EXPECT_EQ(resp.status(), 0);
-}
-
 TEST_F(GrpcRustControlEndToEndTest, DumpHeapProfileEnableThenDisableReturnsOkStatus) {
   {
     grpc::ClientContext ctx;
@@ -264,18 +246,6 @@ TEST_F(GrpcRustControlEndToEndTest, AddPolicyRuleThenReadBackViaDumpConfig) {
   status = stub_->DeletePolicyRule(&del_ctx, del_req, &del_resp);
   ASSERT_TRUE(status.ok());
   EXPECT_EQ(del_resp.status(), 0);
-}
-
-TEST_F(GrpcRustControlEndToEndTest, AddWafRuleWithMinimalFieldsReturnsOkStatus) {
-  grpc::ClientContext ctx;
-  netpolicy::v1::AddWafRuleRequest req;
-  req.add_pod_ips("10.0.0.7");
-  req.set_mode("passthrough");
-  req.set_name("rust-e2e-waf-test");
-  netpolicy::v1::StatusResponse resp;
-  grpc::Status status = stub_->AddWafRule(&ctx, req, &resp);
-  ASSERT_TRUE(status.ok()) << status.error_message();
-  EXPECT_EQ(resp.status(), 0);
 }
 
 } // namespace

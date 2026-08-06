@@ -1544,30 +1544,6 @@ int32_t GrpcDispatchDeletePolicyRule(DaemonContext* daemon, GrpcDispatchQueue* q
   return result;
 }
 
-bool GrpcDispatchDeleteWafRule(DaemonContext* daemon, GrpcDispatchQueue* queue,
-                                rust::Vec<rust::String> pod_ips) {
-  cJSON* root = cJSON_CreateObject();
-  cJSON* ips = cJSON_CreateArray();
-  for (const auto& ip : pod_ips) {
-    cJSON_AddItemToArray(ips, cJSON_CreateString(std::string(ip).c_str()));
-  }
-  cJSON_AddItemToObject(root, "pod_ips", ips);
-  char* json_c = cJSON_PrintUnformatted(root);
-  std::string json(json_c);
-  cJSON_free(json_c);
-  cJSON_Delete(root);
-
-  GrpcDispatchItem item;
-  bool result = false;
-  item.work = [&]() {
-    result = daemon->WafRoot().RemoveWafRule(const_cast<char*>(json.c_str()));
-  };
-  std::future<void> future = item.done.get_future();
-  queue->Push(&item);
-  future.wait();
-  return result;
-}
-
 int32_t GrpcDispatchDumpHeapProfile(DaemonContext* daemon, GrpcDispatchQueue* queue,
                                     bool enable) {
   std::string json = std::string("{\"enable\":\"") + (enable ? "y" : "n") + "\"}";
@@ -1795,82 +1771,6 @@ int32_t GrpcDispatchAddPolicyRule(DaemonContext* daemon, GrpcDispatchQueue* queu
   item.work = [&]() {
     result = ParseNetPolicy(const_cast<char*>(json.c_str()), *daemon);
     daemon->Microseg().PrintPolicyLog();
-  };
-  std::future<void> future = item.done.get_future();
-  queue->Push(&item);
-  future.wait();
-  return result;
-}
-
-bool GrpcDispatchAddWafRule(DaemonContext* daemon, GrpcDispatchQueue* queue,
-                             rust::Vec<rust::String> pod_ips, rust::Vec<WafRule> rules,
-                             rust::Vec<rust::String> domains,
-                             rust::Vec<rust::String> excluded_file_types,
-                             rust::Vec<rust::String> detect_headers,
-                             rust::Vec<BlackWhiteListEntry> black_white_lists, rust::Str uri,
-                             rust::Str mode, rust::Str name, rust::Str cluster_key,
-                             rust::Str k8s_namespace, rust::Str kind, rust::Str workload_name,
-                             uint64_t service_id) {
-  cJSON* root = cJSON_CreateObject();
-  cJSON* pod_ips_arr = cJSON_CreateArray();
-  for (const auto& ip : pod_ips) cJSON_AddItemToArray(pod_ips_arr, cJSON_CreateString(std::string(ip).c_str()));
-  cJSON_AddItemToObject(root, "pod_ips", pod_ips_arr);
-
-  cJSON* rules_arr = cJSON_CreateArray();
-  for (const auto& r : rules) {
-    cJSON* ro = cJSON_CreateObject();
-    cJSON_AddNumberToObject(ro, "id", (double)r.id);
-    cJSON_AddNumberToObject(ro, "level", (double)r.level);
-    cJSON_AddStringToObject(ro, "type", std::string(r.type).c_str());
-    cJSON_AddStringToObject(ro, "name", std::string(r.name).c_str());
-    cJSON_AddStringToObject(ro, "expr", std::string(r.expr).c_str());
-    cJSON_AddStringToObject(ro, "mode", std::string(r.mode).c_str());
-    cJSON_AddStringToObject(ro, "Description", std::string(r.description).c_str()); // capital D, see waf/plugin.cc:477
-    cJSON_AddItemToArray(rules_arr, ro);
-  }
-  cJSON_AddItemToObject(root, "rules", rules_arr);
-
-  cJSON* domains_arr = cJSON_CreateArray();
-  for (const auto& d : domains) cJSON_AddItemToArray(domains_arr, cJSON_CreateString(std::string(d).c_str()));
-  cJSON_AddItemToObject(root, "domain", domains_arr); // key is "domain" (singular), matches ParseConfiguration's expected schema
-
-  cJSON* excl_arr = cJSON_CreateArray();
-  for (const auto& e : excluded_file_types) cJSON_AddItemToArray(excl_arr, cJSON_CreateString(std::string(e).c_str()));
-  cJSON_AddItemToObject(root, "excluded_file_types", excl_arr);
-
-  cJSON* dh_arr = cJSON_CreateArray();
-  for (const auto& h : detect_headers) cJSON_AddItemToArray(dh_arr, cJSON_CreateString(std::string(h).c_str()));
-  cJSON_AddItemToObject(root, "detect_headers", dh_arr);
-
-  cJSON* bwl_arr = cJSON_CreateArray();
-  for (const auto& b : black_white_lists) {
-    cJSON* bo = cJSON_CreateObject();
-    cJSON_AddNumberToObject(bo, "id", (double)b.id);
-    cJSON_AddStringToObject(bo, "name", std::string(b.name).c_str());
-    cJSON_AddStringToObject(bo, "expr", std::string(b.expr).c_str());
-    cJSON_AddStringToObject(bo, "mode", std::string(b.mode).c_str());
-    cJSON_AddItemToArray(bwl_arr, bo);
-  }
-  cJSON_AddItemToObject(root, "black_white_lists", bwl_arr);
-
-  cJSON_AddStringToObject(root, "uri", std::string(uri).c_str());
-  cJSON_AddStringToObject(root, "mode", std::string(mode).c_str());
-  cJSON_AddStringToObject(root, "name", std::string(name).c_str());
-  cJSON_AddStringToObject(root, "cluster_key", std::string(cluster_key).c_str());
-  cJSON_AddStringToObject(root, "namespace", std::string(k8s_namespace).c_str()); // wire key is "namespace", see .proto comment
-  cJSON_AddStringToObject(root, "kind", std::string(kind).c_str());
-  cJSON_AddStringToObject(root, "workload_name", std::string(workload_name).c_str());
-  cJSON_AddNumberToObject(root, "service_id", (double)service_id);
-
-  char* json_c = cJSON_PrintUnformatted(root);
-  std::string json(json_c);
-  cJSON_free(json_c);
-  cJSON_Delete(root);
-
-  GrpcDispatchItem item;
-  bool result = false;
-  item.work = [&]() {
-    result = daemon->WafRoot().ParseConfiguration(const_cast<char*>(json.c_str()));
   };
   std::future<void> future = item.done.get_future();
   queue->Push(&item);

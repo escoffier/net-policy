@@ -2,7 +2,7 @@ pub mod proto {
     tonic::include_proto!("netpolicy.v1");
 }
 
-use proto::{PolicyEvent, PolicyMatchEvent, WafAttackEvent};
+use proto::{PolicyEvent, PolicyMatchEvent};
 use std::collections::VecDeque;
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::Duration;
@@ -19,27 +19,6 @@ mod ffi {
             src_ip: &str,
             dst_ip: &str,
             policy_name: &str,
-        );
-
-        fn publish_waf_attack(
-            service_id: u64,
-            res_name: &str,
-            app_name: &str,
-            res_kind: &str,
-            k8s_namespace: &str,
-            cluster_key: &str,
-            action: &str,
-            attack_ip: &str,
-            attacked_app: &str,
-            attack_load: &str,
-            attack_time: i64,
-            rule_id: i64,
-            rule_name: &str,
-            req_pkg: &str,
-            rsp_pkg: &str,
-            attack_type: &str,
-            attacked_url: &str,
-            rsp_content_type: &str,
         );
 
         unsafe fn start_event_server(port: u16) -> u16;
@@ -147,51 +126,6 @@ pub fn publish_policy_match(
             src_ip: src_ip.to_string(),
             dst_ip: dst_ip.to_string(),
             policy_name: policy_name.to_string(),
-        })),
-    };
-    queue().push(event);
-}
-
-pub fn publish_waf_attack(
-    service_id: u64,
-    res_name: &str,
-    app_name: &str,
-    res_kind: &str,
-    k8s_namespace: &str,
-    cluster_key: &str,
-    action: &str,
-    attack_ip: &str,
-    attacked_app: &str,
-    attack_load: &str,
-    attack_time: i64,
-    rule_id: i64,
-    rule_name: &str,
-    req_pkg: &str,
-    rsp_pkg: &str,
-    attack_type: &str,
-    attacked_url: &str,
-    rsp_content_type: &str,
-) {
-    let event = PolicyEvent {
-        event: Some(proto::policy_event::Event::WafAttack(WafAttackEvent {
-            service_id,
-            res_name: res_name.to_string(),
-            app_name: app_name.to_string(),
-            res_kind: res_kind.to_string(),
-            k8s_namespace: k8s_namespace.to_string(),
-            cluster_key: cluster_key.to_string(),
-            action: action.to_string(),
-            attack_ip: attack_ip.to_string(),
-            attacked_app: attacked_app.to_string(),
-            attack_load: attack_load.to_string(),
-            attack_time,
-            rule_id,
-            rule_name: rule_name.to_string(),
-            req_pkg: req_pkg.to_string(),
-            rsp_pkg: rsp_pkg.to_string(),
-            attack_type: attack_type.to_string(),
-            attacked_url: attacked_url.to_string(),
-            rsp_content_type: rsp_content_type.to_string(),
         })),
     };
     queue().push(event);

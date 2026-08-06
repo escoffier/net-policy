@@ -16,8 +16,6 @@ service NetPolicyControl {
   rpc PodDown(PodDownRequest)                   returns (StatusResponse);          // NetDataType::kPodDie
   rpc AddPolicyRule(AddPolicyRuleRequest)       returns (StatusResponse);          // NetDataType::kAddRule
   rpc DeletePolicyRule(DeletePolicyRuleRequest) returns (StatusResponse);          // NetDataType::kDelRule
-  rpc AddWafRule(AddWafRuleRequest)             returns (StatusResponse);          // NetDataType::kAddWafRule
-  rpc DeleteWafRule(DeleteWafRuleRequest)       returns (StatusResponse);          // NetDataType::kDelWafRule
   rpc DumpHeapProfile(DumpHeapProfileRequest)   returns (StatusResponse);          // NetDataType::kHeapDump
   rpc DumpConfig(DumpConfigRequest)             returns (DumpConfigResponse);      // NetDataType::kConfDump
   rpc DumpConnections(DumpConnectionsRequest)   returns (DumpConnectionsResponse); // NetDataType::kConnDump
@@ -60,46 +58,6 @@ message AddPolicyRuleRequest {
 }
 message DeletePolicyRuleRequest {
   string policy_name = 1;
-}
-
-// mirrors Rule, waf/rule.h:55-65 (fields set by ParseConfiguration, waf/plugin.cc:462-481)
-message WafRule {
-  int64  id          = 1;
-  int64  level       = 2;
-  string type        = 3;
-  string name        = 4;
-  string expr        = 5;
-  string mode        = 6;
-  string description = 7;  // JSON key on the wire is "Description" (capital D), waf/plugin.cc:477
-}
-// mirrors BWList's fields as read by ParseConfiguration, waf/plugin.cc:532-545
-// (BWList itself has additional fields -- action_/desc_/oprexpr_/rtype_/rdata_ -- that
-// ParseConfiguration never populates from JSON; they are intentionally omitted here too)
-message BlackWhiteListEntry {
-  uint64 id   = 1;
-  string name = 2;
-  string expr = 3;
-  string mode = 4;
-}
-// mirrors the full field set ParseConfiguration reads, waf/plugin.cc:427-581
-message AddWafRuleRequest {
-  repeated string pod_ips = 1;
-  repeated WafRule rules = 2;
-  repeated string domains = 3;
-  repeated string excluded_file_types = 4;
-  repeated string detect_headers = 5;
-  repeated BlackWhiteListEntry black_white_lists = 6;
-  string uri = 7;
-  string mode = 8;           // default action, Rules::AddDefAction
-  string name = 9;           // app name
-  string cluster_key = 10;
-  string k8s_namespace = 11; // JSON key on the wire is "namespace"
-  string kind = 12;
-  string workload_name = 13;
-  uint64 service_id = 14;
-}
-message DeleteWafRuleRequest {
-  repeated string pod_ips = 1;  // waf/plugin.cc:621+ (pod_ips only)
 }
 
 // admin::Heap::handleHeapProfile expects a JSON {"enable":"y"|"n"} string, admin/profile.cc:30-56;
