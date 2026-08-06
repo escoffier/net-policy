@@ -52,11 +52,13 @@ fn io_err(msg: &str) -> io::Error {
 }
 
 pub fn open_conntrack_session() -> io::Result<Box<ConntrackSession>> {
-    // Mirrors OpenConntrack's (net-policy.cpp:1085-1111) exact allocation
-    // order and its GOTO_ERROR cleanup-everything-allocated-so-far-then-fail
-    // shape, translated to early Err returns with matching manual cleanup
-    // (Rust has no goto, and ConntrackSession's own Drop cannot run yet since
-    // it has not been fully constructed).
+    // Mirrors the pre-Phase-6c OpenConntrack's exact allocation order and its
+    // GOTO_ERROR cleanup-everything-allocated-so-far-then-fail shape,
+    // translated to early Err returns with matching manual cleanup (Rust has
+    // no goto, and ConntrackSession's own Drop cannot run yet since it has
+    // not been fully constructed). OpenConntrack was deleted from
+    // net-policy.cpp by this plan's Task 4; see the C++ source in commit
+    // 7906a0c or earlier for the original.
     let filter = unsafe { nfct_new() };
     if filter.is_null() {
         return Err(io_err("new nf conntrack failed"));
@@ -101,9 +103,10 @@ pub fn open_conntrack_session() -> io::Result<Box<ConntrackSession>> {
 }
 
 impl ConntrackSession {
-    /// Ports SetAcceptMark (net-policy.cpp:417-457) 1:1. The original's
-    /// `msgtype` parameter is intentionally absent: its only use there was the
-    /// commented-out `nfct_callback_register` call on line 450 (registration
+    /// Ports the pre-Phase-6c SetAcceptMark 1:1 (deleted by this plan's
+    /// Task 4; see the C++ source in commit 7906a0c or earlier). The
+    /// original's `msgtype` parameter is intentionally absent: its only use
+    /// there was a commented-out `nfct_callback_register` call (registration
     /// happens once, at open time, instead).
     pub fn set_accept_mark(&mut self, tuple: &SharedFiveTuple, mark: u32) -> io::Result<()> {
         // SetAcceptMark's exact conditional attribute-setting: ATTR_MARK and
@@ -153,12 +156,13 @@ impl ConntrackSession {
 
 impl Drop for ConntrackSession {
     fn drop(&mut self) {
-        // Mirrors ~NFQ_RES_INFO's conntrack teardown block
-        // (rule-detail.cpp:124-131) in its exact order: destroy filter,
-        // destroy update, close query handle, close update handle. All four
-        // run unconditionally -- they are always non-null once a
-        // ConntrackSession exists at all, since open_conntrack_session never
-        // returns a partially constructed one.
+        // Mirrors NFQ_RES_INFO::FreeResource's conntrack teardown block
+        // (rule-detail.cpp:122, now just `this->conntrack_.reset();`) in its
+        // pre-Phase-6c exact order: destroy filter, destroy update, close
+        // query handle, close update handle. All four run unconditionally --
+        // they are always non-null once a ConntrackSession exists at all,
+        // since open_conntrack_session never returns a partially constructed
+        // one.
         unsafe {
             nfct_destroy(self.filter);
             nfct_destroy(self.update);
@@ -182,9 +186,11 @@ fn inet_addr(text: &str) -> u32 {
     text.parse::<Ipv4Addr>().map(|addr| u32::from(addr).to_be()).unwrap_or(INADDR_NONE)
 }
 
-/// Ports UpdateNetSession (net-policy.cpp:374-414) 1:1. Registered once, at
-/// session-open time, as the callback for NFCT_T_ALL on query_handle -- fires
-/// once per conntrack entry set_accept_mark's NFCT_Q_DUMP query returns.
+/// Ports the pre-Phase-6c UpdateNetSession 1:1 (deleted by this plan's
+/// Task 4; see the C++ source in commit 7906a0c or earlier). Registered once,
+/// at session-open time, as the callback for NFCT_T_ALL on query_handle --
+/// fires once per conntrack entry set_accept_mark's NFCT_Q_DUMP query
+/// returns.
 extern "C" fn update_net_session(
     _msg_type: NfcMsgType,
     ct: *mut nf_conntrack,

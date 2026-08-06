@@ -891,6 +891,17 @@ If nothing needed changing, no commit is required for this task.
 - `UpdateMark`'s "force every tracked connection's mark toward deny whenever
   a policy is added" behavior is preserved exactly and documented as
   deliberate.
+- One known, deliberate, accepted deviation from byte-for-byte identical
+  observable behavior: the old C++ `OpenConntrack`'s partial-allocation
+  failure path had a latent double-free/double-close bug — it cleaned up what
+  it had allocated so far but left `NFQ_RES_INFO`'s four `nfct_*` pointers
+  non-null, so a later `FreeResource` call would re-run `nfct_destroy`/
+  `nfct_close` on the same already-freed pointers. `open_conntrack_session`'s
+  Rust port cannot reproduce this: its cleanup on failure is entirely local
+  (nothing is written back into the caller's `NFQ_RES_INFO`), so `conntrack_`
+  stays a disengaged `std::optional` and `FreeResource`'s `conntrack_.reset()`
+  is a safe no-op on that path. This is a genuine improvement, not a defect,
+  and should not be "fixed" back to match the old behavior.
 - **Phase 6 (NFQ/netlink core) is fully done.** Every piece of the original
   roadmap's Phase 6 scope — iptables, the legacy control protocol, NFQ
   packet-queue mechanics, netns switching, and conntrack — is now Rust-backed
