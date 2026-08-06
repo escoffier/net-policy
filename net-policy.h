@@ -24,7 +24,6 @@
 #include "http/http_filter_factory.h"
 #include "net/connection_manager.h"
 #include "net/utility.h"
-#include "waf/plugin.h"
 #include "net_policy_engine_cxxbridge/lib.h"
 #include "net_iptables_cxxbridge/lib.h"
 #include "net_nfq_cxxbridge/lib.h"
@@ -274,7 +273,7 @@ private:
     std::unordered_map<std::string, std::vector<HTTP_RULE_INFO>>      output_http_policy_;
 };
 
-/*post-notification server — owns the client fd and sends match/WAF events*/
+/*post-notification server — owns the client fd and sends policy-match events*/
 class PostServer
 {
 public:
@@ -284,8 +283,6 @@ public:
     /*send a policy-match notification; returns 0 on success, -1 on error*/
     int  SendMatchMsg(FiveTuple& tuple, NetPolicyRule action, FlowDir dir,
                       const std::string& rule_key);
-    /*return pointer to the fd so the WAF plugin can write directly*/
-    int* FdPtr() { return &post_link_fd_; }
 
 private:
     int post_link_fd_ = 0;
@@ -299,9 +296,7 @@ private:
 class DaemonContext
 {
 public:
-    DaemonContext() : connection_manager_(http_filter_factory_) {
-        waf_root_.SetPostFd(post_server_.FdPtr());
-    }
+    DaemonContext() : connection_manager_(http_filter_factory_) {}
     DaemonContext(const DaemonContext&) = delete;
     DaemonContext& operator=(const DaemonContext&) = delete;
 
@@ -309,12 +304,9 @@ public:
     MicroSegEngine&                     Microseg()   { return microseg_; }
     net::ConnectionManager&             ConnMgr()    { return connection_manager_; }
     PostServer&                         PostSrv()    { return post_server_; }
-    http::extension::PluginRootContext& WafRoot()    { return waf_root_; }
     http::HttpFilterFactory&            HttpFilters(){ return http_filter_factory_; }
 
     /*---- former raw-scalar globals (g_log_level stays a separate atomic global) ----*/
-    bool WafEnabled() const           { return waf_enable_; }
-    void SetWafEnabled(bool v)        { waf_enable_ = v; }
     int  IptablesVersion() const      { return ipt_ver_; }
     void SetIptablesVersion(int v)    { ipt_ver_ = v; }
 
@@ -324,14 +316,12 @@ public:
     grpc_bridge::GrpcDispatchQueue* RustControlDispatchQueue() { return rust_dispatch_queue_; }
 
 private:
-    bool waf_enable_      = false;
     int  ipt_ver_         = 0;
 
     http::HttpFilterFactory              http_filter_factory_;      // must precede connection_manager_
     net::ConnectionManager               connection_manager_;
     MicroSegEngine                       microseg_;
     PostServer                           post_server_;
-    http::extension::PluginRootContext   waf_root_;
 
     grpc_bridge::GrpcDispatchQueue* rust_dispatch_queue_ = nullptr; // non-owning
 };

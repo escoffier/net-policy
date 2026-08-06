@@ -1,7 +1,7 @@
 #[cxx::bridge(namespace = "net_iptables")]
 mod ffi {
     extern "Rust" {
-        fn write_iptable_rule(i_mark: i32, o_mark: i32, ipt_ver: i32, waf_enable: bool);
+        fn write_iptable_rule(i_mark: i32, o_mark: i32, ipt_ver: i32);
         fn clear_iptables_rule(ipt_ver: i32);
         fn check_iptables_rule(ipt_ver: i32) -> bool;
         fn get_iptables_version() -> i32;
@@ -55,7 +55,7 @@ pub fn clear_iptables_rule(ipt_ver: i32) {
 /// redirect: if `-N` ever did fail (shouldn't happen given the guard above),
 /// iptables would print "Chain already exists" to stderr -- harmless, just
 /// noisier than the original.
-pub fn write_iptable_rule(i_mark: i32, o_mark: i32, ipt_ver: i32, waf_enable: bool) {
+pub fn write_iptable_rule(i_mark: i32, o_mark: i32, ipt_ver: i32) {
     let bin = iptables_bin(ipt_ver);
 
     if check_iptables_rule(ipt_ver) {
@@ -70,9 +70,7 @@ pub fn write_iptable_rule(i_mark: i32, o_mark: i32, ipt_ver: i32, waf_enable: bo
                     &i_mark.to_string(), "-j", "ACCEPT"]);
         run(bin, &["-t", "mangle", "-A", "TS_ZERO_PREROUTING", "-j", "NFQUEUE",
                     "--queue-num", "0", "--queue-bypass"]);
-        if !waf_enable {
-            run(bin, &["-t", "mangle", "-A", "INPUT", "-j", "CONNMARK", "--save-mark"]);
-        }
+        run(bin, &["-t", "mangle", "-A", "INPUT", "-j", "CONNMARK", "--save-mark"]);
     }
 
     if !mangle_table_contains(bin, "TS_ZERO_OUTPUT") {
@@ -83,9 +81,7 @@ pub fn write_iptable_rule(i_mark: i32, o_mark: i32, ipt_ver: i32, waf_enable: bo
                     &o_mark.to_string(), "-j", "ACCEPT"]);
         run(bin, &["-t", "mangle", "-A", "TS_ZERO_OUTPUT", "-j", "NFQUEUE",
                     "--queue-num", "1", "--queue-bypass"]);
-        if !waf_enable {
-            run(bin, &["-t", "mangle", "-A", "POSTROUTING", "-j", "CONNMARK", "--save-mark"]);
-        }
+        run(bin, &["-t", "mangle", "-A", "POSTROUTING", "-j", "CONNMARK", "--save-mark"]);
     }
 }
 
@@ -136,10 +132,10 @@ mod tests {
         let _ = Command::new("iptables").args(["-t", "mangle", "-D", "PREROUTING", "-j", "CONNMARK", "--restore-mark"]).status();
         let _ = Command::new("iptables").args(["-t", "mangle", "-D", "OUTPUT", "-j", "CONNMARK", "--restore-mark"]).status();
         // Also remove the two CONNMARK --save-mark rules that write_iptable_rule
-        // appends directly to the builtin INPUT/POSTROUTING chains when called
-        // with waf_enable=false. Empirically verified this needs its own -D:
-        // production's clear_iptables_rule uses a bare `-t mangle -F` (no chain
-        // argument), which flushes *every* chain in the mangle table -- including
+        // now unconditionally appends directly to the builtin INPUT/POSTROUTING
+        // chains. Empirically verified this needs its own -D: production's
+        // clear_iptables_rule uses a bare `-t mangle -F` (no chain argument),
+        // which flushes *every* chain in the mangle table -- including
         // INPUT/POSTROUTING's own rules -- so that path clears these for free.
         // But this helper uses `-F TS_ZERO_PREROUTING`/`-F TS_ZERO_OUTPUT` (named,
         // scoped to just those user chains), which does NOT touch INPUT or
@@ -161,7 +157,7 @@ mod tests {
     fn write_then_check_then_clear_round_trips() {
         let _guard = IPTABLES_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         cleanup_test_chains();
-        write_iptable_rule(100, 101, 0, /*waf_enable=*/true);
+        write_iptable_rule(100, 101, 0);
         assert!(check_iptables_rule(0));
         clear_iptables_rule(0);
         assert!(!check_iptables_rule(0));
@@ -174,30 +170,26 @@ mod tests {
         assert!(v == 0 || v == 1);
     }
 
-    // Production's actual default: DaemonContext::waf_enable_ defaults to
-    // false, and GrpcDispatchPodUp passes daemon->WafEnabled() straight
-    // through to write_iptable_rule. Before this test, every existing test
-    // called write_iptable_rule with waf_enable=true, leaving the
-    // `if !waf_enable { ... "-A INPUT/POSTROUTING -j CONNMARK --save-mark" }`
-    // branches -- the ones production actually exercises by default --
-    // completely uncovered.
+    // write_iptable_rule always installs these CONNMARK --save-mark rules now
+    // (there is no more waf_enable parameter) -- this is the historical
+    // WAF-off default behavior, made unconditional.
     #[test]
-    fn write_with_waf_disabled_adds_save_mark_rules() {
+    fn write_always_adds_save_mark_rules_to_input_and_postrouting() {
         let _guard = IPTABLES_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         cleanup_test_chains();
 
-        write_iptable_rule(100, 101, 0, /*waf_enable=*/false);
+        write_iptable_rule(100, 101, 0);
 
         let input = Command::new("iptables").args(["-t", "mangle", "-S", "INPUT"]).output().unwrap();
         let postrouting =
             Command::new("iptables").args(["-t", "mangle", "-S", "POSTROUTING"]).output().unwrap();
         assert!(
             String::from_utf8_lossy(&input.stdout).contains("CONNMARK --save-mark"),
-            "expected -A INPUT -j CONNMARK --save-mark when waf_enable=false"
+            "expected -A INPUT -j CONNMARK --save-mark"
         );
         assert!(
             String::from_utf8_lossy(&postrouting.stdout).contains("CONNMARK --save-mark"),
-            "expected -A POSTROUTING -j CONNMARK --save-mark when waf_enable=false"
+            "expected -A POSTROUTING -j CONNMARK --save-mark"
         );
 
         clear_iptables_rule(0);

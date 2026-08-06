@@ -10,7 +10,6 @@
 extern std::atomic<int> g_log_level;
 
 #define POLICY_LOG_LEVEL  "POLICY_LOG_LEVEL"
-#define POLICY_WAF_ENABLE "POLICY_WAF_ENABLE"
 
 extern std::string TimeToString();
 

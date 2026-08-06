@@ -31,7 +31,7 @@ TEST(NetIptablesFfiTest, GetIptablesVersionReturnsZeroOrOne) {
 TEST(NetIptablesFfiTest, CheckWriteClearRoundTrip) {
   net_iptables::clear_iptables_rule(0);  // best-effort pre-cleanup
   EXPECT_FALSE(net_iptables::check_iptables_rule(0));
-  net_iptables::write_iptable_rule(100, 101, 0, /*waf_enable=*/true);
+  net_iptables::write_iptable_rule(100, 101, 0);
   EXPECT_TRUE(net_iptables::check_iptables_rule(0));
   net_iptables::clear_iptables_rule(0);
   EXPECT_FALSE(net_iptables::check_iptables_rule(0));

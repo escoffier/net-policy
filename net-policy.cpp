@@ -1507,7 +1507,7 @@ int32_t GrpcDispatchPodUp(DaemonContext* daemon, GrpcDispatchQueue* queue, int32
     if (ret == 0) {
       ret = InitNfqueue(epoll_fd, ctrl, *daemon);
       if (ret == 0)
-        net_iptables::write_iptable_rule(1, 1, daemon->IptablesVersion(), daemon->WafEnabled());
+        net_iptables::write_iptable_rule(1, 1, daemon->IptablesVersion());
     }
     result = ret;
   };
@@ -1907,12 +1907,6 @@ int RunNetPolicyDaemon(int argc, char* argv[]) {
         return std::make_shared<http::extension::LogFilter>(id, from, to);
       });
 
-  daemon.HttpFilters().registerFilter(
-      [root = &daemon.WafRoot()](size_t id, uint32_t from,
-                                  uint32_t to) -> std::shared_ptr<http::HttpFilterBase> {
-        return std::make_shared<http::extension::PluginContext>(id, from, to, root);
-      });
-
   char* log_level_env = NULL;
   struct epoll_event ev, events[20];
   int epfd = 0, zLinkFd;
@@ -1924,10 +1918,6 @@ int RunNetPolicyDaemon(int argc, char* argv[]) {
   log_level_env = getenv(POLICY_LOG_LEVEL);
   if (log_level_env)
     g_log_level = std::stoi(log_level_env);
-  /*get waf env*/
-  log_level_env = getenv(POLICY_WAF_ENABLE);
-  if (log_level_env)
-    daemon.SetWafEnabled(strcmp(log_level_env, "true") == 0);
   /*get iptables version*/
   daemon.SetIptablesVersion(net_iptables::get_iptables_version());
   /*print debug log*/
@@ -1962,10 +1952,9 @@ int RunNetPolicyDaemon(int argc, char* argv[]) {
 
   // --- Reaper timer (Phase 6b-2): periodic sweep of stale TCB/microseg state ---
   // This is what bounds the memory the TCP-tracking path consumes. It became
-  // load-bearing rather than merely tidy when the microsegmentation cutover
-  // dropped the old WafEnabled() gate on receive()'s track_tcp: TCB tracking
-  // now runs on every TCP connection in every deployment, including the default
-  // WAF-off one (see input_nfq_cb's comment on that argument), so without this
+  // load-bearing when microsegmentation's cutover made receive()'s track_tcp
+  // unconditional (see input_nfq_cb's comment on that argument): TCB tracking
+  // now runs on every TCP connection in every deployment, so without this
   // timer both the Rust engine's TCB table and ConnectionManager's own per-flow
   // maps would grow without bound for the daemon's lifetime.
   int reaper_timer_fd;
