@@ -4,9 +4,9 @@
 
 This spec covers Phase 3a of the C++ → Rust migration roadmap (`docs/superpowers/specs/2026-07-29-cpp-to-rust-migration-design.md`, sequenced per `docs/superpowers/specs/2026-08-06-phase7-decommission-scoping.md`): migrating the daemon's HTTP/1.1 request-line/header parser to Rust.
 
-Investigation before design turned up two facts that materially change this phase's actual scope from what the roadmap assumed:
+Investigation before design turned up two facts that materially change this phase's actual scope from what the roadmap assumed — plus a correction to the first one, found while re-verifying it during implementation planning:
 
-1. **`http/http1/http_parser.{h,c}` (3,026 lines — vendored joyent `http-parser` v2.9.4) is fully dead code.** The real, currently-used parser is `llhttp` (linked separately as `llhttp::llhttp_static`); every call site for the joyent API in `http/http1/codec.{cc,h}` is commented out, left over from a prior migration to llhttp that was never cleaned up.
+1. **`http/http1/http_parser.{h,c}` (3,026 lines — vendored joyent `http-parser` v2.9.4) is *not* fully dead, though it looks that way from `codec.{cc,h}` alone.** The real, currently-used parser for headers is `llhttp` (linked separately as `llhttp::llhttp_static`); every call site for the joyent API in `http/http1/codec.{cc,h}` is commented out, left over from a prior migration to llhttp that was never cleaned up. But `http/url.cc:10-13`'s `Url::initialize` — called live, uncommented, from `codec.cc:72`'s `onUrlComplete()` on every absolute-form request — calls the vendored parser's `http_parser_url_init`/`http_parser_parse_url` (defined at `http_parser.c:2420,2425`) directly. `http/url.cc`/`url.hh` are explicitly out of Phase 3a's scope (staying C++ until Phase 3c), so `http_parser.{h,c}` cannot be deleted in Phase 3a without breaking `url.cc`'s compile — even though, once Phase 3a deletes `codec.cc`'s call to `Url::initialize`, `url.cc` itself will have zero remaining callers. This phase leaves `http_parser.{h,c}` in place; its deletion is deferred to Phase 3c, alongside `url.cc`/`url.hh` (its one real caller), since that's when both actually become removable together. Confirmed via a repo-wide grep for every symbol `http_parser.h` declares — `url.cc` is the only non-commented, non-`http_parser.c`-internal consumer.
 2. **Body content is not consumed by anything in production today.** `Header` (`http/codec.h`) — what microsegmentation actually matches L7 policy against — has only `method_`/`path_`/`host_`, no body. The generic filter chain that used to consume parsed body bytes (`HttpFilterManager::decodeBody`) is the same one the WAF-removal branch found to be unreachable in production (its only real filter, `LogFilter`, has zero remaining production callers — see `docs/superpowers/specs/2026-08-06-waf-removal-design.md`'s aftermath). Body *framing* (locating where one request ends and the next begins, via `Content-Length` or chunked `Transfer-Encoding`) is still required for correct pipelined-request parsing, even though the bytes themselves go nowhere.
 
 Both facts were confirmed by reading the actual current code, not assumed from the roadmap's row description — the same discipline applied throughout the WAF-removal work.
@@ -15,7 +15,8 @@ Both facts were confirmed by reading the actual current code, not assumed from t
 
 - Migrate `http/http1/codec.{h,cc}` (268 lines — the actually-used llhttp-based parser) to a new Rust crate using `httparse` for header parsing plus a small hand-rolled body-framing state machine.
 - **Framing only — no body content exposed.** Content-Length is counted down; chunked `Transfer-Encoding` is skipped chunk-by-chunk to its terminator; neither is stored or handed back to the caller. This matches actual current need exactly, since nothing downstream consumes body bytes today. If a filter needing bodies is reconnected later, that's a scope addition for whichever future work reconnects the filter chain — not built speculatively here.
-- Delete the dead vendored `http/http1/http_parser.{h,c}` (3,026 lines) as part of this same phase.
+- **Reimplement absolute-form request-target parsing natively in the new Rust crate** (scheme/host/path splitting for request lines like `POST https://host:port/path ...`), rather than calling back into C++'s `Url::initialize`. This is required regardless of the `http_parser.{h,c}` correction above — the new Rust codec has no reason to reach back into C++ for a ~20-line URL-splitting operation it can do natively, and doing so would leave a strange reverse-FFI dependency for no benefit.
+- `http/http1/http_parser.{h,c}` is explicitly **not** touched by this phase — see the Overview correction. It is left in place for Phase 3c to delete alongside `url.cc`/`url.hh`.
 - Expose the new parser to C++ via `cxx`, following the same shape already established by `net_flow_engine`/`net_policy_engine`: an opaque Rust struct (`Http1Parser`), one instance per connection, with a `dispatch(&mut self, data: &[u8]) -> ParsedHeader`-shaped method returning owned `method`/`path`/`host` strings and a parse-state enum — no raw or borrowed data crossing the FFI boundary.
 - Preserve, exactly:
   - What's currently observable through `Header` (`method_`/`path_`/`host_`/`parseState_`).
@@ -31,6 +32,7 @@ Both facts were confirmed by reading the actual current code, not assumed from t
 - Removing `llhttp`/`nghttp2`/`fmt` from the C++ link line — doesn't happen until Phase 3c, since `http/http_inspector.cc` also calls real `llhttp` (for HTTP/1-vs-2 protocol sniffing via the h2 connection-preface check) independently of `http/http1/codec.cc`.
 - Fixing the "last-message-wins-within-one-call" pipelining limitation — preserved as-is (see Goals).
 - Exposing body content — explicitly out of scope per the framing-only decision above.
+- **Deleting `http/http1/http_parser.{h,c}`** — explicitly deferred to Phase 3c, per the Overview correction. It stays in the tree and in `CMakeLists.txt`'s `SOURCES`, compiled but (after this phase lands) uncalled by anything, until Phase 3c deletes it alongside `url.cc`/`url.hh`.
 
 ## Architecture
 
@@ -41,8 +43,9 @@ Both facts were confirmed by reading the actual current code, not assumed from t
   - `Transfer-Encoding: chunked` → skip chunk-size-prefixed segments until the zero-length terminator chunk and trailing CRLF (discarded, not stored).
   - Neither → request has no body.
   - Once framing completes, state resets for the next pipelined request on the same connection, mirroring today's `on_message_begin`-triggered `resetState()`.
+- **Absolute-form request-target parsing** happens natively in the new Rust crate: a small scheme/host/path splitter for request lines like `POST https://host:port/path ...`, distinct from origin-form (`POST /path ...`). Not a port of C++'s `Url::initialize` — a fresh, self-contained implementation, since the new crate has no reason to call back into C++ for this.
 - **C++ integration:** `http/connection.cc`'s `createCodec` constructs the new type (via a thin C++ adapter implementing `Codec`'s virtual interface — `dispatch`, `addFilter`, `setFilterManager`) directly in place of `http1::ConnectionImpl` — no toggle, per Goals. This mirrors the pattern `net::ConnectionManager` already uses for its own Rust-backed internals.
-- **Dead code removal:** `http/http1/http_parser.{h,c}` deleted; `CMakeLists.txt`'s `net-rule`/`net_rule_grpc_test`/`net_rule_test` `SOURCES` updated to drop it.
+- **`CMakeLists.txt` changes are additive only** for this phase: add the new `http1_codec` crate's `corrosion_add_cxxbridge` block and link it into all three targets (`net-rule`, `net_rule_test`, `net_rule_grpc_test`); drop `http/http1/codec.cc` from all three targets' `SOURCES` (replaced by the Rust crate + its thin adapter). `http/http1/http_parser.c` stays in `SOURCES` unchanged — see Non-Goals.
 
 ## Testing & Rollout
 
@@ -52,6 +55,6 @@ Both facts were confirmed by reading the actual current code, not assumed from t
 ## Final State
 
 - `http/http1/codec.{h,cc}` deleted; replaced by a thin C++ adapter over a new `crates/http1_codec` Rust crate, reachable via `cxx`.
-- `http/http1/http_parser.{h,c}` deleted (dead vendored code).
+- `http/http1/http_parser.{h,c}` **still present**, still compiled, now genuinely uncalled by anything (its one live caller, `url.cc`, is itself uncalled once `codec.cc` is gone — but `url.cc` isn't deleted yet). Left for Phase 3c.
 - `http/connection.cc`'s `createCodec` constructs the Rust-backed adapter unconditionally — no toggle ever existed to remove.
 - No change yet to `llhttp`/`nghttp2`/`fmt` link-line presence — that's Phase 3c.
