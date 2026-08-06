@@ -223,7 +223,17 @@ target_include_directories(net-rule PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/ ${CMAKE_
 target_link_libraries(net-rule
   libnfnetlink
   libnetfilter_queue
+  # net_conntrack (Rust) calls libnetfilter_conntrack's C API directly, and
+  # corrosion emits libnet_conntrack.a at the very end of the link line, after
+  # every entry this list can place. Plain archive semantics -- an archive only
+  # satisfies references the linker has already seen to its left -- would
+  # therefore leave those nfct_* references undefined. --whole-archive pulls the
+  # archive's members in unconditionally, which is order-independent. Before
+  # Phase 6c every nfct_* reference came from net-policy.cpp.o, ahead of all
+  # archives, so plain ordering happened to be enough.
+  -Wl,--whole-archive
   libnetfilter_conntrack
+  -Wl,--no-whole-archive
   libnghttp2.a
   libpcre2-8.a
   libpcre2-posix.a
@@ -333,7 +343,17 @@ target_include_directories(net_rule_grpc_test PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
 target_link_libraries(net_rule_grpc_test
   libnfnetlink
   libnetfilter_queue
+  # net_conntrack (Rust) calls libnetfilter_conntrack's C API directly, and
+  # corrosion emits libnet_conntrack.a at the very end of the link line, after
+  # every entry this list can place. Plain archive semantics -- an archive only
+  # satisfies references the linker has already seen to its left -- would
+  # therefore leave those nfct_* references undefined. --whole-archive pulls the
+  # archive's members in unconditionally, which is order-independent. Before
+  # Phase 6c every nfct_* reference came from net-policy.cpp.o, ahead of all
+  # archives, so plain ordering happened to be enough.
+  -Wl,--whole-archive
   libnetfilter_conntrack
+  -Wl,--no-whole-archive
   libnghttp2.a
   libpcre2-8.a
   libpcre2-posix.a

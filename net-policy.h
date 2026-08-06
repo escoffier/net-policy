@@ -13,7 +13,7 @@
 #include "vector"
 #include "cjson.h"
 #include "libmnl/libmnl.h"
-#include "libnetfilter_conntrack/libnetfilter_conntrack.h"
+#include "net_conntrack_cxxbridge/lib.h"
 #include "glog/logging.h"
 #include "http/packet.hh"
 #include "log.h"
@@ -46,7 +46,6 @@ inline constexpr int              kNfMatchRule    = 6;
 #define NF_MAX_VERDICT NF_STOP
 */
 
-typedef struct nf_conntrack NF_CONNTRACK;
 /*epoll call function*/
 using RcvCbFunc = int32_t(*)(int32_t epoll_fd, int32_t fd, void* ptr);
 /*daemon entrypoint; defined in net-policy.cpp, called from main.cpp*/
@@ -122,11 +121,10 @@ public:
     std::optional<rust::Box<net_nfq::NfqQueue>> output_queue_;
     RcvEpollCb*          input_cb_   = nullptr;
     RcvEpollCb*          output_cb_  = nullptr;
-    // nf conntrack
-    NF_CONNTRACK*        nfct_       = nullptr;
-    NF_CONNTRACK*        nfct_cb_    = nullptr;
-    struct nfct_handle*  nfct_hd_    = nullptr;
-    struct nfct_handle*  nfct_cb_hd_ = nullptr;
+    // nf conntrack. Fallible to construct and freed explicitly by FreeResource
+    // before this object's own destruction -- same std::optional<rust::Box<T>>
+    // reasoning as input_queue_/output_queue_ above.
+    std::optional<rust::Box<net_conntrack::ConntrackSession>> conntrack_;
     uint64_t pod_id_;
     DaemonContext*       daemon_     = nullptr; // non-owning; set once in InitNfqueue
 

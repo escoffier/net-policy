@@ -370,91 +370,10 @@ static NET_POLICY_RULE MatchMicroPolicyRule(FiveTuple& tuple, FLOW_DIR& dir,
   return revDetail->action_;
 }
 
-/*update session callback*/
-static int UpdateNetSession(NFC_MSG_TYPE type, NF_CONNTRACK* ct, void* data) {
-  int ret;
-  uint32_t mark;
-  struct nfct_handle* ith = NULL;
-  NFQ_RES_INFO* nfq_res = (NFQ_RES_INFO*)data;
-  NF_CONNTRACK *obj, *tmp = NULL;
-  /*check argument*/
-  if (!ct || !data)
-    return NFCT_CB_CONTINUE;
-  //
-  obj = nfq_res->nfct_;
-  /*compare nfct*/
-  if (!nfct_cmp(obj, ct, NFCT_CMP_ORIG))
-    return NFCT_CB_CONTINUE;
-  /*get mark*/
-  mark = nfct_get_attr_u32(obj, ATTR_MARK);
-  if (mark > 100)
-    return NFCT_CB_CONTINUE;
-  /*new nfct*/
-  tmp = nfq_res->nfct_cb_;
-  if (!tmp)
-    RETURN_ERROR(NFCT_CB_CONTINUE, "new nfct failed.");
-  /*open nfct*/
-  ith = nfq_res->nfct_cb_hd_;
-  if (!ith)
-    RETURN_ERROR(NFCT_CB_CONTINUE, "open nfct failed.");
-  /*copy info*/
-  nfct_copy(tmp, ct, NFCT_CP_ORIG);
-  // nfct_copy(tmp, obj, NFCT_CP_META);
-  /*set mark*/
-  nfct_set_attr_u32(tmp, ATTR_MARK, mark);
-  /* do not send NFCT_Q_UPDATE if ct appears unchanged */
-  if (nfct_cmp(tmp, ct, NFCT_CMP_ALL | NFCT_CMP_MASK))
-    return NFCT_CB_CONTINUE;
-  /*query*/
-  ret = nfct_query(ith, NFCT_Q_UPDATE, tmp);
-  if (ret < 0)
-    LOG_E("Operation failed: update mark failed.")
-  /*return*/
-  return NFCT_CB_CONTINUE;
-}
-
-/*set mark to accept*/
-static int SetAcceptMark(NFQ_RES_INFO* nfq_res, FiveTuple& tuple, NFC_MSG_TYPE msgtype,
-                         int markValue) {
-  int ret, family = AF_INET;
-  NF_CONNTRACK* ct = NULL;
-  struct nfct_handle* cth = NULL;
-  if (!nfq_res)
-    RETURN_ERROR(-1, "nfct resource is nil.");
-  /*new nfct*/
-  ct = nfq_res->nfct_;
-  if (!ct)
-    RETURN_ERROR(-1, "nfct is null.");
-  /*open nfct*/
-  cth = nfq_res->nfct_hd_;
-  if (!cth)
-    RETURN_ERROR(-1, "nfct handle is nil.");
-  /*set mark*/
-  nfct_set_attr_u32(ct, ATTR_MARK, markValue);
-  /*L3 proto*/
-  nfct_set_attr_u8(ct, ATTR_ORIG_L3PROTO, family);
-  /*set protocol*/
-  if (tuple.proto_ > 0)
-    nfct_set_attr_u8(ct, ATTR_L4PROTO, tuple.proto_);
-  // ip
-  if (tuple.src_addr_.length() > 0)
-    nfct_set_attr_u32(ct, ATTR_ORIG_IPV4_SRC, inet_addr(tuple.src_addr_.c_str()));
-  if (tuple.dst_addr_.length() > 0)
-    nfct_set_attr_u32(ct, ATTR_ORIG_IPV4_DST, inet_addr(tuple.dst_addr_.c_str()));
-  // port
-  if (tuple.src_port_ > 0)
-    nfct_set_attr_u16(ct, ATTR_ORIG_PORT_SRC, htons(tuple.src_port_));
-  if (tuple.dst_port_ > 0)
-    nfct_set_attr_u16(ct, ATTR_ORIG_PORT_DST, htons(tuple.dst_port_));
-  // register
-  // nfct_callback_register(cth, msgtype, UpdateNetSession, nfq_res);
-  /*query*/
-  ret = nfct_query(cth, NFCT_Q_DUMP, &family);
-  if (ret != 0)
-    RETURN_ERROR(ret, "nfct query failed.");
-  /*return*/
-  return 0;
-}
+// UpdateNetSession and SetAcceptMark were deleted here: net_conntrack's
+// update_net_session (the callback registered once at session-open time) and
+// ConntrackSession::set_accept_mark (Rust) are now the sole implementations of
+// this logic, reached from UpdateMark via the cxx bridge.
 
 // parse_package was deleted here: net_flow_engine's parse_five_tuple (Rust,
 // reached via net::ConnectionManager::receive) is now the single five-tuple
@@ -1082,33 +1001,11 @@ static void output_nfq_cb(NFQ_RES_INFO* nfq_res, net_nfq::NfqQueue& queue, net_n
   return;
 }
 
-int OpenConntrack(NFQ_RES_INFO* nfq_res) {
-  FiveTuple tuple = {};
-  // nf conntrack
-  nfq_res->nfct_ = nfct_new();
-  if (!nfq_res->nfct_)
-    GOTO_ERROR(err, "new nf conntrack failed");
-  nfq_res->nfct_hd_ = nfct_open();
-  if (!nfq_res->nfct_hd_)
-    GOTO_ERROR(err, "open nf conntrack failed");
-  // nf conntrack callback
-  nfq_res->nfct_cb_ = nfct_new();
-  if (!nfq_res->nfct_cb_)
-    GOTO_ERROR(err, "new nf conntrack cb failed");
-  nfq_res->nfct_cb_hd_ = nfct_open();
-  if (!nfq_res->nfct_cb_hd_)
-    GOTO_ERROR(err, "open nf conntrack cb failed");
-  // register
-  nfct_callback_register(nfq_res->nfct_hd_, NFCT_T_ALL, UpdateNetSession, nfq_res);
-  /*return*/
-  return 0;
-err:
-  if (nfq_res->nfct_)      nfct_destroy(nfq_res->nfct_);
-  if (nfq_res->nfct_cb_)   nfct_destroy(nfq_res->nfct_cb_);
-  if (nfq_res->nfct_hd_)   nfct_close(nfq_res->nfct_hd_);
-  if (nfq_res->nfct_cb_hd_) nfct_close(nfq_res->nfct_cb_hd_);
-  return -1;
-}
+// OpenConntrack was deleted here: net_conntrack::open_conntrack_session (Rust)
+// performs the same four allocations in the same order, registers the same
+// NFCT_T_ALL callback on the query handle, and reproduces the same
+// cleanup-everything-allocated-so-far-then-fail path. Its call site in
+// InitNfqueue constructs the session directly.
 
 int OpenNfque(FLOW_DIR quenum, NFQ_RES_INFO* nfq_res) {
   try {
@@ -1232,9 +1129,15 @@ int InitNfqueue(int epoll_fd, NET_CTRL_INFO& ctrl, DaemonContext& daemon) {
   if (ret != 0)
     GOTO_ERROR(err, "init output queue resource failed, pid : %d.", ctrl.pid_);
   /*init conntrack*/
-  ret = OpenConntrack(nfq_res.get());
-  if (ret != 0)
+  try {
+    nfq_res->conntrack_.emplace(net_conntrack::open_conntrack_session());
+  } catch (const std::exception& e) {
+    // Two log lines on failure, matching the pre-port shape: OpenConntrack
+    // logged the specific allocation that failed (now carried in e.what()),
+    // then this call site logged the generic "init conntrack resource failed".
+    LOG_E("open conntrack session failed, pid : %d, err : %s.", ctrl.pid_, e.what());
     GOTO_ERROR(err, "init conntrack resource failed, pid : %d.", ctrl.pid_);
+  }
   /*add epoll event*/
   ret = AddEpollEvent(epoll_fd, nfq_res.get());
   if (ret != 0)
@@ -1279,17 +1182,32 @@ int AddNewPolicy(RuleDetail& policy, RULE_PORT& stPort, DaemonContext& daemon) {
 
 /*update iptable rule*/
 void UpdateMark(std::unordered_map<uint64_t, string>& cgRes, DaemonContext& daemon) {
-  int mark = static_cast<int>(NetPolicyRule::kDeny);
-  FiveTuple tuple = {};
+  uint32_t mark = static_cast<uint32_t>(NetPolicyRule::kDeny);
+  // Value-initializes to proto=0, src_addr="", dst_addr="", src_port=0,
+  // dst_port=0 -- the same all-empty shape `FiveTuple tuple = {};` produced, so
+  // set_accept_mark skips every optional filter attribute exactly as
+  // SetAcceptMark did for this call site.
+  net_conntrack::SharedFiveTuple tuple{};
 
   for (auto it = cgRes.begin(); it != cgRes.end(); it++) {
     auto res = daemon.Microseg().GetNfqRes(it->first);
     if (res == nullptr)
       CONTINUE_ERROR("can not find pod resource, pod id : %lu.", it->first);
-    // set mark
-    SetAcceptMark(res, tuple, NFCT_T_ALL, mark);
+    // set mark. SetAcceptMark's return value was deliberately ignored here and
+    // each of its own failure paths only logged before returning, so a failure
+    // must neither abort this loop nor skip the LOG_D below -- either would be
+    // an observable change to this RPC's behavior.
+    if (!res->conntrack_.has_value()) {
+      LOG_E("nfct resource is nil, pod id : %lu.", it->first);
+    } else {
+      try {
+        (*res->conntrack_)->set_accept_mark(tuple, mark);
+      } catch (const std::exception& e) {
+        LOG_E("nfct query failed, pod id : %lu, err : %s.", it->first, e.what());
+      }
+    }
     //
-    LOG_D("update mark, mark : %d, address : %s.", mark, it->second.c_str());
+    LOG_D("update mark, mark : %u, address : %s.", mark, it->second.c_str());
   }
 }
 
