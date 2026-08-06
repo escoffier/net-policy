@@ -48,18 +48,12 @@ corrosion_add_cxxbridge(ffi_smoke_cxxbridge
   FILES lib.rs
 )
 
-corrosion_add_cxxbridge(waf_rules_core_cxxbridge
-  CRATE waf_rules_core
-  FILES lib.rs
-)
-
 corrosion_add_cxxbridge(net_policy_control_cxxbridge
   CRATE net_policy_control
   FILES lib.rs
 )
 # lib.rs's cxx bridge does `include!("grpc/control_dispatch.h")`, resolved
-# relative to the repo root -- unlike waf_rules_core_cxxbridge, which has no
-# C++ #include of its own and so never needed this.
+# relative to the repo root.
 target_include_directories(net_policy_control_cxxbridge PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
 corrosion_add_cxxbridge(net_policy_events_cxxbridge
@@ -113,8 +107,6 @@ set(SOURCES
     main.cpp
     net-policy.cpp
     rule-detail.cpp
-    waf/plugin.cc
-    waf/rule.cc
     grpc/control_dispatch.cc
 )
 
@@ -161,8 +153,8 @@ foreach(proto_file ${NET_POLICY_PROTO_FILES})
 endforeach()
 
 # proto/net_policy_events.proto is kept out of NET_POLICY_PROTO_FILES/SOURCES above:
-# no C++ in net-rule references its generated types anymore (net-policy.cpp and
-# waf/plugin.cc only include net_policy_events_cxxbridge/lib.h, which carries no
+# no C++ in net-rule references its generated types anymore (net-policy.cpp only
+# includes net_policy_events_cxxbridge/lib.h, which carries no
 # proto-generated C++ types across the FFI boundary -- the Rust net_policy_events
 # crate is the actual EventService server now). The only remaining C++ consumer of
 # this proto's generated code is tests/grpc_rust_events_e2e_test.cc, which needs the
@@ -235,8 +227,6 @@ target_link_libraries(net-rule
   libnetfilter_conntrack
   -Wl,--no-whole-archive
   libnghttp2.a
-  libpcre2-8.a
-  libpcre2-posix.a
   fmt::fmt-header-only
   llhttp::llhttp_static
   glog.a
@@ -248,7 +238,6 @@ target_link_libraries(net-rule
   libtcmalloc_and_profiler.a
   gRPC::grpc++
   protobuf::libprotobuf
-  waf_rules_core_cxxbridge
   net_policy_control_cxxbridge
   net_policy_events_cxxbridge
   net_flow_engine_cxxbridge
@@ -257,9 +246,9 @@ target_link_libraries(net-rule
   net_nfq_cxxbridge
   net_conntrack_cxxbridge
 )
-# waf_rules_core_cxxbridge, net_policy_control_cxxbridge, net_policy_events_cxxbridge,
-# net_flow_engine_cxxbridge, net_policy_engine_cxxbridge, net_iptables_cxxbridge, net_nfq_cxxbridge,
-# and net_conntrack_cxxbridge are separate Rust staticlib crates that all depend on the `cxx` crate; since each
+# net_policy_control_cxxbridge, net_policy_events_cxxbridge, net_flow_engine_cxxbridge,
+# net_policy_engine_cxxbridge, net_iptables_cxxbridge, net_nfq_cxxbridge, and
+# net_conntrack_cxxbridge are separate Rust staticlib crates that all depend on the `cxx` crate; since each
 # staticlib statically embeds its own copy of cxx's internal runtime shim symbols
 # (e.g. cxxbridge1$rust_vec$bool$...), linking multiple such crates into the same
 # binary trips the linker's ODR check even though the duplicated bodies are
@@ -281,13 +270,11 @@ set_target_properties(net-rule PROPERTIES LINK_FLAGS "-Wl,--allow-multiple-defin
 # unwind 
 # tcmalloc) 
 
-target_link_libraries(net_rule_test 
-libnfnetlink 
-libnetfilter_queue 
-libnetfilter_conntrack 
-libnghttp2.a 
-libpcre2-8.a 
-libpcre2-posix.a 
+target_link_libraries(net_rule_test
+libnfnetlink
+libnetfilter_queue
+libnetfilter_conntrack
+libnghttp2.a
 fmt::fmt-header-only
 llhttp::llhttp_static 
 glog.a 
@@ -304,8 +291,8 @@ gtest_discover_tests(net_rule_test)
 
 # --- gRPC control-plane tests ---
 # Kept separate from net_rule_test (which deliberately excludes NFQUEUE/iptables/policy-engine
-# code) since these tests link net-policy.cpp/rule-detail.cpp/waf/* to exercise real
-# g_microseg/WAF state through the new gRPC control service. Safe to link GTest::gtest_main
+# code) since these tests link net-policy.cpp/rule-detail.cpp to exercise real
+# g_microseg state through the new gRPC control service. Safe to link GTest::gtest_main
 # alongside net-policy.cpp now that net-policy.cpp no longer defines main() (see main.cpp).
 add_executable(net_rule_grpc_test
     net/utility.cc
@@ -325,14 +312,11 @@ add_executable(net_rule_grpc_test
     admin/profile.cc
     net-policy.cpp
     rule-detail.cpp
-    waf/plugin.cc
-    waf/rule.cc
     grpc/control_dispatch.cc
     ${NET_POLICY_PROTO_GENERATED_SRCS}
     ${NET_POLICY_EVENTS_PROTO_GENERATED_SRCS}
     tests/grpc_rust_control_e2e_test.cc
     tests/grpc_rust_events_e2e_test.cc
-    tests/waf_rules_test.cc
     tests/net_flow_engine_ffi_test.cc
     tests/net_policy_engine_ffi_test.cc
     tests/net_iptables_ffi_test.cc
@@ -355,8 +339,6 @@ target_link_libraries(net_rule_grpc_test
   libnetfilter_conntrack
   -Wl,--no-whole-archive
   libnghttp2.a
-  libpcre2-8.a
-  libpcre2-posix.a
   fmt::fmt-header-only
   llhttp::llhttp_static
   glog.a
@@ -368,7 +350,6 @@ target_link_libraries(net_rule_grpc_test
   libtcmalloc_and_profiler.a
   gRPC::grpc++
   protobuf::libprotobuf
-  waf_rules_core_cxxbridge
   net_policy_control_cxxbridge
   net_policy_events_cxxbridge
   net_flow_engine_cxxbridge
@@ -377,7 +358,7 @@ target_link_libraries(net_rule_grpc_test
   net_nfq_cxxbridge
   net_conntrack_cxxbridge
   GTest::gtest_main)
-# See the matching comment on net-rule's LINK_FLAGS above (applies to waf_rules_core_cxxbridge,
+# See the matching comment on net-rule's LINK_FLAGS above (applies to
 # net_policy_control_cxxbridge, net_policy_events_cxxbridge, net_flow_engine_cxxbridge,
 # net_policy_engine_cxxbridge, net_iptables_cxxbridge, net_nfq_cxxbridge, and net_conntrack_cxxbridge).
 set_target_properties(net_rule_grpc_test PROPERTIES LINK_FLAGS "-Wl,--allow-multiple-definition")
