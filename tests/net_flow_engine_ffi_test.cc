@@ -146,7 +146,7 @@ std::vector<uint8_t> FinPacket() {
 // packet, not just TCP), while `decision` stays untouched -- on_packet is
 // only ever invoked for TCP packets (see ReceiveResult::receive's doc
 // comment), so a UDP packet must never reach it, tracking or not.
-TEST(ConnectionManagerCutoverTest, ReceiveReturnsFiveTupleForUdpWithoutWafDispatch) {
+TEST(ConnectionManagerCutoverTest, ReceiveReturnsFiveTupleForUdpWithoutTcpDispatch) {
   http::HttpFilterFactory filter_factory;
   net::ConnectionManager manager(filter_factory);
 
@@ -187,8 +187,8 @@ TEST(ConnectionManagerCutoverTest, TcpPacketWithTrackingOffDoesNotEnterTcbTable)
 
   // The five-tuple parse and the is_tcp classification are deliberately NOT
   // gated on track_tcp -- L3-L4 policy matching and net-policy.cpp's downstream
-  // microsegmentation TCP-tracking block need both on every packet, whatever
-  // the WAF's state.
+  // microsegmentation TCP-tracking block need both on every packet, regardless
+  // of whether tracking is enabled for it.
   EXPECT_TRUE(result.tuple.recognized);
   EXPECT_TRUE(result.is_tcp);
   EXPECT_EQ(result.tuple.proto, 6);

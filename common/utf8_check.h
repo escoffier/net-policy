@@ -13,8 +13,8 @@
 // from such data must check this first and fail closed (skip/no-match)
 // rather than let the exception escape uncaught and crash the daemon via
 // std::terminate. Kept at global scope (not inside a namespace) so
-// existing bare-name call sites (waf/rule.cc) don't need to change when
-// this moves out of its old anonymous namespace.
+// existing bare-name call sites (e.g. rule-detail.cpp) don't need to change
+// when this moves out of its old anonymous namespace.
 inline bool IsValidUtf8(const std::string& s) {
     try {
         (void)rust::Str(s);

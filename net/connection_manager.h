@@ -135,10 +135,9 @@ public:
   // insert` does nothing when the key exists, so a repeat SYN never reset a
   // live entry's parser state).
   //
-  // Deliberately inserts ONLY `conn_id`, never `peer_conn_id`, unlike
-  // http_conns_ (WAF), where both directions legitimately share one
-  // HttpFilterManager. Microsegmentation's rule keys are direction-specific:
-  // the ingress direction's key is looked up in InputHttpPolicy() and the
+  // Deliberately inserts ONLY `conn_id`, never `peer_conn_id`.
+  // Microsegmentation's rule keys are direction-specific: the ingress
+  // direction's key is looked up in InputHttpPolicy() and the
   // egress direction's in OutputHttpPolicy(), and the old code kept two
   // separate direction-keyed maps for exactly that reason. Seeding the peer
   // here with this direction's key would hand output_nfq_cb an ingress key to
@@ -396,7 +395,8 @@ private:
   }
 
   // No longer read anywhere: its only consumer, HandleNewConnection, was
-  // deleted with the rest of the WAF dispatch path (see this task's commit).
+  // deleted with the rest of the WAF dispatch path (see
+  // docs/superpowers/specs/2026-08-06-waf-removal-design.md).
   // Kept as a stored member -- rather than dropped along with the
   // constructor parameter -- because the constructor's public signature is
   // relied on by DaemonContext (net-policy.h, out of scope for this task)

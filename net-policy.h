@@ -289,7 +289,7 @@ private:
 };
 
 /*single aggregate owner of everything that used to be a free-standing global
- *in net-policy.cpp/waf/plugin.cc. One instance is constructed on the stack of
+ *in net-policy.cpp. One instance is constructed on the stack of
  *RunNetPolicyDaemon and threaded through every epoll callback via
  *RcvEpollCb::daemon_ / NFQ_RES_INFO::daemon_. Not copyable — there is
  *exactly one instance for the life of the process (or of a test).*/

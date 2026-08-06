@@ -32,14 +32,10 @@ mod ffi {
         peer_is_new: bool,
         /// Byte length of the IPv4 header alone -- separate from
         /// `payload_offset` (IP + TCP header combined). Only meaningful when
-        /// `kind == Data` (kind 3). C++'s HandleData (net/connection_manager.h)
-        /// MUST trim the packet by exactly this amount before calling
-        /// `setTCPSegment`, and by `payload_offset - ip_header_len` after --
-        /// matching `setTCPSegment`'s contract that its input packet already
-        /// starts at the TCP header (see waf/plugin.cc's ModifyNetPackets,
-        /// which casts the stored pointer directly to `struct tcphdr*`).
-        /// Trimming by the combined `payload_offset` before `setTCPSegment`,
-        /// or not trimming at all before it, corrupts live packets.
+        /// `kind == Data` (kind 3). Today's consumer is microsegmentation's
+        /// DispatchMicroseg (net/connection_manager.h), which uses
+        /// `payload_offset` for its own single-trim `std::string_view`
+        /// construction over the packet's HTTP payload.
         ip_header_len: u32,
         payload_offset: u32,
         /// Whether this packet has the TCP SYN flag set. Populated for every

@@ -43,7 +43,7 @@ private:
 // by pointer, pushes it onto `queue`, blocks until the epoll thread
 // (DispatchGrpcRustQueueEvent, net-policy.cpp) has run it, and returns the
 // typed result. Implemented in net-policy.cpp, where DaemonContext's full
-// definition and the legacy policy/WAF functions are already visible.
+// definition and the legacy policy functions are already visible.
 int32_t GrpcDispatchResetConfig(DaemonContext* daemon, GrpcDispatchQueue* queue);
 
 int32_t GrpcDispatchPodUp(DaemonContext* daemon, GrpcDispatchQueue* queue, int32_t epoll_fd,

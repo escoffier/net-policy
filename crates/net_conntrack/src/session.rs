@@ -243,7 +243,7 @@ extern "C" fn update_net_session(
         if ret < 0 {
             // Stands in for the original's LOG_E; matches the pattern the
             // other Rust crates here use, since Rust cannot reach the C++
-            // LOG_* macros (see net_nfq, waf_rules_core, net_policy_events).
+            // LOG_* macros (see net_nfq, net_policy_events).
             eprintln!("net_conntrack: Operation failed: update mark failed.");
         }
     }

@@ -1902,6 +1902,21 @@ int RunNetPolicyDaemon(int argc, char* argv[]) {
   google::ParseCommandLineFlags(&argc, &argv, true);
   FLAGS_logtostderr = true;
 
+  // Nothing in production traverses this factory anymore. WAF removal
+  // deleted ConnectionManager::HandleNewConnection, which was the only
+  // production caller of HttpFilterManager's 4-arg constructor
+  // (http/filter.cc) -- the only constructor that ever calls
+  // HttpFilterFactory::traverse() to build real filter instances from what
+  // registerFilter() adds here. Microsegmentation's http::Connection(std::
+  // string key) builds a bare default HttpFilterManager() (zero filters) by
+  // original design, and was never meant to drive this chain. So LogFilter
+  // below (and any future filter registered here) is inert/unreachable in
+  // production until something reconnects this factory to a real
+  // per-connection instantiation point. Severity today is nil -- LogFilter
+  // (http/extension/log.cc) only does VLOG(4) diagnostic logging with zero
+  // effect on policy verdicts -- but a future filter registered here would
+  // silently do nothing too. See
+  // docs/superpowers/specs/2026-08-06-waf-removal-design.md for more.
   daemon.HttpFilters().registerFilter(
       [](size_t id, uint32_t from, uint32_t to) -> std::shared_ptr<http::HttpFilterBase> {
         return std::make_shared<http::extension::LogFilter>(id, from, to);

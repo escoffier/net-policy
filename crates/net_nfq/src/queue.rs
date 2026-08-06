@@ -130,7 +130,8 @@ fn drain_batch<M>(
     // matters in the release build the daemon actually ships, where a
     // debug_assert compiles away to nothing, and eprintln! matches this
     // workspace's existing convention for FFI-side diagnostics that can't
-    // reach the C++ LOG_* macros (see waf_rules_core, net_policy_events).
+    // reach the C++ LOG_* macros (see net_conntrack, net_policy_control,
+    // net_policy_events).
     if !pending.is_empty() {
         eprintln!(
             "net_nfq: recv_batch found {} stale pending message(s) from an earlier failed \
