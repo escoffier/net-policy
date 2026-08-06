@@ -61,6 +61,17 @@ established in Phase 0 before any behavior moves.
 | **6. NFQ/netlink core** | `net-policy.cpp`/`.h` main loop, `NFQ_RES_INFO`, epoll wiring, `admin/profile.cc` (netns), vendored `libmnl`/`libnetfilter_queue`/`libnetfilter_conntrack`/`libnfnetlink` | Rust using pure-Rust netlink crates (e.g. `neli`, `nfq`) | Replaces the vendored C netlink libs entirely. Highest risk and effort; done last, after everything that calls into it already speaks Rust. |
 | **7. Decommission** | — | — | Remove the C++ build target, `cxx` bridge, legacy Makefile, and all remaining C/C++ dependencies (`cjson`, llhttp, nghttp2, pcre2, libmnl family, `gflags`, `fmt`, gperftools/`libunwind`, `glog`). Rust-only build going forward. |
 
+> **Update (2026-08-06):** Phase 1 above ("WAF rule/regex engine") and the
+> WAF-adjacent portions of Phase 2 and Phase 7 did not happen as written.
+> Instead, the entire WAF feature (`waf/plugin.{h,cc}`, `waf/rule.{h,cc}`,
+> the `waf_rules_core` Rust crate, the `AddWafRule`/`DeleteWafRule`/
+> `WafAttackEvent` control-plane surface, and the `POLICY_WAF_ENABLE`
+> runtime toggle) was deleted outright rather than migrated to Rust — a
+> deliberate scope decision made independently of this roadmap. See
+> `docs/superpowers/specs/2026-08-06-waf-removal-design.md` for the full
+> rationale. No other phase in this roadmap depended on WAF's Rust target,
+> so this does not affect the rest of the plan.
+
 ## Validation Strategy (per phase)
 
 Each phase follows the same gate before its Rust component takes over from

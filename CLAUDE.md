@@ -42,11 +42,11 @@ Note the single leading dash before the first suite name, with the rest
 colon-separated — a double-dash form is invalid gtest syntax and silently
 fails to exclude the intended suites.
 
-The build uses C++17, enforces `-Wall -Werror`, and links against llhttp, nghttp2, pcre2, glog, gflags, gperftools, and libunwind. Netlink submodules (libmnl, libnetfilter_queue, libnetfilter_conntrack, libnfnetlink) are vendored under the repo root.
+The build uses C++17, enforces `-Wall -Werror`, and links against llhttp, nghttp2, glog, gflags, gperftools, and libunwind. Netlink submodules (libmnl, libnetfilter_queue, libnetfilter_conntrack, libnfnetlink) are vendored under the repo root.
 
 ## Architecture Overview
 
-This is a **kernel-integrated network policy enforcement daemon** for containerized workloads (Kubernetes-style pods). It intercepts packets via Linux Netfilter (NFQ), applies Layer 3-4 policy rules, and performs Layer 7 HTTP inspection and WAF filtering.
+This is a **kernel-integrated network policy enforcement daemon** for containerized workloads (Kubernetes-style pods). It intercepts packets via Linux Netfilter (NFQ), applies Layer 3-4 policy rules, and performs Layer 7 HTTP inspection for microsegmentation policy.
 
 ### Data Flow
 
@@ -61,7 +61,7 @@ Five-Tuple extraction (src/dst IP, src/dst port, protocol)
     │
     ├──── Network Policy Match (Layer 3-4) ─── allow/deny/mark verdict
     │
-    └──── HTTP Inspection (Layer 7) ──── WAF rule evaluation ─── NF_ACCEPT / NF_DROP
+    └──── HTTP Inspection (Layer 7) ──── microsegmentation policy match ─── NF_ACCEPT / NF_DROP
 ```
 
 ### Key Components
@@ -73,7 +73,6 @@ Five-Tuple extraction (src/dst IP, src/dst port, protocol)
 | **HTTP Layer** | `http/http_inspector.{h,cc}`, `http/filter.{h,cc}`, `http/http_filter_factory.{h,cc}` | Protocol detection, header parsing, per-connection HTTP filter chain |
 | **HTTP/1.1 Codec** | `http/http1/codec.{h,cc}`, `http/http1/http_parser.{h,c}` | llhttp-based HTTP/1.1 parsing |
 | **HTTP/2 Codec** | `http/http2/codec.{hh,cc}` | nghttp2-based HTTP/2 parsing |
-| **WAF System** | `waf/plugin.{h,cc}`, `waf/rule.{h,cc}` | PCRE2 regex pattern matching; `PluginRootContext` owns global rules, `PluginContext` is per-connection |
 | **Network Filters** | `net/connection_manager.h`, `crates/net_flow_engine/` | IPv4/TCP header parsing and TCP connection (TCB) tracking, implemented in Rust and wired into C++ via a `cxx` FFI bridge |
 | **Connection Tracking** | `net/connection_manager.h` | Tracks active TCP/UDP connections |
 | **iptables Management** | `crates/net_iptables/` | iptables rule management, implemented in Rust and wired into C++ via a `cxx` FFI bridge |
@@ -98,9 +97,8 @@ protocol on port 9999 — `NetDataType` enum, `CtrlServer` — was deleted; see
 - **`NetPolicyControl`** (port 50051, served by the Rust `net_policy_control`
   crate, dispatched into C++ via `grpc/control_dispatch.h`): `PodUp` / `PodDown`
   — pod lifecycle events; `AddPolicyRule` / `DeletePolicyRule` — network policy
-  CRUD; `AddWafRule` / `DeleteWafRule` — WAF rule CRUD; `DumpHeapProfile` /
-  `DumpConfig` / `DumpConnections` — debugging; `ResetConfig` /
-  `UpdateNodeConfig` / `SetLogLevel` — runtime config.
+  CRUD; `DumpHeapProfile` / `DumpConfig` / `DumpConnections` — debugging;
+  `ResetConfig` / `UpdateNodeConfig` / `SetLogLevel` — runtime config.
 - **`NetPolicyEvents`** (port 50052, served by the C++ `EventService`):
   `SubscribeEvents` — streams policy-match events to subscribers.
 
