@@ -1,3 +1,5 @@
+mod request_target;
+
 #[cxx::bridge(namespace = "http1_codec")]
 mod ffi {
     extern "Rust" {
