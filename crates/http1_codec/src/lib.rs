@@ -1,3 +1,4 @@
+mod header_parser;
 mod request_target;
 
 #[cxx::bridge(namespace = "http1_codec")]
