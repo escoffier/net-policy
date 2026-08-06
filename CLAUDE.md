@@ -24,11 +24,23 @@ make all
 make clean
 ```
 
-`net_rule_grpc_test` includes `NetIptablesFfiTest`, which shells out to real
-`iptables` commands against the mangle table. Running it (and `cargo test` in
-`crates/net_iptables`) requires elevated container privileges — e.g. `docker
-run/exec --privileged` or `--cap-add=NET_ADMIN` — otherwise those iptables
-integration tests fail for lack of `CAP_NET_ADMIN`.
+`net_rule_grpc_test` includes three privileged-only suites — `NetIptablesFfiTest`
+(shells out to real `iptables` commands against the mangle table),
+`NetNfqFfiTest` (opens real NFQUEUE resources), and `NetConntrackFfiTest`
+(opens real conntrack sessions and exercises a real loopback flow). Running
+these (and the corresponding `cargo test` in `crates/net_iptables`,
+`crates/net_nfq`, `crates/net_conntrack`) requires elevated container
+privileges — e.g. `docker run/exec --privileged` or `--cap-add=NET_ADMIN` —
+otherwise they fail for lack of `CAP_NET_ADMIN`. For routine (non-privileged)
+runs, exclude all three with:
+
+```bash
+./build/net_rule_grpc_test --gtest_filter='-NetIptablesFfiTest.*:NetNfqFfiTest.*:NetConntrackFfiTest.*'
+```
+
+Note the single leading dash before the first suite name, with the rest
+colon-separated — a double-dash form is invalid gtest syntax and silently
+fails to exclude the intended suites.
 
 The build uses C++17, enforces `-Wall -Werror`, and links against llhttp, nghttp2, pcre2, glog, gflags, gperftools, and libunwind. Netlink submodules (libmnl, libnetfilter_queue, libnetfilter_conntrack, libnfnetlink) are vendored under the repo root.
 
@@ -64,6 +76,9 @@ Five-Tuple extraction (src/dst IP, src/dst port, protocol)
 | **WAF System** | `waf/plugin.{h,cc}`, `waf/rule.{h,cc}` | PCRE2 regex pattern matching; `PluginRootContext` owns global rules, `PluginContext` is per-connection |
 | **Network Filters** | `net/connection_manager.h`, `crates/net_flow_engine/` | IPv4/TCP header parsing and TCP connection (TCB) tracking, implemented in Rust and wired into C++ via a `cxx` FFI bridge |
 | **Connection Tracking** | `net/connection_manager.h` | Tracks active TCP/UDP connections |
+| **iptables Management** | `crates/net_iptables/` | iptables rule management, implemented in Rust and wired into C++ via a `cxx` FFI bridge |
+| **NFQ Packet Queues** | `crates/net_nfq/` | NFQUEUE packet-queue mechanics (replacing `libnetfilter_queue`'s direct C API), implemented in Rust and wired into C++ via a `cxx` FFI bridge |
+| **Conntrack Sessions** | `crates/net_conntrack/` | conntrack session lifecycle and mark management (replacing `libnetfilter_conntrack`'s direct C API, which is now consumed only via this crate's hand-written `extern "C"` FFI, not called directly from C++) |
 
 ### Core Data Structures (net-policy.h)
 

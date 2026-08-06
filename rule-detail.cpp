@@ -88,15 +88,10 @@ void NFQ_RES_INFO::Init() {
   this->pid_ = 0;
   this->pod_id_ = 0;
   this->poll_fd_ = 0;
-  // input_queue_/output_queue_ default-construct as disengaged
+  // input_queue_/output_queue_/conntrack_ default-construct as disengaged
   // std::optionals; no explicit reset needed here.
   this->input_cb_ = nullptr;
   this->output_cb_ = nullptr;
-  // nf conntrack
-  this->nfct_ = nullptr;
-  this->nfct_cb_ = nullptr;
-  this->nfct_hd_ = nullptr;
-  this->nfct_cb_hd_ = nullptr;
 }
 
 /*释放资源*/
@@ -121,14 +116,10 @@ void NFQ_RES_INFO::FreeResource(int efd) {
     delete this->input_cb_;
   if (this->output_cb_)
     delete this->output_cb_;
-  if (this->nfct_)
-    nfct_destroy(this->nfct_);
-  if (this->nfct_cb_)
-    nfct_destroy(this->nfct_cb_);
-  if (this->nfct_hd_)
-    nfct_close(this->nfct_hd_);
-  if (this->nfct_cb_hd_)
-    nfct_close(this->nfct_cb_hd_);
+  // Drops the Rust ConntrackSession, whose Drop destroys/closes the same four
+  // conntrack objects (filter, update, query handle, update handle) this block
+  // used to destroy/close by hand, in the same order.
+  this->conntrack_.reset();
   /*print debug log*/
   LOG_I("free nfqueue resource, pid : %d", this->pid_);
 }
