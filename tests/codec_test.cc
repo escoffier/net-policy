@@ -57,6 +57,60 @@ TEST_F(Http1CodecTest, Dispatch1) {
   EXPECT_EQ(header.path_, "/internal/platform/waf/service");
 }
 
+TEST_F(Http1CodecTest, ChunkedRequestBodyDoesNotBlockHeaderParsing) {
+  const char* req = "POST /upload HTTP/1.1\r\nHost: example.com\r\n"
+                     "Transfer-Encoding: chunked\r\n\r\n"
+                     "3\r\nfoo\r\n0\r\n\r\n";
+  auto header = codec_.dispatch(std::string_view{req, strlen(req)});
+  EXPECT_EQ(header.parseState_, ParseState::Done);
+  EXPECT_EQ(header.method_, "POST");
+  EXPECT_EQ(header.path_, "/upload");
+  EXPECT_EQ(header.host_, "example.com");
+}
+
+TEST_F(Http1CodecTest, PipelinedRequestsInOneCallReturnOnlyTheLastOne) {
+  const char* req = "GET /first HTTP/1.1\r\n\r\nGET /second HTTP/1.1\r\n\r\n";
+  auto header = codec_.dispatch(std::string_view{req, strlen(req)});
+  EXPECT_EQ(header.parseState_, ParseState::Done);
+  EXPECT_EQ(header.path_, "/second");
+}
+
+TEST_F(Http1CodecTest, ChunkedBodyDoesNotCorruptFollowingPipelinedRequest) {
+  const char* req = "POST /upload HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
+                     "3\r\nfoo\r\n0\r\n\r\n"
+                     "GET /next HTTP/1.1\r\n\r\n";
+  auto header = codec_.dispatch(std::string_view{req, strlen(req)});
+  EXPECT_EQ(header.parseState_, ParseState::Done);
+  EXPECT_EQ(header.path_, "/next");
+}
+
+TEST_F(Http1CodecTest, OriginFormHostFallsBackToHostHeaderWithPortStripped) {
+  const char* req = "GET /foo HTTP/1.1\r\nHost: example.com:9090\r\n\r\n";
+  auto header = codec_.dispatch(std::string_view{req, strlen(req)});
+  EXPECT_EQ(header.parseState_, ParseState::Done);
+  EXPECT_EQ(header.host_, "example.com");
+  EXPECT_EQ(codec_.getHost(), "example.com:9090");
+}
+
+TEST_F(Http1CodecTest, HostHeaderWithoutPortIsNotTruncated) {
+  const char* req = "GET /foo HTTP/1.1\r\nHost: example.com\r\n\r\n";
+  auto header = codec_.dispatch(std::string_view{req, strlen(req)});
+  EXPECT_EQ(header.host_, "example.com");
+}
+
+TEST_F(Http1CodecTest, AbsoluteFormHostWinsOverHostHeader) {
+  const char* req = "GET https://1.2.3.4:8888/foo HTTP/1.1\r\nHost: other.example.com\r\n\r\n";
+  auto header = codec_.dispatch(std::string_view{req, strlen(req)});
+  EXPECT_EQ(header.host_, "1.2.3.4");
+  EXPECT_EQ(header.path_, "/foo");
+}
+
+TEST_F(Http1CodecTest, MalformedRequestLineReportsError) {
+  const char* req = "NOT A REQUEST\r\n\r\n";
+  auto header = codec_.dispatch(std::string_view{req, strlen(req)});
+  EXPECT_EQ(header.parseState_, ParseState::Error);
+}
+
 } // namespace http
 
 int main(int argc, char **argv) {
