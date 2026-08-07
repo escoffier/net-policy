@@ -906,6 +906,8 @@ storing or exposing any body bytes, since nothing downstream consumes them."
 
 ### Task 5: The `Http1Parser` cxx-bridged type and `dispatch()`
 
+> **Post-implementation correction (found by this task's own implementer, before Task 6 was built on top of it):** the original `dispatch()` loop had a real bug — if a message completed successfully within a call (`result = Some(...)`), the loop went back to check for another pipelined message in the remaining buffer, and if THAT check failed to parse (even a single stray leftover byte), it immediately returned `Error`, discarding the already-successful result entirely. Both `Err(())` arms below now return the already-successful `result` (if one exists) instead of overwriting it. The Step 5 smoke test's hardcoded slice length (which had an off-by-one bug that fed a stray trailing NUL byte through and is what surfaced this) is also corrected to use `strlen()` instead of a hardcoded number. If you are executing this task fresh (not fixing an already-landed Task 5), just follow the steps below as written — they already reflect both corrections.
+
 **Files:**
 - Modify: `crates/http1_codec/src/lib.rs`
 - Modify: `tests/http1_codec_smoke_test.cc` → will be superseded; see Step 7
@@ -1004,6 +1006,20 @@ mod integration_tests {
         let buf = b"POST /upload HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nfooXX\r\n0\r\n\r\n";
         let r = p.dispatch(buf);
         assert_eq!(r.parse_state, 2 /* Error */);
+    }
+
+    #[test]
+    fn trailing_garbage_after_a_completed_request_does_not_discard_its_result() {
+        // A body-less request completes successfully, but the same call's
+        // buffer has one stray trailing byte left over (not a valid, even
+        // partial, next request-line). The loop tries -- and fails -- to
+        // parse that leftover as a further pipelined message; that failure
+        // must NOT overwrite the already-successful Done result from
+        // earlier in this same call.
+        let mut p = Http1Parser::new();
+        let r = p.dispatch(b"GET /foo HTTP/1.1\r\n\r\n\0");
+        assert_eq!(r.parse_state, 1 /* Done */);
+        assert_eq!(r.path, "/foo");
     }
 }
 ```
@@ -1113,6 +1129,17 @@ impl Http1Parser {
     /// fields when `parseState_ == Done`, discarding the result entirely
     /// otherwise -- so whether a discarded result carries stale data or
     /// fresh defaults is unobservable to every actual caller.
+    ///
+    /// If a message completes successfully within this call (`result`
+    /// becomes `Some(..)`) and the loop then finds leftover bytes that fail
+    /// to parse as a further pipelined message -- even a single stray
+    /// byte -- that failure does NOT discard the already-successful result.
+    /// An earlier version of this code returned `Error` unconditionally on
+    /// any `Err(())`, which meant a perfectly valid, fully-parsed request
+    /// could have its `Done` result silently overwritten by an unrelated
+    /// parse failure on whatever garbage happened to follow it in the same
+    /// read -- a real correctness bug, not just a style choice (found via a
+    /// smoke test that accidentally fed a stray trailing NUL byte through).
     pub fn dispatch(&mut self, data: &[u8]) -> ffi::ParsedHeader {
         self.buf.extend_from_slice(data);
         let mut result: Option<ffi::ParsedHeader> = None;
@@ -1121,6 +1148,9 @@ impl Http1Parser {
             match &mut self.phase {
                 Phase::Headers => match header_parser::try_parse_headers(&self.buf) {
                     Err(()) => {
+                        if let Some(r) = result {
+                            return r;
+                        }
                         return ffi::ParsedHeader { parse_state: PARSE_STATE_ERROR, ..Default::default() };
                     }
                     Ok(None) => break,
@@ -1144,6 +1174,9 @@ impl Http1Parser {
                 },
                 Phase::Body(framing) => match framing.advance(&self.buf) {
                     Err(()) => {
+                        if let Some(r) = result {
+                            return r;
+                        }
                         return ffi::ParsedHeader { parse_state: PARSE_STATE_ERROR, ..Default::default() };
                     }
                     Ok((consumed, complete)) => {
@@ -1186,13 +1219,15 @@ TEST(Http1CodecSmokeTest, RustPingReturns42) {
 with:
 
 ```cpp
+#include <cstring>
 #include <gtest/gtest.h>
 #include "http1_codec_cxxbridge/lib.h"
 
 TEST(Http1CodecSmokeTest, ParserConstructsAndDispatchesOneRequest) {
   auto parser = http1_codec::new_http1_parser();
-  auto result = parser->dispatch(rust::Slice<const uint8_t>(
-      reinterpret_cast<const uint8_t*>("GET /foo HTTP/1.1\r\n\r\n"), 22));
+  const char* req = "GET /foo HTTP/1.1\r\n\r\n";
+  auto result = parser->dispatch(
+      rust::Slice<const uint8_t>(reinterpret_cast<const uint8_t*>(req), strlen(req)));
   EXPECT_EQ(result.parse_state, 1);
   EXPECT_EQ(std::string(result.method), "GET");
   EXPECT_EQ(std::string(result.path), "/foo");
