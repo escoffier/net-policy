@@ -54,7 +54,7 @@ Both facts were confirmed by reading the actual current code, not assumed from t
 
 ## Final State
 
-- `http/http1/codec.{h,cc}` deleted; replaced by a thin C++ adapter over a new `crates/http1_codec` Rust crate, reachable via `cxx`.
+- `http/http1/codec.{h,cc}` **rewritten in place** (same class name, `http::http1::ConnectionImpl`, same public interface) to hold a `rust::Box<http1_codec::Http1Parser>` and translate between it and the existing `Codec`/`Header` types — not deleted and replaced by a new file. This was a plan-writing-time simplification over this design's original "thin adapter, new file" framing: it meant `http/connection.cc`'s `createCodec` call site and the pre-existing tests in `tests/codec_test.cc` needed zero changes. The net effect described below (`http/http1/codec.{h,cc}` now delegates to `crates/http1_codec` via `cxx` instead of calling `llhttp` directly) is unchanged.
 - `http/http1/http_parser.{h,c}` **still present**, still compiled, now genuinely uncalled by anything (its one live caller, `url.cc`, is itself uncalled once `codec.cc` is gone — but `url.cc` isn't deleted yet). Left for Phase 3c.
 - `http/connection.cc`'s `createCodec` constructs the Rust-backed adapter unconditionally — no toggle ever existed to remove.
 - No change yet to `llhttp`/`nghttp2`/`fmt` link-line presence — that's Phase 3c.
