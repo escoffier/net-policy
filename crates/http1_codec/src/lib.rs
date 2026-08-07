@@ -75,6 +75,17 @@ impl Http1Parser {
     /// fields when `parseState_ == Done`, discarding the result entirely
     /// otherwise -- so whether a discarded result carries stale data or
     /// fresh defaults is unobservable to every actual caller.
+    ///
+    /// If a message completes successfully within this call (`result`
+    /// becomes `Some(..)`) and the loop then finds leftover bytes that fail
+    /// to parse as a further pipelined message -- even a single stray
+    /// byte -- that failure does NOT discard the already-successful result.
+    /// An earlier version of this code returned `Error` unconditionally on
+    /// any `Err(())`, which meant a perfectly valid, fully-parsed request
+    /// could have its `Done` result silently overwritten by an unrelated
+    /// parse failure on whatever garbage happened to follow it in the same
+    /// read -- a real correctness bug, not just a style choice (found via a
+    /// smoke test that accidentally fed a stray trailing NUL byte through).
     pub fn dispatch(&mut self, data: &[u8]) -> ffi::ParsedHeader {
         self.buf.extend_from_slice(data);
         let mut result: Option<ffi::ParsedHeader> = None;
@@ -83,6 +94,9 @@ impl Http1Parser {
             match &mut self.phase {
                 Phase::Headers => match header_parser::try_parse_headers(&self.buf) {
                     Err(()) => {
+                        if let Some(r) = result {
+                            return r;
+                        }
                         return ffi::ParsedHeader { parse_state: PARSE_STATE_ERROR, ..Default::default() };
                     }
                     Ok(None) => break,
@@ -105,6 +119,16 @@ impl Http1Parser {
                     }
                 },
                 Phase::Body(framing) => match framing.advance(&self.buf) {
+                    // Unlike the Headers arm above, this Err(()) is NOT
+                    // guarded by a check for a prior `result`: an error here
+                    // always pertains to the body of the SAME message whose
+                    // headers just set `result = Some(Done)` moments ago in
+                    // this loop (Body phase is only ever entered right after
+                    // Headers succeeds for one message) -- so it invalidates
+                    // that very `result`, it doesn't follow it. Guarding this
+                    // arm the same way as Headers would silently mask a
+                    // malformed body behind its own message's already-set
+                    // (but not yet fully valid) headers-done result.
                     Err(()) => {
                         return ffi::ParsedHeader { parse_state: PARSE_STATE_ERROR, ..Default::default() };
                     }
@@ -191,5 +215,19 @@ mod integration_tests {
         let buf = b"POST /upload HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nfooXX\r\n0\r\n\r\n";
         let r = p.dispatch(buf);
         assert_eq!(r.parse_state, 2 /* Error */);
+    }
+
+    #[test]
+    fn trailing_garbage_after_a_completed_request_does_not_discard_its_result() {
+        // A body-less request completes successfully, but the same call's
+        // buffer has one stray trailing byte left over (not a valid, even
+        // partial, next request-line). The loop tries -- and fails -- to
+        // parse that leftover as a further pipelined message; that failure
+        // must NOT overwrite the already-successful Done result from
+        // earlier in this same call.
+        let mut p = Http1Parser::new();
+        let r = p.dispatch(b"GET /foo HTTP/1.1\r\n\r\n\0");
+        assert_eq!(r.parse_state, 1 /* Done */);
+        assert_eq!(r.path, "/foo");
     }
 }
