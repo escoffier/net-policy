@@ -1,0 +1,11 @@
+[package]
+name = "http1_codec"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+cxx = "1"
+httparse = "1"

@@ -66,6 +66,11 @@ corrosion_add_cxxbridge(net_flow_engine_cxxbridge
   FILES lib.rs
 )
 
+corrosion_add_cxxbridge(http1_codec_cxxbridge
+  CRATE http1_codec
+  FILES lib.rs
+)
+
 corrosion_add_cxxbridge(net_policy_engine_cxxbridge
   CRATE net_policy_engine
   FILES lib.rs
@@ -241,13 +246,14 @@ target_link_libraries(net-rule
   net_policy_control_cxxbridge
   net_policy_events_cxxbridge
   net_flow_engine_cxxbridge
+  http1_codec_cxxbridge
   net_policy_engine_cxxbridge
   net_iptables_cxxbridge
   net_nfq_cxxbridge
   net_conntrack_cxxbridge
 )
 # net_policy_control_cxxbridge, net_policy_events_cxxbridge, net_flow_engine_cxxbridge,
-# net_policy_engine_cxxbridge, net_iptables_cxxbridge, net_nfq_cxxbridge, and
+# http1_codec_cxxbridge, net_policy_engine_cxxbridge, net_iptables_cxxbridge, net_nfq_cxxbridge, and
 # net_conntrack_cxxbridge are separate Rust staticlib crates that all depend on the `cxx` crate; since each
 # staticlib statically embeds its own copy of cxx's internal runtime shim symbols
 # (e.g. cxxbridge1$rust_vec$bool$...), linking multiple such crates into the same
@@ -284,6 +290,7 @@ libunwind.a
 liblzma.a
 libz.a
 ffi_smoke_cxxbridge
+http1_codec_cxxbridge
 GTest::gtest_main)
 
 include(GoogleTest)
@@ -318,6 +325,7 @@ add_executable(net_rule_grpc_test
     tests/grpc_rust_control_e2e_test.cc
     tests/grpc_rust_events_e2e_test.cc
     tests/net_flow_engine_ffi_test.cc
+    tests/http1_codec_smoke_test.cc
     tests/net_policy_engine_ffi_test.cc
     tests/net_iptables_ffi_test.cc
     tests/net_nfq_ffi_test.cc
@@ -353,6 +361,7 @@ target_link_libraries(net_rule_grpc_test
   net_policy_control_cxxbridge
   net_policy_events_cxxbridge
   net_flow_engine_cxxbridge
+  http1_codec_cxxbridge
   net_policy_engine_cxxbridge
   net_iptables_cxxbridge
   net_nfq_cxxbridge
@@ -360,7 +369,8 @@ target_link_libraries(net_rule_grpc_test
   GTest::gtest_main)
 # See the matching comment on net-rule's LINK_FLAGS above (applies to
 # net_policy_control_cxxbridge, net_policy_events_cxxbridge, net_flow_engine_cxxbridge,
-# net_policy_engine_cxxbridge, net_iptables_cxxbridge, net_nfq_cxxbridge, and net_conntrack_cxxbridge).
+# http1_codec_cxxbridge, net_policy_engine_cxxbridge, net_iptables_cxxbridge, net_nfq_cxxbridge,
+# and net_conntrack_cxxbridge).
 set_target_properties(net_rule_grpc_test PROPERTIES LINK_FLAGS "-Wl,--allow-multiple-definition")
 gtest_discover_tests(net_rule_grpc_test)
 
