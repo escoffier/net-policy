@@ -4,15 +4,21 @@
 #include "http/connection.h"
 #include "http/filter.h"
 #include "http/header.h"
-#include "llhttp.h"
+#include "http1_codec_cxxbridge/lib.h"
+#include "rust/cxx.h"
 
-// #include "http/http1/http_parser.h"
+#include <memory>
 #include <string>
 #include <string_view>
-#include <vector>
 
 namespace http {
 namespace http1 {
+
+// Thin C++ adapter over crates/http1_codec's Rust parser. Keeps the exact
+// class name, namespace, constructor signature, and public interface the
+// old llhttp-based implementation had, so http/connection.cc's createCodec
+// call site and tests/codec_test.cc's existing tests need no changes --
+// see docs/superpowers/plans/2026-08-06-phase3a-http1-codec.md Task 6.
 class ConnectionImpl : public Codec {
 public:
   ConnectionImpl(bool serverSide, HttpFilterManagerPtr filterManager);
@@ -27,49 +33,20 @@ public:
 
   void setFilterManager(HttpFilterManagerPtr filterManager) override;
 
-  inline void setPath(std::string_view path) { header_.path_ = path; }
-
-  inline void setHost(std::string_view host) { header_.host_ = host; }
-
-  inline void setMethod(std::string_view method) { header_.method_ = method; }
-
-  inline std::string_view getHost() const { return host_; }
-
-  void onUrl(std::string_view url);
-
-  void onUrlComplete();
-
-  void onHeadersComplete();
-
-  int onBodyComplete(std::string_view body);
-
-  void onHeaderField(std::string field) {
-    header_fields_.push_back(field);
-  };
-
-  void resetState() {
-    url_.clear();
-    header_ = {"", "", "", ParseState::Continue};
-    header_fields_.clear();
-    header_values_.clear();
-    headerMap_.clear();
-  }
-
-  void onHeaderValue(std::string value) {
-    header_values_.push_back(value);
-  };
+  // Returns the raw (port-included) value of the most recently seen Host
+  // header, or empty if none was seen -- mirrors the old private host_
+  // member exactly, including that it's distinct from header_.host_'s
+  // resolved-and-possibly-port-stripped value. Has no production caller
+  // (see the design spec); kept only so tests/codec_test.cc's existing
+  // Dispatch1 test needs no changes.
+  std::string getHost() const { return raw_host_header_; }
 
 private:
-  // http_parser parser_;
-  // http_parser_settings settings_;
-  llhttp_t parser_;
-  llhttp_settings_t settings_;
-  // http_parser_settings settings_;
+  const Header &applyParsedHeader(const http1_codec::ParsedHeader &parsed);
+
+  rust::Box<http1_codec::Http1Parser> parser_;
   Header header_;
-  std::string url_;
-  std::string_view host_;
-  std::vector<std::string> header_fields_;
-  std::vector<std::string> header_values_;
+  std::string raw_host_header_;
   HttpFilterManagerPtr filters_manager_;
   RequestHeaderMap headerMap_;
   bool serverSide_;
