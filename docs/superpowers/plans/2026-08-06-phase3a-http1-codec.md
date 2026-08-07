@@ -615,6 +615,8 @@ back to a port-stripped Host header value."
 
 ### Task 4: Rust body-framing state machine (`body_framing` module)
 
+> **Post-implementation correction (found by this task's own reviewer, before Task 5 was built on top of it):** the original version of this task's `advance()` had two real bugs, not just style nits — an unparseable chunk-size line silently defaulted to `0` (treated as the end-of-body terminator, silently truncating a body early instead of rejecting it), and chunk-data not immediately followed by `\r\n` caused `advance()` to return `(pos, false)` forever with no error signal and no further progress — since nothing ever drains past the stuck point, this is an unbounded buffer-growth / memory-exhaustion vector on a single malformed connection, not just a parsing nicety. `advance()`'s signature is corrected below to `Result<(usize, bool), ()>`, matching `header_parser::try_parse_headers`'s existing `Result<Option<_>, ()>` shape. If you are executing this task fresh (not fixing an already-landed Task 4), just follow the steps below as written — they already reflect the correction.
+
 **Files:**
 - Create: `crates/http1_codec/src/body_framing.rs`
 - Modify: `crates/http1_codec/src/lib.rs`
@@ -625,10 +627,10 @@ back to a port-stripped Host header value."
   pub enum BodyFraming { None, ContentLength(usize), ChunkedSize, ChunkedData(usize), ChunkedTrailer }
   impl BodyFraming {
       pub fn start(content_length: Option<usize>, chunked: bool) -> BodyFraming;
-      pub fn advance(&mut self, buf: &[u8]) -> (usize, bool); // (bytes_consumed, framing_complete)
+      pub fn advance(&mut self, buf: &[u8]) -> Result<(usize, bool), ()>; // Ok((bytes_consumed, framing_complete)); Err(()) on malformed chunked input
   }
   ```
-  Task 5 constructs a `BodyFraming` via `start()` right after a header parse completes, then calls `advance()` repeatedly as more data arrives (or immediately, if the whole body is already in the buffer) until it returns `true` for completion.
+  Task 5 constructs a `BodyFraming` via `start()` right after a header parse completes, then calls `advance()` repeatedly as more data arrives (or immediately, if the whole body is already in the buffer) until it returns `Ok((_, true))` for completion or `Err(())` for malformed input (mapped to `ParseState::Error`, the same way a header-parse error already is).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -642,7 +644,7 @@ mod tests {
     #[test]
     fn no_body_completes_immediately_consuming_nothing() {
         let mut f = BodyFraming::start(None, false);
-        let (consumed, done) = f.advance(b"GET /next HTTP/1.1\r\n\r\n");
+        let (consumed, done) = f.advance(b"GET /next HTTP/1.1\r\n\r\n").unwrap();
         assert_eq!(consumed, 0);
         assert!(done);
     }
@@ -650,7 +652,7 @@ mod tests {
     #[test]
     fn zero_content_length_completes_immediately() {
         let mut f = BodyFraming::start(Some(0), false);
-        let (consumed, done) = f.advance(b"");
+        let (consumed, done) = f.advance(b"").unwrap();
         assert_eq!(consumed, 0);
         assert!(done);
     }
@@ -658,7 +660,7 @@ mod tests {
     #[test]
     fn content_length_consumes_exactly_that_many_bytes() {
         let mut f = BodyFraming::start(Some(5), false);
-        let (consumed, done) = f.advance(b"12345restofbuffer");
+        let (consumed, done) = f.advance(b"12345restofbuffer").unwrap();
         assert_eq!(consumed, 5);
         assert!(done);
     }
@@ -666,10 +668,10 @@ mod tests {
     #[test]
     fn content_length_needs_more_data_across_calls() {
         let mut f = BodyFraming::start(Some(10), false);
-        let (consumed1, done1) = f.advance(b"12345");
+        let (consumed1, done1) = f.advance(b"12345").unwrap();
         assert_eq!(consumed1, 5);
         assert!(!done1);
-        let (consumed2, done2) = f.advance(b"67890");
+        let (consumed2, done2) = f.advance(b"67890").unwrap();
         assert_eq!(consumed2, 5);
         assert!(done2);
     }
@@ -678,16 +680,19 @@ mod tests {
     fn chunked_single_chunk_then_terminator() {
         let mut f = BodyFraming::start(None, true);
         let buf = b"5\r\nhello\r\n0\r\n\r\n";
-        let (consumed, done) = f.advance(buf);
+        let (consumed, done) = f.advance(buf).unwrap();
         assert_eq!(consumed, buf.len());
         assert!(done);
     }
 
     #[test]
-    fn chunked_multiple_chunks() {
+    fn chunked_multiple_chunks_with_different_sizes() {
+        // Deliberately DIFFERENT chunk sizes (3, then 4) -- proves each
+        // chunk's size is read from its own size line, not e.g. reused from
+        // the first chunk (which a same-sized-chunks test couldn't catch).
         let mut f = BodyFraming::start(None, true);
-        let buf = b"3\r\nfoo\r\n3\r\nbar\r\n0\r\n\r\n";
-        let (consumed, done) = f.advance(buf);
+        let buf = b"3\r\nfoo\r\n4\r\nbarz\r\n0\r\n\r\n";
+        let (consumed, done) = f.advance(buf).unwrap();
         assert_eq!(consumed, buf.len());
         assert!(done);
     }
@@ -695,10 +700,10 @@ mod tests {
     #[test]
     fn chunked_needs_more_data_mid_chunk() {
         let mut f = BodyFraming::start(None, true);
-        let (consumed1, done1) = f.advance(b"5\r\nhel");
+        let (consumed1, done1) = f.advance(b"5\r\nhel").unwrap();
         assert_eq!(consumed1, 6); // consumed the size line "5\r\n", 3 of the 5 data bytes
         assert!(!done1);
-        let (consumed2, done2) = f.advance(b"lo\r\n0\r\n\r\n");
+        let (consumed2, done2) = f.advance(b"lo\r\n0\r\n\r\n").unwrap();
         assert_eq!(consumed2, 9);
         assert!(done2);
     }
@@ -707,9 +712,25 @@ mod tests {
     fn chunked_with_trailer_headers() {
         let mut f = BodyFraming::start(None, true);
         let buf = b"0\r\nX-Trailer: value\r\n\r\n";
-        let (consumed, done) = f.advance(buf);
+        let (consumed, done) = f.advance(buf).unwrap();
         assert_eq!(consumed, buf.len());
         assert!(done);
+    }
+
+    #[test]
+    fn malformed_chunk_size_line_is_an_error() {
+        let mut f = BodyFraming::start(None, true);
+        assert!(f.advance(b"not-hex\r\nfoo").is_err());
+    }
+
+    #[test]
+    fn chunk_data_not_immediately_followed_by_crlf_is_an_error() {
+        let mut f = BodyFraming::start(None, true);
+        // Declares 3 data bytes ("foo") but is followed by "XX" instead of
+        // an immediate CRLF -- a chunked-grammar violation, not merely
+        // "need more data" (the eventual "\r\n" later in the buffer must
+        // not be treated as satisfying the immediate-CRLF requirement).
+        assert!(f.advance(b"3\r\nfooXX\r\n0\r\n\r\n").is_err());
     }
 }
 ```
@@ -753,18 +774,26 @@ impl BodyFraming {
     }
 
     /// Consumes as much of `buf` as belongs to the body (advancing internal
-    /// state), returning `(bytes_consumed, framing_complete)`. When
+    /// state), returning `Ok((bytes_consumed, framing_complete))`. When
     /// `framing_complete` is false, the caller must call `advance` again
     /// with more data (starting from byte `bytes_consumed` onward -- the
     /// caller is expected to drain consumed bytes from its own buffer, as
-    /// Task 5's `Http1Parser` does).
-    pub fn advance(&mut self, buf: &[u8]) -> (usize, bool) {
+    /// Task 5's `Http1Parser` does). Returns `Err(())` for malformed
+    /// chunked-encoding input -- an unparseable chunk-size line, or
+    /// chunk-data not immediately followed by CRLF -- rather than silently
+    /// misframing (an earlier version of this code treated an unparseable
+    /// size as the zero-size terminator, silently truncating a body early)
+    /// or stalling forever with no forward progress and no error signal
+    /// (an unbounded buffer-growth / memory-exhaustion vector on a single
+    /// malformed connection, since nothing ever drains past the stuck
+    /// point).
+    pub fn advance(&mut self, buf: &[u8]) -> Result<(usize, bool), ()> {
         match self {
-            BodyFraming::None => (0, true),
+            BodyFraming::None => Ok((0, true)),
             BodyFraming::ContentLength(remaining) => {
                 let take = (*remaining).min(buf.len());
                 *remaining -= take;
-                (take, *remaining == 0)
+                Ok((take, *remaining == 0))
             }
             BodyFraming::ChunkedSize | BodyFraming::ChunkedData(_) | BodyFraming::ChunkedTrailer => {
                 self.advance_chunked(buf)
@@ -772,19 +801,22 @@ impl BodyFraming {
         }
     }
 
-    fn advance_chunked(&mut self, buf: &[u8]) -> (usize, bool) {
+    fn advance_chunked(&mut self, buf: &[u8]) -> Result<(usize, bool), ()> {
         let mut pos = 0;
         loop {
             match self {
                 BodyFraming::ChunkedSize => match find_crlf(&buf[pos..]) {
-                    None => return (pos, false),
+                    None => return Ok((pos, false)),
                     Some(line_len) => {
                         let line = &buf[pos..pos + line_len];
                         let hex_part = line.split(|&b| b == b';').next().unwrap_or(line);
-                        let size = std::str::from_utf8(hex_part)
+                        let size = match std::str::from_utf8(hex_part)
                             .ok()
                             .and_then(|s| usize::from_str_radix(s.trim(), 16).ok())
-                            .unwrap_or(0);
+                        {
+                            Some(size) => size,
+                            None => return Err(()),
+                        };
                         pos += line_len + 2;
                         *self = if size == 0 { BodyFraming::ChunkedTrailer } else { BodyFraming::ChunkedData(size) };
                     }
@@ -795,22 +827,28 @@ impl BodyFraming {
                     pos += take;
                     *remaining -= take;
                     if *remaining > 0 {
-                        return (pos, false);
+                        return Ok((pos, false));
                     }
-                    match find_crlf(&buf[pos..]) {
-                        None => return (pos, false),
-                        Some(0) => {
-                            pos += 2;
-                            *self = BodyFraming::ChunkedSize;
-                        }
-                        Some(_) => return (pos, false),
+                    // Deliberately NOT using find_crlf here: it searches for
+                    // a CRLF ANYWHERE later in the buffer, but the grammar
+                    // requires the CRLF to be the IMMEDIATE next two bytes.
+                    // Treating a later, unrelated CRLF as satisfying this
+                    // check was the exact bug being fixed.
+                    let tail = &buf[pos..];
+                    if tail.len() < 2 {
+                        return Ok((pos, false)); // not enough bytes yet to check
                     }
+                    if &tail[..2] != b"\r\n" {
+                        return Err(());
+                    }
+                    pos += 2;
+                    *self = BodyFraming::ChunkedSize;
                 }
                 BodyFraming::ChunkedTrailer => match find_crlf(&buf[pos..]) {
-                    None => return (pos, false),
+                    None => return Ok((pos, false)),
                     Some(0) => {
                         pos += 2;
-                        return (pos, true);
+                        return Ok((pos, true));
                     }
                     Some(line_len) => {
                         pos += line_len + 2;
@@ -850,7 +888,7 @@ mod request_target;
 cd crates/http1_codec && cargo test body_framing
 ```
 
-Expected: all 8 tests PASS.
+Expected: all 10 tests PASS.
 
 - [ ] **Step 6: Commit**
 
@@ -873,7 +911,7 @@ storing or exposing any body bytes, since nothing downstream consumes them."
 - Modify: `tests/http1_codec_smoke_test.cc` → will be superseded; see Step 7
 
 **Interfaces:**
-- Consumes: `header_parser::try_parse_headers` (Task 3), `body_framing::BodyFraming` (Task 4).
+- Consumes: `header_parser::try_parse_headers` (Task 3), `body_framing::BodyFraming` (Task 4) — note `BodyFraming::advance()` returns `Result<(usize, bool), ()>` (corrected after Task 4's own review found two real bugs in the original `(usize, bool)` shape; see Task 4's header note), so `dispatch()`'s body-phase branch below handles both the `Ok` and `Err` arms.
 - Produces the real `cxx` bridge, replacing the Task 1 smoke-test bridge entirely:
   ```rust
   #[cxx::bridge(namespace = "http1_codec")]
@@ -953,6 +991,18 @@ mod integration_tests {
     fn error_on_malformed_input() {
         let mut p = Http1Parser::new();
         let r = p.dispatch(b"NOT A REQUEST\r\n\r\n");
+        assert_eq!(r.parse_state, 2 /* Error */);
+    }
+
+    #[test]
+    fn error_on_malformed_chunked_body() {
+        let mut p = Http1Parser::new();
+        // Headers parse fine; the chunked body that follows violates the
+        // chunked grammar (chunk-data not immediately followed by CRLF) --
+        // this must surface as Error through the full dispatch() path, not
+        // just at the body_framing unit-test level.
+        let buf = b"POST /upload HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nfooXX\r\n0\r\n\r\n";
+        let r = p.dispatch(buf);
         assert_eq!(r.parse_state, 2 /* Error */);
     }
 }
@@ -1092,14 +1142,18 @@ impl Http1Parser {
                         self.phase = Phase::Body(framing);
                     }
                 },
-                Phase::Body(framing) => {
-                    let (consumed, complete) = framing.advance(&self.buf);
-                    self.buf.drain(..consumed);
-                    if !complete {
-                        break;
+                Phase::Body(framing) => match framing.advance(&self.buf) {
+                    Err(()) => {
+                        return ffi::ParsedHeader { parse_state: PARSE_STATE_ERROR, ..Default::default() };
                     }
-                    self.phase = Phase::Headers;
-                }
+                    Ok((consumed, complete)) => {
+                        self.buf.drain(..consumed);
+                        if !complete {
+                            break;
+                        }
+                        self.phase = Phase::Headers;
+                    }
+                },
             }
         }
 
