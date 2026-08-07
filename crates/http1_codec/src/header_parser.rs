@@ -1,6 +1,6 @@
 use crate::request_target::parse_request_target;
 
-const MAX_HEADERS: usize = 64;
+const MAX_HEADERS: usize = 100;
 
 pub struct HeaderParseResult {
     pub method: String,
@@ -15,12 +15,15 @@ pub struct HeaderParseResult {
 /// Attempts to parse one complete HTTP/1.x request-line + header block from
 /// the start of `buf`. `Ok(None)` means the buffer holds a valid prefix of a
 /// request but not yet a complete header block (caller should wait for more
-/// data via a later call). `Err(())` means the input is malformed --
+/// data via a later call). `Err(())` means the input is malformed -- this
 /// includes both genuinely invalid syntax and MAX_HEADERS being exceeded
-/// (httparse's `TooManyHeaders`); the caller does not need to distinguish
-/// these since neither is recoverable, mirroring llhttp's own behavior for
-/// unrecoverable parse errors (no reset-and-retry exists in the old code
-/// either).
+/// (httparse's `TooManyHeaders`). Unlike llhttp (which has no header-count
+/// limit), httparse requires a fixed-size header array up front, so some
+/// bound is unavoidable here; MAX_HEADERS is set well above what any real
+/// client sends. A request that legitimately exceeds it is treated the same
+/// as any other malformed message: this one message fails, and the caller
+/// (`Http1Parser::dispatch`) resets and resyncs on the next message rather
+/// than wedging the connection.
 pub fn try_parse_headers(buf: &[u8]) -> Result<Option<HeaderParseResult>, ()> {
     let mut raw_headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
     let mut req = httparse::Request::new(&mut raw_headers);
@@ -41,11 +44,27 @@ pub fn try_parse_headers(buf: &[u8]) -> Result<Option<HeaderParseResult>, ()> {
         let name = h.name.to_string();
         let value = String::from_utf8_lossy(h.value).into_owned();
         if name.eq_ignore_ascii_case("content-length") {
-            content_length = value.trim().parse::<usize>().ok();
+            let parsed: usize = value.trim().parse().map_err(|_| ())?;
+            if let Some(existing) = content_length {
+                if existing != parsed {
+                    // Conflicting Content-Length values on the same
+                    // message -- a classic request-smuggling vector.
+                    // Reject rather than silently pick one.
+                    return Err(());
+                }
+            }
+            content_length = Some(parsed);
         } else if name.eq_ignore_ascii_case("transfer-encoding") && value.trim().eq_ignore_ascii_case("chunked") {
             chunked = true;
         }
         fields.push((name, value));
+    }
+
+    if chunked && content_length.is_some() {
+        // Content-Length and Transfer-Encoding: chunked both present is
+        // itself a request-smuggling vector (RFC 7230 SS3.3.3) -- reject
+        // rather than silently letting chunked win.
+        return Err(());
     }
 
     let host = resolve_host(&target.host, &fields);
@@ -140,6 +159,59 @@ mod tests {
     #[test]
     fn malformed_request_line_is_an_error() {
         let buf = b"NOT A REQUEST\r\n\r\n";
+        assert!(try_parse_headers(buf).is_err());
+    }
+
+    #[test]
+    fn a_request_with_80_headers_parses_successfully() {
+        let mut buf = String::from("GET /foo HTTP/1.1\r\n");
+        for i in 0..80 {
+            buf.push_str(&format!("X-Custom-{i}: value{i}\r\n"));
+        }
+        buf.push_str("\r\n");
+        let result = try_parse_headers(buf.as_bytes()).unwrap().unwrap();
+        assert_eq!(result.path, "/foo");
+        assert_eq!(result.fields.len(), 80);
+    }
+
+    #[test]
+    fn a_request_with_far_too_many_headers_is_an_error() {
+        let mut buf = String::from("GET /foo HTTP/1.1\r\n");
+        for i in 0..500 {
+            buf.push_str(&format!("X-Custom-{i}: value{i}\r\n"));
+        }
+        buf.push_str("\r\n");
+        assert!(try_parse_headers(buf.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn unparseable_content_length_is_an_error() {
+        let buf = b"POST /foo HTTP/1.1\r\nContent-Length: abc\r\n\r\n";
+        assert!(try_parse_headers(buf).is_err());
+    }
+
+    #[test]
+    fn negative_content_length_is_an_error() {
+        let buf = b"POST /foo HTTP/1.1\r\nContent-Length: -1\r\n\r\n";
+        assert!(try_parse_headers(buf).is_err());
+    }
+
+    #[test]
+    fn conflicting_duplicate_content_length_is_an_error() {
+        let buf = b"POST /foo HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 10\r\n\r\n";
+        assert!(try_parse_headers(buf).is_err());
+    }
+
+    #[test]
+    fn identical_duplicate_content_length_is_allowed() {
+        let buf = b"POST /foo HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\n";
+        let result = try_parse_headers(buf).unwrap().unwrap();
+        assert_eq!(result.content_length, Some(5));
+    }
+
+    #[test]
+    fn content_length_and_chunked_together_is_an_error() {
+        let buf = b"POST /foo HTTP/1.1\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n";
         assert!(try_parse_headers(buf).is_err());
     }
 }

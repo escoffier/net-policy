@@ -97,6 +97,8 @@ impl Http1Parser {
                         if let Some(r) = result {
                             return r;
                         }
+                        self.buf.clear();
+                        self.phase = Phase::Headers;
                         return ffi::ParsedHeader { parse_state: PARSE_STATE_ERROR, ..Default::default() };
                     }
                     Ok(None) => break,
@@ -130,6 +132,8 @@ impl Http1Parser {
                     // malformed body behind its own message's already-set
                     // (but not yet fully valid) headers-done result.
                     Err(()) => {
+                        self.buf.clear();
+                        self.phase = Phase::Headers;
                         return ffi::ParsedHeader { parse_state: PARSE_STATE_ERROR, ..Default::default() };
                     }
                     Ok((consumed, complete)) => {
@@ -229,5 +233,39 @@ mod integration_tests {
         let r = p.dispatch(b"GET /foo HTTP/1.1\r\n\r\n\0");
         assert_eq!(r.parse_state, 1 /* Done */);
         assert_eq!(r.path, "/foo");
+    }
+
+    #[test]
+    fn dispatch_recovers_after_a_malformed_message_instead_of_wedging_forever() {
+        let mut p = Http1Parser::new();
+        let r1 = p.dispatch(b"NOT A REQUEST\r\n\r\n");
+        assert_eq!(r1.parse_state, 2 /* Error */);
+
+        // A well-formed request sent right after must parse successfully --
+        // proving the parser resynced instead of staying wedged in Error
+        // forever and re-accumulating every subsequent byte unboundedly.
+        let r2 = p.dispatch(b"GET /foo HTTP/1.1\r\n\r\n");
+        assert_eq!(r2.parse_state, 1 /* Done */);
+        assert_eq!(r2.path, "/foo");
+    }
+
+    #[test]
+    fn dispatch_clears_buffer_on_error_instead_of_growing_it_unboundedly() {
+        let mut p = Http1Parser::new();
+        let r1 = p.dispatch(b"NOT A REQUEST\r\n\r\n");
+        assert_eq!(r1.parse_state, 2 /* Error */);
+        assert_eq!(p.buf.len(), 0, "buf must be cleared after an unrecoverable parse error, not retained");
+    }
+
+    #[test]
+    fn dispatch_recovers_after_a_malformed_chunked_body_instead_of_wedging_forever() {
+        let mut p = Http1Parser::new();
+        let buf = b"POST /upload HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nfooXX\r\n0\r\n\r\n";
+        let r1 = p.dispatch(buf);
+        assert_eq!(r1.parse_state, 2 /* Error */);
+
+        let r2 = p.dispatch(b"GET /foo HTTP/1.1\r\n\r\n");
+        assert_eq!(r2.parse_state, 1 /* Done */);
+        assert_eq!(r2.path, "/foo");
     }
 }
