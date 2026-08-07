@@ -906,7 +906,7 @@ storing or exposing any body bytes, since nothing downstream consumes them."
 
 ### Task 5: The `Http1Parser` cxx-bridged type and `dispatch()`
 
-> **Post-implementation correction (found by this task's own implementer, before Task 6 was built on top of it):** the original `dispatch()` loop had a real bug — if a message completed successfully within a call (`result = Some(...)`), the loop went back to check for another pipelined message in the remaining buffer, and if THAT check failed to parse (even a single stray leftover byte), it immediately returned `Error`, discarding the already-successful result entirely. Both `Err(())` arms below now return the already-successful `result` (if one exists) instead of overwriting it. The Step 5 smoke test's hardcoded slice length (which had an off-by-one bug that fed a stray trailing NUL byte through and is what surfaced this) is also corrected to use `strlen()` instead of a hardcoded number. If you are executing this task fresh (not fixing an already-landed Task 5), just follow the steps below as written — they already reflect both corrections.
+> **Post-implementation correction, twice (found by this task's own implementer, before Task 6 was built on top of it):** the original `dispatch()` loop had a real bug — if a message completed successfully within a call (`result = Some(...)`), the loop went back to check for another pipelined message in the remaining buffer, and if THAT check failed to parse (even a single stray leftover byte), it immediately returned `Error`, discarding the already-successful result entirely. The first fix attempt guarded *both* `Err(())` arms (Headers and Body) identically — but this regressed an existing test: the **Body** arm's error always pertains to the body of the SAME message that just set `result` (Body phase is only ever entered right after Headers succeeds for one message), so guarding it the same way silently masks a malformed body behind its own not-yet-fully-valid headers result. Only the **Headers** arm's `Err(())` is guarded below; the **Body** arm's `Err(())` is deliberately left as an unconditional `Error` return. The Step 5 smoke test's hardcoded slice length (which had an off-by-one bug that fed a stray trailing NUL byte through and is what surfaced the original issue) is also corrected to use `strlen()` instead of a hardcoded number. If you are executing this task fresh (not fixing an already-landed Task 5), just follow the steps below as written — they already reflect the correct, asymmetric fix.
 
 **Files:**
 - Modify: `crates/http1_codec/src/lib.rs`
@@ -1140,6 +1140,8 @@ impl Http1Parser {
     /// parse failure on whatever garbage happened to follow it in the same
     /// read -- a real correctness bug, not just a style choice (found via a
     /// smoke test that accidentally fed a stray trailing NUL byte through).
+    /// This guard applies ONLY to the Headers arm below, not the Body arm --
+    /// see that arm's own comment for why.
     pub fn dispatch(&mut self, data: &[u8]) -> ffi::ParsedHeader {
         self.buf.extend_from_slice(data);
         let mut result: Option<ffi::ParsedHeader> = None;
@@ -1172,11 +1174,20 @@ impl Http1Parser {
                         self.phase = Phase::Body(framing);
                     }
                 },
+                // Unlike the Headers arm above, this Err(()) is NOT guarded
+                // by a check for a prior `result`: an error here always
+                // pertains to the body of the SAME message whose headers
+                // just set `result = Some(Done)` moments ago in this loop
+                // (Body phase is only ever entered right after Headers
+                // succeeds for one message) -- so it invalidates that very
+                // `result`, it doesn't follow it. Guarding this arm the same
+                // way as Headers would silently mask a malformed body behind
+                // its own message's already-set (but not yet fully valid)
+                // headers-done result -- verified by this exact change
+                // regressing `error_on_malformed_chunked_body` when first
+                // tried.
                 Phase::Body(framing) => match framing.advance(&self.buf) {
                     Err(()) => {
-                        if let Some(r) = result {
-                            return r;
-                        }
                         return ffi::ParsedHeader { parse_state: PARSE_STATE_ERROR, ..Default::default() };
                     }
                     Ok((consumed, complete)) => {
