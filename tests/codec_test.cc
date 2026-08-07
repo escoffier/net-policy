@@ -111,6 +111,23 @@ TEST_F(Http1CodecTest, MalformedRequestLineReportsError) {
   EXPECT_EQ(header.parseState_, ParseState::Error);
 }
 
+TEST_F(Http1CodecTest, TrailingGarbageAfterCompletedRequestDoesNotDiscardResult) {
+  // A body-less request completes successfully, but the same dispatch()
+  // call's buffer has one stray trailing byte left over (not a valid, even
+  // partial, next request-line). This must not discard the already-Done
+  // result -- the exact bug Task 5's own fix round found and fixed in
+  // dispatch()'s loop (crates/http1_codec/src/lib.rs), reproduced here at
+  // the C++ adapter layer where it had no coverage until now. Built via
+  // std::string + push_back rather than a C-string literal, since a NUL
+  // byte can't survive strlen()-based length inference -- exactly the
+  // class of bug that originally surfaced this issue via a smoke test.
+  std::string req = "GET /foo HTTP/1.1\r\n\r\n";
+  req.push_back('\0');
+  auto header = codec_.dispatch(std::string_view{req});
+  EXPECT_EQ(header.parseState_, ParseState::Done);
+  EXPECT_EQ(header.path_, "/foo");
+}
+
 } // namespace http
 
 int main(int argc, char **argv) {
